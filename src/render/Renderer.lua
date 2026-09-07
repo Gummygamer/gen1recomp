@@ -92,8 +92,8 @@ function Renderer:init()
   -- 160x144 real pixels, never DPI-scaled: see src/render/PixelCanvas.lua
   -- (#208).  Every canvas below is sized in framebuffer pixels for the same
   -- reason -- worldViewSize() already works in drawable pixels.
-  self.uiWidth, self.uiHeight = self.WIDTH, self.HEIGHT
-  self.canvas = PixelCanvas.new(self.uiWidth, self.uiHeight, "nearest")
+  self.uiWidth, self.uiHeight, self.uiDensity = self.WIDTH, self.HEIGHT, 1
+  self.canvas = PixelCanvas.new(self.uiWidth, self.uiHeight, "nearest", self.uiDensity)
   self.worldCanvas = nil
   self.worldActive = false
   -- tilt mode only: a transparent overlay canvas the size of the world
@@ -193,17 +193,20 @@ end
 -- it.  Sizes are resolved before any state draws (Game:draw) and bounded on
 -- both ends -- never smaller than the Game Boy screen every layout assumes,
 -- never large enough for a bad request to allocate an unbounded canvas.
-function Renderer:setUISize(w, h)
+function Renderer:setUISize(w, h, density)
   if type(w) ~= "number" or type(h) ~= "number"
      or w < self.WIDTH or h < self.HEIGHT
      or w > self.MAX_UI_WIDTH or h > self.MAX_UI_HEIGHT then
     w, h = self.WIDTH, self.HEIGHT
   end
   w, h = math.floor(w), math.floor(h)
-  if w == self.uiWidth and h == self.uiHeight and self.canvas then return end
+  density = tonumber(density) or 1
+  if density ~= 1 and density ~= 2 then density = 1 end
+  if w == self.uiWidth and h == self.uiHeight
+     and density == self.uiDensity and self.canvas then return end
   if self.canvas and self.canvas.release then self.canvas:release() end
-  self.uiWidth, self.uiHeight = w, h
-  self.canvas = PixelCanvas.new(w, h, "nearest")
+  self.uiWidth, self.uiHeight, self.uiDensity = w, h, density
+  self.canvas = PixelCanvas.new(w, h, "nearest", density)
 end
 
 -- LOVE-unit draw scales endFrame uses for the UI blit: integer framebuffer

@@ -67,6 +67,40 @@ local pendingBuf -- a current-gen buffer popped from the worker but not yet
 local musicHeld = false
 
 -- ---------------------------------------------------------------------------
+-- playback device loss
+--
+-- Windows can invalidate the output device under a running game: a headset or
+-- monitor unplugged, a sleep/resume cycle, or the default device changing.
+-- OpenAL Soft's WASAPI mixer thread then fails GetCurrentPadding, prints
+--   AL lib: (EE) ALCwasapiPlayback_mixerProc: Failed to get padding: 0x88890004
+-- (0x88890004 is AUDCLNT_E_DEVICE_INVALIDATED), calls
+-- ALCdevice::handleDisconnect, and breaks out of its mixer loop.  Every voice
+-- is stopped and every Source reads as not playing forever after.  LOVE 11.5
+-- exposes no playback-device API (no love.audio.setPlaybackDevice in this
+-- engine build), so the device cannot be re-opened in-process and a fresh
+-- process is the only guaranteed recovery.
+--
+-- What this module can do is stop pretending: quit hammering Source:play
+-- against a dead device every frame, say plainly in the log what happened
+-- instead of leaving a bare AL lib line on stderr, and mark the song ended so
+-- Music stops re-cuing into a silence the player cannot wait out.  The latch
+-- deliberately survives a song change -- Music.restoreMap plays the map theme
+-- again as soon as a stream stops, and clearing it there would rebuild the
+-- exact retry storm this exists to prevent.  recoverDevice() is the one way
+-- back, and a still-dead device simply re-latches after the same budget.
+-- ---------------------------------------------------------------------------
+
+-- Source:play against a disconnected device returns without erroring, so the
+-- only signal is that the Source still reads as stopped afterwards.  A few
+-- such frames in a row is a render stall (this whole function exists for
+-- those); this many is an output that is not coming back on its own.  Sized to
+-- outlast a Bluetooth headset or exclusive-mode device waking up (~1.5s).
+local DEVICE_LOST_AFTER_ATTEMPTS = 90
+local playAttempts = 0
+local deviceLost = false
+local deviceLostLogged = false
+
+-- ---------------------------------------------------------------------------
 -- worker management
 -- ---------------------------------------------------------------------------
 
@@ -216,6 +250,42 @@ local function pushChannelMix()
   end
 end
 
+-- Start a Source and confirm it took.  Source:play never errors on a
+-- disconnected device, so "still not playing afterwards" is the only evidence.
+local function startSource(source)
+  pcall(source.play, source)
+  local ok, playing = pcall(source.isPlaying, source)
+  return ok and playing == true
+end
+
+local function reportDeviceLost()
+  if deviceLostLogged then return end
+  deviceLostLogged = true
+  require("src.core.Logger").warn(
+    "playback device was lost; music is silent until audio output returns "
+      .. "(restart the game if it does not)")
+end
+
+-- One restart attempt that did not stick.  Returns true once the pattern says
+-- the output device is gone rather than merely starved of buffers, and marks
+-- the song ended so Music moves on instead of re-cuing over it.
+local function playAttemptFailed(m)
+  playAttempts = playAttempts + 1
+  if not deviceLost and playAttempts < DEVICE_LOST_AFTER_ATTEMPTS then
+    return false
+  end
+  if not deviceLost then
+    deviceLost = true
+    reportDeviceLost()
+  end
+  -- Remember WHY this song stopped.  A song that ran out is over for good, but
+  -- one silenced by a lost device must be resumable: recoverDevice() clears
+  -- this and playback is tried again, which is how a replugged headset gets
+  -- its music back without a song change.
+  m.finished, m.finishedByDeviceLoss = true, true
+  return true
+end
+
 -- move finished buffers from the worker into the Source; start playback once
 -- the first one lands
 local function updateThreaded()
@@ -247,9 +317,13 @@ local function updateThreaded()
     end
   end
   if not m.started and not musicHeld then
-    if (MUSIC_BUFFER_COUNT - m.source:getFreeBufferCount()) > 0 then
-      pcall(function() m.source:play() end)
+    if deviceLost then
+      -- the output is gone; do not leave another stream dangling in silence
       m.started = true
+      m.finished, m.finishedByDeviceLoss = true, true
+    elseif (MUSIC_BUFFER_COUNT - m.source:getFreeBufferCount()) > 0 then
+      m.started = true
+      if not startSource(m.source) then playAttemptFailed(m) end
     end
   end
 end
@@ -266,25 +340,72 @@ end
 
 -- Recover from a queue underrun caused by a long render stall.  Called after
 -- Music has handled intentional fanfare pauses, so it never fights the normal
--- pause/resume behavior.
+-- pause/resume behavior.  Once the device is known to be gone it stops
+-- retrying entirely: an unbounded per-frame Source:play against a
+-- disconnected WASAPI device cannot succeed and hides the real diagnosis.
 function ChipAudio.ensureMusicPlaying()
   local m = currentMusic
   if not m or m.finished or musicHeld then return end
+  if deviceLost then
+    m.finished, m.finishedByDeviceLoss = true, true
+    return
+  end
   if m.threaded then
     if not m.started then return end
-    local ok, playing = pcall(function() return m.source:isPlaying() end)
-    if ok and not playing
-       and (MUSIC_BUFFER_COUNT - m.source:getFreeBufferCount()) > 0 then
-      pcall(function() m.source:play() end)
+    local ok, playing = pcall(m.source.isPlaying, m.source)
+    if not ok then return end
+    if playing then
+      playAttempts = 0
+    elseif (MUSIC_BUFFER_COUNT - m.source:getFreeBufferCount()) > 0 then
+      if startSource(m.source) then
+        playAttempts = 0
+      else
+        playAttemptFailed(m)
+      end
     end
   else
     if not m.engine or m.engine:finished() then return end
     local ok, playing = pcall(m.source.isPlaying, m.source)
-    if ok and not playing then
+    if not ok then return end
+    if playing then
+      playAttempts = 0
+    else
       fillSync(MUSIC_FILL_INITIAL)
-      pcall(m.source.play, m.source)
+      if startSource(m.source) then
+        playAttempts = 0
+      else
+        playAttemptFailed(m)
+      end
     end
   end
+end
+
+-- How many failed restarts count as a lost device.  Exposed so a host (or a
+-- test) can reason about the budget instead of hard-coding it.
+ChipAudio.DEVICE_LOST_AFTER_ATTEMPTS = DEVICE_LOST_AFTER_ATTEMPTS
+
+-- True once repeated restart attempts have shown the output device is gone.
+-- Hosts read this to offer a restart instead of leaving the player in silence.
+function ChipAudio.deviceLost()
+  return deviceLost
+end
+
+-- Drop the lost-device latch so playback is tried again: called when audio
+-- output plausibly returned (a window regaining focus after a resume, or an
+-- explicit player retry).  A still-dead device re-latches after the same
+-- budget, so this cannot loop.
+function ChipAudio.recoverDevice()
+  if not deviceLost then return false end
+  deviceLost = false
+  playAttempts = 0
+  -- Undo only the stop the latch itself caused, so a song that genuinely ended
+  -- during the silence is not resurrected.
+  local m = currentMusic
+  if m and m.finishedByDeviceLoss then
+    m.finished, m.finishedByDeviceLoss = false, false
+  end
+  ChipAudio.ensureMusicPlaying()
+  return true
 end
 
 -- Silence the song for the length of a fanfare and start whatever was held
@@ -319,6 +440,12 @@ function ChipAudio.awaitingFirstBuffer()
 end
 
 function ChipAudio.stopMusic()
+  -- A deliberate stop (song change, menu, NEW GAME) ends one attempt streak,
+  -- so an occasional underrun in an earlier song cannot contribute to a later
+  -- device-loss verdict.  The latch itself is deliberately NOT cleared here:
+  -- Music.restoreMap re-plays the map theme the moment a stream stops, and
+  -- clearing it would restart the retry storm this module exists to stop.
+  playAttempts = 0
   if currentMusic and currentMusic.source then
     pcall(currentMusic.source.stop, currentMusic.source)
   end

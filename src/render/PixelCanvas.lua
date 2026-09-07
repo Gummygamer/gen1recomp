@@ -32,10 +32,17 @@
 
 local PixelCanvas = {}
 
--- One framebuffer pixel per w/h unit, always.  `filter` is applied only when
--- given, so callers that relied on LOVE's default ("linear") keep it.
-function PixelCanvas.new(w, h, filter)
-  local canvas = love.graphics.newCanvas(w, h, { dpiscale = 1 })
+-- One framebuffer pixel per w/h unit by default. `density` is an explicit
+-- integer supersampling opt-in; `filter` is applied only when given.
+function PixelCanvas.new(w, h, filter, density)
+  -- Most engine surfaces intentionally use one texel per logical pixel.
+  -- A caller may opt into an integer backing density for artwork that has
+  -- more detail than the original Game Boy grid. LOVE keeps w/h as the
+  -- logical coordinate space while allocating w*density by h*density texels,
+  -- so existing layout, scissors, shaders, and input coordinates do not move.
+  density = tonumber(density) or 1
+  density = math.max(1, math.min(4, math.floor(density)))
+  local canvas = love.graphics.newCanvas(w, h, { dpiscale = density })
   if filter and canvas and canvas.setFilter then
     canvas:setFilter(filter, filter)
   end

@@ -105,8 +105,11 @@ BattleState.BG_WORLD_DIM = 0.55
 
 -- Renderer:setUISize asks the top state for its surface before anything draws
 function BattleState:uiSize()
-  if self:wideLayout() then return WideBattle.WIDTH, WideBattle.HEIGHT end
-  return 160, 144
+  -- Battle art may opt out of the Game Boy's source resolution. An integer
+  -- backing density preserves that detail through the UI composition while
+  -- every battle coordinate remains in the original 160x144 space.
+  if self:wideLayout() then return WideBattle.WIDTH, WideBattle.HEIGHT, 2 end
+  return 160, 144, 2
 end
 
 -- Battle colors itself per-pixel (species pics + HP bar tints), so the

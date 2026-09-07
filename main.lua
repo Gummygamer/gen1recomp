@@ -694,6 +694,7 @@ function love.textinput(text)
   if editorMode and EditorApp.textinput then
     return EditorApp.textinput(text)
   end
+  if Game and Game.textinput then return Game:textinput(text) end
 end
 
 function love.quit()

@@ -634,6 +634,16 @@ function Game:keypressed(key)
   Input:keypressed(key)
 end
 
+-- Free-form text is deliberately separate from the Game Boy button map.
+-- Ordinary game states never implement onTextInput, so forwarding LOVE's
+-- UTF-8 text event is a no-op until a naming/tool/mod screen explicitly
+-- claims it.  This lets text-entry mods accept a real keyboard without
+-- teaching Input about an unbounded alphabet.
+function Game:textinput(text)
+  local top = self.stack and self.stack:top()
+  if top and top.onTextInput then top:onTextInput(text) end
+end
+
 -- Mod enablement is stored with persistent options.  Restarting the actual
 -- LÖVE process ensures scripts, registries, and assets are all rebuilt from
 -- the newly selected mod state.
@@ -791,11 +801,19 @@ end
 function Game:onResume()
   Input:reset()
   TouchControls:reset()
+  -- A resume is also the most likely moment for audio output to have come
+  -- back: the device Windows invalidated while the game was backgrounded
+  -- (unplug/replug, sleep, default-device change) is the reason ChipAudio
+  -- latched in the first place, and it has no way to learn that from inside a
+  -- frame.  A no-op unless the latch is set; if the output is still gone it
+  -- simply re-latches after the same budget.
+  local ChipAudio = require("src.core.ChipAudio")
+  if ChipAudio.deviceLost() then ChipAudio.recoverDevice() end
   -- Chip music may survive NX suspend as a duplicate stream; stop it and let
   -- the active screen re-cue on the next frame (hardware audio check: T19).
   -- Desktop/mobile window-visible flips must not kill overworld music.
   if require("src.core.Platform").isNX() then
-    require("src.core.ChipAudio").stopMusic()
+    ChipAudio.stopMusic()
   end
   local SwitchDiagnostics = require("src.debug.SwitchDiagnostics")
   if SwitchDiagnostics.isEnabled() then

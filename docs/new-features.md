@@ -507,6 +507,43 @@ clash gets a number). Mods the shared profile names but that are not installed
 are reported when the profile is applied; installing them is still a manual
 trip through the mods list or Find Mods.
 
+## Audio output recovery (lost playback device)
+
+Windows can take the sound device away from a running game: a headset or
+monitor unplugged, a sleep/resume cycle, or the default output changing. OpenAL
+Soft's WASAPI mixer then fails to read its buffer padding, prints
+
+    AL lib: (EE) ALCwasapiPlayback_mixerProc: Failed to get padding: 0x88890004
+
+and disconnects the device. `0x88890004` is `AUDCLNT_E_DEVICE_INVALIDATED`.
+Every voice stops and every source reads as not playing from then on, so music
+goes silent with nothing on screen to explain it.
+
+LÖVE 11.5 exposes no playback-device API, so the device cannot be re-opened
+inside the running process and a fresh process is the only guaranteed recovery.
+What the game does instead is stop pretending: after about a second and a half
+of restart attempts that do not stick, it says once, in the log,
+
+    [warn] playback device was lost; music is silent until audio output returns (restart the game if it does not)
+
+and then stops retrying. The current song is treated as ended so nothing keeps
+re-cuing into the silence, and the retry storm that used to run one
+`Source:play` per frame forever is gone.
+
+The verdict deliberately survives a song change, because the map theme is
+re-played the instant any stream stops and clearing it there would rebuild
+exactly that storm. Two things clear it: regaining window focus (a resume is
+the likeliest moment for output to have come back, since backgrounding is what
+often removes it) and a replugged device that starts answering again. Either
+way a still-dead device simply re-latches after the same budget, so recovery
+cannot loop, and when output really is back the song sounds again without
+leaving the map.
+
+A short stall is not a lost device. The same restart path has always recovered
+music after a long frame hitch, and it keeps doing so: the budget is sized to
+outlast a Bluetooth headset or an exclusive-mode device waking up, and any
+restart that sticks resets the count.
+
 ## Windows: no console windows on launcher actions
 
 Checking for updates, browsing a mod index, adding a mod repo, installing a

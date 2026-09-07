@@ -2517,6 +2517,48 @@ function OverworldState:talkTo(npc)
   local unfreeze = function() npc.frozen = false end
   local d = npc.def
 
+  -- A universal, additive talk seam.  `true` means the wrapper presented
+  -- the interaction and owns calling ctx.finish; false/nil falls through to
+  -- the byte-for-byte vanilla dispatch below.  The context labels hazardous
+  -- interactions so conversational mods can leave story, battle, item and
+  -- service side effects intact instead of guessing from text.
+  if Runtime.wantsHook("world.npc.talk") then
+    local entry = Game.data:textEntry(self.map.def.label, d.text)
+    local kind = "dialogue"
+    if mapScripts.talkScript(self.map.id, d.text) then kind = "script"
+    elseif d.item and d.item ~= "0" and d.item ~= 0 then kind = "item"
+    elseif d.pokemon then kind = "pokemon"
+    elseif d.trainerClass and not self:trainerDefeated(npc) then kind = "trainer"
+    elseif entry and entry.mart then kind = "mart"
+    elseif entry and entry.nurse then kind = "nurse"
+    elseif entry and entry.pc then kind = "pc"
+    elseif entry and entry.cableClub then kind = "cable_club" end
+
+    local vanillaText
+    if kind == "dialogue" and d.trainerClass then
+      local header = Game.data:trainerHeader(self.map.def.label, d.index)
+      vanillaText = header and header.after and Game.data.text[header.after]
+    elseif kind == "dialogue" then
+      vanillaText = select(1, Game.data:resolveText(self.map.def.label, d.text))
+    end
+    local handled = Runtime.call("world.npc.talk", function() return false end,
+      Game, {
+        overworld = self,
+        npc = npc,
+        npcId = npc.id,
+        mapId = self.map.id,
+        mapLabel = self.map.def.label,
+        textId = d.text,
+        kind = kind,
+        vanillaText = vanillaText,
+        finish = unfreeze,
+      })
+    if handled == true then
+      npc:facePlayer(self.player)
+      return
+    end
+  end
+
   -- hand-ported scripts always win
   if mapScripts.talkScript(self.map.id, d.text) then
     self:showMapText(d.text, npc, unfreeze)

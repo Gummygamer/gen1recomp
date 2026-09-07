@@ -234,4 +234,100 @@ function HostShell.httpGet(url, userAgent, accept)
   return body
 end
 
+-- POST a JSON document and return the response body.  This is the desktop
+-- transport used by network-enabled tool mods; mobile's download-only JNI
+-- bridge cannot express POST and therefore reports an explicit unsupported
+-- error.  Headers are put in a short-lived file and passed to curl with
+-- `--header @file`, keeping bearer tokens out of the child process command
+-- line.  The body file also avoids shell quoting user/model text.
+function HostShell.httpPostJson(url, body, headers, opts)
+  if type(url) ~= "string" or url == "" then return nil, "missing url" end
+  if type(body) ~= "string" then return nil, "body must be a string" end
+  if not HostShell.haveCurl() then
+    return nil, "JSON POST requires curl on this platform"
+  end
+  if not (love and love.filesystem and love.filesystem.getSaveDirectory) then
+    return nil, "JSON POST needs LOVE"
+  end
+  local dirOk, saveDir = pcall(love.filesystem.getSaveDirectory)
+  if not dirOk or not saveDir or saveDir == "" then return nil, "no save directory" end
+
+  opts = opts or {}
+  local tag = tostring(opts.tag or "request"):gsub("[^%w_%-]", "_")
+  local bodyName = "http_post_" .. tag .. ".json"
+  local headerName = "http_post_" .. tag .. ".headers"
+  local responseName = "http_post_" .. tag .. ".response"
+  local bodyPath = saveDir .. "/" .. bodyName
+  local headerPath = saveDir .. "/" .. headerName
+  local responsePath = saveDir .. "/" .. responseName
+  local headerLines = { "Content-Type: application/json", "Accept: application/json" }
+  for name, value in pairs(headers or {}) do
+    name, value = tostring(name), tostring(value)
+    if name:find("[\r\n]") or value:find("[\r\n]") then
+      return nil, "HTTP headers may not contain newlines"
+    end
+    headerLines[#headerLines + 1] = name .. ": " .. value
+  end
+
+  pcall(love.filesystem.remove, bodyName)
+  pcall(love.filesystem.remove, headerName)
+  pcall(love.filesystem.remove, responseName)
+  local bodyOk, bodyErr = love.filesystem.write(bodyName, body)
+  if not bodyOk then return nil, "could not stage request body: " .. tostring(bodyErr) end
+  local headerOk, headerErr = love.filesystem.write(headerName, table.concat(headerLines, "\n"))
+  if not headerOk then
+    pcall(love.filesystem.remove, bodyName)
+    return nil, "could not stage request headers: " .. tostring(headerErr)
+  end
+
+  local timeout = math.max(5, math.min(tonumber(opts.timeout) or 60, 180))
+  local maxResponseBytes = tonumber(opts.maxResponseBytes)
+  local cmd = "curl -sS --connect-timeout 10 --max-time " .. tostring(timeout)
+    .. " -X POST --data-binary " .. HostShell.quote("@" .. bodyPath)
+    .. " -H " .. HostShell.quote("@" .. headerPath)
+  if maxResponseBytes then
+    cmd = cmd .. " -o " .. HostShell.quote(responsePath)
+  end
+  cmd = cmd .. " " .. HostShell.quote(url)
+  local pipe = HostShell.popen(cmd)
+  if not pipe then
+    pcall(love.filesystem.remove, bodyName)
+    pcall(love.filesystem.remove, headerName)
+    return nil, "could not run curl"
+  end
+  local readOk, out = pcall(function() return pipe:read("*a") end)
+  local closeOk, closeResult = pcall(function() return pipe:close() end)
+  pcall(love.filesystem.remove, bodyName)
+  pcall(love.filesystem.remove, headerName)
+  if not readOk then
+    pcall(love.filesystem.remove, responseName)
+    return nil, "request failed: " .. tostring(out)
+  end
+  if not closeOk or closeResult == nil then
+    pcall(love.filesystem.remove, responseName)
+    return nil, (out and out ~= "" and out) or "curl request failed"
+  end
+  if maxResponseBytes then
+    maxResponseBytes = math.max(1024, math.floor(maxResponseBytes))
+    local infoOk, info = pcall(love.filesystem.getInfo, responseName, "file")
+    if not infoOk or not info then
+      pcall(love.filesystem.remove, responseName)
+      return nil, "empty response from " .. url
+    end
+    if tonumber(info.size) and info.size > maxResponseBytes then
+      pcall(love.filesystem.remove, responseName)
+      return nil, "response exceeded the configured size limit"
+    end
+    local responseOk, response = pcall(love.filesystem.read, responseName, maxResponseBytes + 1)
+    pcall(love.filesystem.remove, responseName)
+    if not responseOk or type(response) ~= "string" or response == "" then
+      return nil, "empty response from " .. url
+    end
+    if #response > maxResponseBytes then return nil, "response exceeded the configured size limit" end
+    return response
+  end
+  if not out or out == "" then return nil, "empty response from " .. url end
+  return out
+end
+
 return HostShell
