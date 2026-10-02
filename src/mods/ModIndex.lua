@@ -11,13 +11,15 @@
 -- no network) so the engine tier can table-drive it, and the fetch/cache half
 -- reaches for curl and options.lua.
 --
--- Sources are never added automatically.  options.modIndexes is a player-built
--- list -- adding an index is a deliberate act of trusting whoever publishes it,
--- so the launcher ships with none and asks.
+-- The main index is built in and cannot be removed.  options.modIndexes keeps
+-- player-added sources, including main-index rows saved by older launchers.
 --
 -- schema_version is a hard gate, not a hint: a bumped feed may reuse a field
 -- name for something else, so an unknown version is refused outright rather
 -- than parsed hopefully.
+--
+-- Carts ride the same feed additively at schema_version 1: `doc.carts` is a
+-- second array beside `doc.mods`, and a feed without it lists no carts.
 
 local ModIndex = {}
 
@@ -26,6 +28,7 @@ local ModIndex = {}
 -- single repo's releases; a whole index is heavier and changes more slowly.
 ModIndex.CACHE_TTL = 24 * 60 * 60
 ModIndex.SCHEMA_VERSION = 1
+ModIndex.CACHE_VERSION = 3
 
 -- ------- pure: source resolution
 
@@ -149,6 +152,43 @@ local function parseLatest(raw)
   }
 end
 
+local function parseDownloads(raw)
+  if type(raw) == "number" or type(raw) == "string" then
+    local n = tonumber(raw)
+    return n and { total = n } or nil
+  end
+  if type(raw) ~= "table" then return nil end
+  local out = {
+    total = tonumber(raw.total),
+    recent = tonumber(raw.recent),
+    window_days = tonumber(raw.window_days),
+    as_of = str(raw.as_of),
+  }
+  if out.total == nil and out.recent == nil then return nil end
+  return out
+end
+
+-- downloadStats(entry) -> { total, recent, window_days, as_of } | nil
+function ModIndex.downloadStats(entry)
+  if type(entry) ~= "table" then return nil end
+  return parseDownloads(entry.downloads)
+end
+
+local function isoDay(v)
+  if type(v) ~= "string" then return nil end
+  return v:match("^(%d%d%d%d%-%d%d%-%d%d)")
+end
+
+-- releaseDates(entry) -> { first, latest } | nil
+function ModIndex.releaseDates(entry)
+  if type(entry) ~= "table" then return nil end
+  local first = isoDay(entry.first_release)
+  local latest = isoDay(entry.last_release)
+    or isoDay(entry.latest and entry.latest.published_at)
+  if not (first or latest) then return nil end
+  return { first = first, latest = latest }
+end
+
 local function parseEntry(raw)
   if type(raw) ~= "table" or not str(raw.id) then return nil end
   return {
@@ -160,6 +200,7 @@ local function parseEntry(raw)
     summary = str(raw.summary) or "",
     categories = strArray(raw.categories),
     tags = strArray(raw.tags),
+    games = strArray(raw.games),
     license = str(raw.license),
     repo = str(raw.repo),
     github = str(raw.github),
@@ -174,18 +215,114 @@ local function parseEntry(raw)
     conflicts = raw.conflicts,
     thumbnail = str(raw.thumbnail),
     description_url = str(raw.description_url),
+    -- Optional release stats a feed author can publish: download counts
+    -- across all releases plus first/last release dates.  Additive-only,
+    -- so a feed that carries them stays readable by every build that
+    -- predates them (and one that does not still renders fine here).
+    downloads = parseDownloads(raw.downloads),
+    first_release = str(raw.first_release),
+    last_release = str(raw.last_release),
     latest = parseLatest(raw.latest),
     update_check = str(raw.update_check) or "pending",
   }
 end
 
--- parse(jsonText [, Json]) -> { schemaVersion, generatedAt, categories, mods }
---                          |  nil, err
+local function numArray(v)
+  local out = {}
+  if type(v) == "table" then
+    for _, entry in ipairs(v) do
+      local n = tonumber(entry)
+      if n then out[#out + 1] = n end
+    end
+  end
+  return out
+end
+
+-- One pinned mod out of a cart's `mods` array, in the bundle's own cart.json
+-- shape: github pins carry repo/version/sha256, gamebanana pins mod/file/md5.
+local function parseCartPin(raw)
+  if type(raw) ~= "table" or not str(raw.id) then return nil end
+  local source = str(raw.source)
+  if source ~= "github" and source ~= "gamebanana" then return nil end
+  local pin = {
+    id = raw.id,
+    source = source,
+    repo = str(raw.repo),
+    version = str(raw.version),
+    sha256 = str(raw.sha256),
+    mod = tonumber(raw.mod),
+    file = tonumber(raw.file),
+    md5 = str(raw.md5),
+    options = type(raw.options) == "table" and raw.options or nil,
+  }
+  if raw.enabled == false then pin.enabled = false end
+  return pin
+end
+
+-- One cart listing.  The eight fields the cart schema marks required are the
+-- gate: a row missing any of them is dropped rather than half-listed, because
+-- every one of them is load bearing for installing or naming the cart.
+local function parseCartEntry(raw)
+  if type(raw) ~= "table" then return nil end
+  if not (str(raw.id) and str(raw.title) and str(raw.author)
+      and str(raw.version) and str(raw.base) and str(raw.seal)
+      and str(raw.repo) and type(raw.mods) == "table") then
+    return nil
+  end
+  local pins = {}
+  for _, pin in ipairs(raw.mods) do
+    local parsed = parseCartPin(pin)
+    if parsed then pins[#pins + 1] = parsed end
+  end
+  if #pins == 0 then return nil end
+  return {
+    kind = "cart",
+    folder = str(raw.folder),
+    id = raw.id,
+    title = raw.title,
+    author = raw.author,
+    version = raw.version,
+    base = raw.base,
+    seal = raw.seal,
+    summary = str(raw.summary) or "",
+    shell = str(raw.shell),
+    finish = str(raw.finish),
+    speeds = numArray(raw.speeds),
+    tags = strArray(raw.tags),
+    repo = raw.repo,
+    github = str(raw.github),
+    downloadURL = str(raw.downloadURL),
+    automatic_version_check = raw.automatic_version_check ~= false,
+    fixed_release_tag = str(raw.fixed_release_tag),
+    game_version = str(raw.game_version),
+    license = str(raw.license),
+    mods = pins,
+    load_order = strArray(raw.load_order),
+    thumbnail = str(raw.thumbnail),
+    description_url = str(raw.description_url),
+    downloads = parseDownloads(raw.downloads),
+    first_release = str(raw.first_release),
+    last_release = str(raw.last_release),
+    latest = parseLatest(raw.latest),
+    update_check = str(raw.update_check) or "pending",
+  }
+end
+
+-- True for a listing that installs through CartStore, not the mod installer.
+function ModIndex.isCart(entry)
+  return type(entry) == "table" and entry.kind == "cart"
+end
+
+-- parse(jsonText [, Json])
+--   -> { schemaVersion, generatedAt, categories, baseGames, mods, carts }
+--   |  nil, err
 -- Never throws: a truncated download, an HTML error page, or a feed from a
 -- future schema all come back as a message the panel can print.
 function ModIndex.parse(jsonText, Json)
+  Json = Json or require("src.link.Json")
+  local notJson = Json.describeUnexpected(jsonText)
+  if notJson then return nil, notJson end
   local ok, result, err = pcall(function()
-    Json = Json or require("src.link.Json")
     local doc, decodeErr = Json.decode(jsonText)
     if type(doc) ~= "table" then
       return nil, decodeErr or "index.json is not an object"
@@ -206,11 +343,21 @@ function ModIndex.parse(jsonText, Json)
       local entry = parseEntry(raw)
       if entry then mods[#mods + 1] = entry end
     end
+    -- Absent carts is the old-feed case, not an error.
+    local carts = {}
+    if type(doc.carts) == "table" then
+      for _, raw in ipairs(doc.carts) do
+        local entry = parseCartEntry(raw)
+        if entry then carts[#carts + 1] = entry end
+      end
+    end
     return {
       schemaVersion = schema,
       generatedAt = str(doc.generated_at),
       categories = strArray(doc.categories),
+      baseGames = strArray(doc.base_games),
       mods = mods,
+      carts = carts,
     }
   end)
   if not ok then return nil, "could not read the index: " .. tostring(result) end
@@ -325,9 +472,15 @@ function ModIndex.compatIssues(entry, ctx)
   local function eachSpec(spec, fn)
     if type(spec) ~= "table" then return end
     for k, v in pairs(spec) do
-      if type(k) == "number" and type(v) == "string" then
-        local id, range = v:match("^([^@]+)@(.+)$")
-        fn(id or v, range)
+      if type(k) == "number" then
+        if type(v) == "table" and type(v.id) == "string" then
+          fn(v.id, v.range or v.version, v.github or v.repo)
+        elseif type(v) == "string" then
+          local main, hashRepo = v:match("^([^#]+)#(.*)$")
+          if main then v = main end
+          local id, range = v:match("^([^@]+)@(.+)$")
+          fn(id or v, range, hashRepo)
+        end
       elseif type(k) == "string" then
         fn(k, type(v) == "string" and v or nil)
       end
@@ -367,21 +520,57 @@ function ModIndex.matches(entry, query)
   return true
 end
 
--- filter(mods, opts) -> a new array.  opts = { query, category, tag }.
--- Category and tag compare case-insensitively; feed order (already sorted by
--- title) is preserved.
+function ModIndex.targets(entry)
+  local ModTargets = require("src.mods.ModTargets")
+  return (ModTargets.normalize(type(entry) == "table" and entry.games or nil))
+end
+
+function ModIndex.targetLabel(entry)
+  local ModTargets = require("src.mods.ModTargets")
+  local ids = ModIndex.targets(entry)
+  if #ids == 0 then return nil end
+  return ModTargets.chip({ games = ids })
+end
+
+-- Category, base and tag compare case-insensitively; feed order (already
+-- sorted by title) is preserved.  `base` is the cart-side equivalent of a
+-- mod's category: a cart plays as exactly one game and has no categories.
 function ModIndex.filter(mods, opts)
   opts = opts or {}
   local want = opts.category and tostring(opts.category):lower() or nil
+  local wantBase = opts.base and tostring(opts.base):lower() or nil
   local wantTag = opts.tag and tostring(opts.tag):lower() or nil
+  local wantGames = nil
+  if opts.game and opts.game ~= "all" then
+    local ModTargets = require("src.mods.ModTargets")
+    local ids = ModTargets.expand(opts.game)
+    if ids then
+      wantGames = {}
+      for _, id in ipairs(ids) do wantGames[id] = true end
+    end
+  end
   local out = {}
   for _, entry in ipairs(mods or {}) do
     local keep = ModIndex.matches(entry, opts.query)
+    if keep and wantGames then
+      if ModIndex.isCart(entry) then
+        keep = wantGames[tostring(entry.base or ""):lower()] == true
+      else
+        local ids = ModIndex.targets(entry)
+        keep = false
+        for _, id in ipairs(ids) do
+          if wantGames[id] then keep = true; break end
+        end
+      end
+    end
     if keep and want then
       keep = false
       for _, c in ipairs(entry.categories or {}) do
         if tostring(c):lower() == want then keep = true; break end
       end
+    end
+    if keep and wantBase then
+      keep = tostring(entry.base or ""):lower() == wantBase
     end
     if keep and wantTag then
       keep = false
@@ -415,23 +604,65 @@ function ModIndex.categoriesIn(index)
   return out
 end
 
+-- Every base game the feed's carts actually play as, in the feed's declared
+-- base_games order, with anything a cart names that the header forgot
+-- appended.  The cart-side twin of categoriesIn.
+function ModIndex.baseGamesIn(index)
+  local out, seen = {}, {}
+  if type(index) ~= "table" then return out end
+  local used = {}
+  for _, entry in ipairs(index.carts or {}) do
+    if entry.base then used[entry.base] = true end
+  end
+  for _, base in ipairs(index.baseGames or {}) do
+    if used[base] and not seen[base] then
+      seen[base] = true
+      out[#out + 1] = base
+    end
+  end
+  for _, entry in ipairs(index.carts or {}) do
+    local base = entry.base
+    if base and not seen[base] then
+      seen[base] = true
+      out[#out + 1] = base
+    end
+  end
+  return out
+end
+
 -- ------- sources (options.modIndexes)
 
 local function loadOptions()
   return require("src.core.SaveData").loadOptions()
 end
 
--- The player's index list, normalised.  Rows are { url, feed, base, fallback,
+local BUILTIN = ModIndex.resolveSource("bryanthaboi/gen1recomp-mod-index")
+BUILTIN.url = "bryanthaboi/gen1recomp-mod-index"
+
+function ModIndex.isBuiltIn(feed)
+  return feed == BUILTIN.feed
+end
+
+-- The player's index list plus the built-in source.  Rows are { url, feed, base, fallback,
 -- label }; `url` is what they typed, kept so the row reads back the way they
--- entered it.
+-- entered it.  Keep an existing main-index row in place to preserve source
+-- precedence and its cache; otherwise append it without rewriting options.
 function ModIndex.sources()
   local ok, opts = pcall(loadOptions)
-  if not ok or type(opts) ~= "table" then return {} end
-  local out = {}
-  for _, row in ipairs(opts.modIndexes or {}) do
+  local saved = ok and type(opts) == "table" and opts.modIndexes or {}
+  local out, hasBuiltin = {}, false
+  for _, row in ipairs(type(saved) == "table" and saved or {}) do
     if type(row) == "table" and type(row.feed) == "string" then
-      out[#out + 1] = row
+      if not ModIndex.isBuiltIn(row.feed) or not hasBuiltin then
+        out[#out + 1] = row
+      end
+      if ModIndex.isBuiltIn(row.feed) then hasBuiltin = true end
     end
+  end
+  if not hasBuiltin then
+    local row = {}
+    for k, v in pairs(BUILTIN) do row[k] = v end
+    out[#out + 1] = row
   end
   return out
 end
@@ -441,6 +672,7 @@ end
 function ModIndex.addSource(input)
   local source, err = ModIndex.resolveSource(input)
   if not source then return nil, err end
+  if ModIndex.isBuiltIn(source.feed) then return nil, "that index is already added" end
   local ok, result, addErr = pcall(function()
     local SaveData = require("src.core.SaveData")
     local opts = loadOptions()
@@ -464,6 +696,7 @@ end
 -- outlives the index it came from.
 function ModIndex.removeSource(feed)
   if type(feed) ~= "string" or feed == "" then return nil, "missing index" end
+  if ModIndex.isBuiltIn(feed) then return nil, "the built-in index cannot be removed" end
   local ok, result = pcall(function()
     local SaveData = require("src.core.SaveData")
     local opts = loadOptions()
@@ -500,6 +733,7 @@ function ModIndex.cacheFresh(entry, now, ttl)
   now = now or os.time()
   ttl = ttl or ModIndex.CACHE_TTL
   return entry ~= nil and type(entry.checkedAt) == "number"
+    and entry.version == ModIndex.CACHE_VERSION
     and (now - entry.checkedAt) < ttl
 end
 
@@ -511,9 +745,12 @@ function ModIndex.writeCache(feed, index)
     opts.modIndexCache = opts.modIndexCache or {}
     opts.modIndexCache[feed] = {
       checkedAt = os.time(),
+      version = ModIndex.CACHE_VERSION,
       generatedAt = index.generatedAt,
       categories = index.categories,
+      baseGames = index.baseGames,
       mods = index.mods,
+      carts = index.carts,
     }
     SaveData.saveOptions(opts)
   end)
@@ -553,7 +790,9 @@ function ModIndex.fetch(source, opts)
       schemaVersion = ModIndex.SCHEMA_VERSION,
       generatedAt = entry.generatedAt,
       categories = entry.categories or {},
+      baseGames = entry.baseGames or {},
       mods = entry.mods or {},
+      carts = entry.carts or {},
     }, nil, { fromCache = true, stale = stale, checkedAt = entry.checkedAt }
   end
 
@@ -585,11 +824,144 @@ function ModIndex.fetch(source, opts)
   return index, nil, { fromCache = false, checkedAt = os.time() }
 end
 
+-- ------- async fetch (the launcher's path; ModIndex.fetch above stays as the
+-- synchronous one for tests and non-UI callers)
+--
+-- ModIndex.fetch blocks on curl, which on the render thread froze the Find
+-- Mods tab for as long as the server took.  These three functions are the
+-- same state machine driven a frame at a time over src/net/Fetch.lua:
+--     local h = ModIndex.beginFetch(source, { force = true })
+--     -- every frame:
+--     local done, index, err, meta = ModIndex.pumpFetch(h)
+-- pumpFetch returns done=false while the request is in flight.  The cache
+-- rules are identical to the sync path: a fresh cache short-circuits the
+-- network entirely (so the handle completes on its first pump), a failed
+-- live fetch falls back to stale cache, and the fallback mirror gets one try
+-- before the feed counts as an outage.
+function ModIndex.beginFetch(source, opts)
+  opts = opts or {}
+  local h = { source = source, opts = opts, stage = "start" }
+  if type(source) ~= "table" or type(source.feed) ~= "string" then
+    h.stage, h.err = "done", "missing index source"
+    return h
+  end
+  return h
+end
+
+-- Shared with the sync path's `cached` closure: read whatever is in the
+-- options cache and shape it like a parsed index.
+local function cachedIndex(feed, stale)
+  local entry = ModIndex.readCache(feed)
+  if not entry then return nil end
+  return {
+    schemaVersion = ModIndex.SCHEMA_VERSION,
+    generatedAt = entry.generatedAt,
+    categories = entry.categories or {},
+    baseGames = entry.baseGames or {},
+    mods = entry.mods or {},
+    carts = entry.carts or {},
+  }, nil, { fromCache = true, stale = stale, checkedAt = entry.checkedAt }
+end
+
+-- Returns done, index, err, meta.
+function ModIndex.pumpFetch(h)
+  if not h then return true, nil, "no handle" end
+  local Fetch = require("src.net.Fetch")
+  local feed = h.source and h.source.feed
+
+  if h.stage == "done" then
+    return true, h.index, h.err, h.meta
+  end
+
+  if h.stage == "start" then
+    if not h.opts.force then
+      local entry = ModIndex.readCache(feed)
+      if ModIndex.cacheFresh(entry) then
+        h.index, h.err, h.meta = cachedIndex(feed, false)
+        h.stage = "done"
+        return true, h.index, h.err, h.meta
+      end
+    end
+    h.job = Fetch.get(feed, { userAgent = "gen1recomp-mod-index" })
+    h.stage = "feed"
+    return false
+  end
+
+  local st = Fetch.poll(h.job)
+  if st.status == "pending" then return false end
+  Fetch.release(h.job)
+
+  if st.status == "ok" and st.body then
+    local index, parseErr = ModIndex.parse(st.body)
+    if index then
+      ModIndex.writeCache(feed, index)
+      h.index, h.meta = index, { fromCache = false, checkedAt = os.time() }
+      h.stage = "done"
+      return true, h.index, nil, h.meta
+    end
+    -- A feed that parses badly is an outage as far as the UI is concerned.
+    h.parseErr = parseErr
+  end
+
+  -- Pages deploys trail a push; the raw mirror is the same file, so a feed
+  -- that fails right after a release is worth one retry elsewhere.
+  if h.stage == "feed" and h.source.fallback then
+    h.job = Fetch.get(h.source.fallback, { userAgent = "gen1recomp-mod-index" })
+    h.stage = "fallback"
+    return false
+  end
+
+  local index, _, meta = cachedIndex(feed, true)
+  h.stage = "done"
+  if index then
+    h.index, h.meta = index, meta
+    return true, index, nil, meta
+  end
+  h.err = h.parseErr or st.err or "index fetch failed"
+  return true, nil, h.err
+end
+
 -- Fetch a description_url / any index-relative text file.  Returns the raw
 -- markdown; callers run it through ModUpdate.cleanBody for display.
 function ModIndex.fetchText(url)
   if type(url) ~= "string" or url == "" then return nil, "no description" end
   return ModIndex.httpGet(url)
+end
+
+function ModIndex.beginFetchText(url)
+  local h = { url = url, stage = "start" }
+  if type(url) ~= "string" or url == "" then
+    h.stage, h.err = "done", "no description"
+  end
+  return h
+end
+
+function ModIndex.pumpFetchText(h)
+  if not h then return true, nil, "no handle" end
+  if h.stage == "done" then return true, h.body, h.err end
+  local Fetch = require("src.net.Fetch")
+  if h.stage == "start" then
+    h.job = Fetch.get(h.url, { userAgent = "gen1recomp-mod-index" })
+    h.stage = "fetching"
+    return false
+  end
+  local st = Fetch.poll(h.job)
+  if st.status == "pending" then return false end
+  Fetch.release(h.job)
+  h.job, h.stage = nil, "done"
+  if st.status == "ok" and type(st.body) == "string" and st.body ~= "" then
+    h.body = st.body
+    return true, h.body
+  end
+  h.err = st.err or "description fetch failed"
+  return true, nil, h.err
+end
+
+function ModIndex.cancelFetchText(h)
+  if not h or not h.job then return end
+  local Fetch = require("src.net.Fetch")
+  pcall(Fetch.cancel, h.job)
+  h.job, h.stage = nil, "done"
 end
 
 -- Download a thumbnail into the save directory and return the love.filesystem

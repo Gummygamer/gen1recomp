@@ -71,8 +71,13 @@ end
 
 -- ------- carried handoff: the data-driven move repair floor
 
-check(require("src.core.Data").constants.fallbackMove == "TACKLE",
-  "CONSTANT_DEFAULTS seeds fallbackMove = TACKLE")
+do
+  local seeded = setmetatable({ constants = {}, field = {}, maps = {}, pokemon = {} },
+    { __index = require("src.core.Data") })
+  seeded:seedDefaults("red")
+  check(seeded.constants.fallbackMove == "TACKLE",
+    "CONSTANT_DEFAULTS seeds fallbackMove = TACKLE")
+end
 
 -- ------- fixture dataset: complete, ROM-free, loader-ready
 
@@ -125,8 +130,11 @@ local hotFiles = {
   ["mods/hot_mod/main.lua"] = [[
 return function(mod)
   mod.content.pokemon:patch("FIXMON_A", { baseStats = { speed = 99 } })
+  -- counted on mod.exports, not _G: a mod's globals are its own
+  -- (src/mods/Sandbox.lua), and a reload gives it a fresh table
+  local out = mod.exports
   mod.events:on("game.ready", function()
-    _G.MODKIT_TEST_READY = (_G.MODKIT_TEST_READY or 0) + 1
+    out.ready = (out.ready or 0) + 1
   end)
 end
 ]],
@@ -148,7 +156,6 @@ local function freshHotData()
   return d
 end
 
-_G.MODKIT_TEST_READY = 0
 local hotData = freshHotData()
 local game = { data = hotData, save = { modData = {} } }
 local bootLoader = Loader.new({ fs = hotFs })
@@ -209,7 +216,8 @@ check(deepEqual(hotData.pokemon.FIXMON_B, fixture.load().pokemon.FIXMON_B),
   "untouched base record is byte-identical after reload")
 check(flushed >= 1, "reload flushed the registered caches")
 check(summary:find("reloaded 1 mods", 1, true) ~= nil, "reload summary counts")
-check(_G.MODKIT_TEST_READY >= 1, "game.ready re-reaches re-subscribed mods")
+check((game.mods.exports.hot_mod or {}).ready >= 1,
+  "game.ready re-reaches re-subscribed mods")
 ChipAudio.stopMusic = savedStopMusic
 check(musicStops >= 1, "reload stops chip music through the cache bus")
 Sound.play(beepData, "Fix_Beep")
@@ -228,7 +236,6 @@ local broken = HotReload.run(game, { fs = hotFs })
 check(#broken.errors > 0, "broken edit lands in the error feed")
 check(hotData.pokemon.FIXMON_A.baseStats.speed == 45,
   "broken mod rolls back to pristine base")
-_G.MODKIT_TEST_READY = nil
 
 -- ------- dev console: repl, verbs, tracer, input isolation
 
@@ -461,6 +468,8 @@ return function(mod)
 end
 ]])
 write(bad .. "/hack.gb", "GBDATA")
+os.execute((mkdir .. " %q"):format(bad .. "/baseroms"))
+write(bad .. "/baseroms/stadium2.z64", "USER ROM")
 write(bad .. "/cachepath.lua",
   'return { pic = "assets/generated/battle/front/mew.png" }')
 
@@ -472,6 +481,8 @@ check(out:find("MK101", 1, true) ~= nil, "schema typo reported as MK101")
 check(out:find("base_stats", 1, true) ~= nil, "MK101 names the bad field")
 check(out:find("MK301", 1, true) ~= nil, "cache reference reported as MK301")
 check(out:find("MK303", 1, true) ~= nil, "ROM patch file reported as MK303")
+check(out:find("MK307", 1, true) ~= nil,
+  "a user-supplied baseroms file is refused explicitly")
 
 out, code = run(("%s tools/modkit.py pack %q -o %q --base fixture")
   :format(python, bad, root .. "/bad.modpkg"))
@@ -635,6 +646,52 @@ check(code == 0, "a finding-free mod still packs: " .. out)
 local packed = io.open(cleanPkg, "rb")
 check(packed ~= nil, "pack writes the package")
 if packed then packed:close() end
+
+-- Reproducible-build callers pin the informational pack timestamp through the
+-- standard SOURCE_DATE_EPOCH contract. Two clean invocations over the same
+-- input must then produce identical archive bytes and metadata.
+local epoch = "1234567890"
+local envPrefix = isWindows
+  and ('set "SOURCE_DATE_EPOCH=%s" && '):format(epoch)
+  or ("SOURCE_DATE_EPOCH=%s "):format(epoch)
+local deterministicA = root .. "/declared-a.modpkg"
+local deterministicB = root .. "/declared-b.modpkg"
+out, code = run(envPrefix ..
+  ("%s tools/modkit.py pack %q -o %q --base fixture")
+    :format(python, declared, deterministicA))
+check(code == 0, "SOURCE_DATE_EPOCH package A succeeds: " .. out)
+out, code = run(envPrefix ..
+  ("%s tools/modkit.py pack %q -o %q --base fixture")
+    :format(python, declared, deterministicB))
+check(code == 0, "SOURCE_DATE_EPOCH package B succeeds: " .. out)
+local archiveA = assert(io.open(deterministicA, "rb"))
+local bytesA = archiveA:read("*a")
+archiveA:close()
+local archiveB = assert(io.open(deterministicB, "rb"))
+local bytesB = archiveB:read("*a")
+archiveB:close()
+check(bytesA == bytesB, "SOURCE_DATE_EPOCH makes package bytes reproducible")
+local inspectPack = root .. "/inspect_pack.py"
+write(inspectPack, [[
+import json, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    meta = json.loads(archive.read(".modkit/pack.json"))
+assert meta["packed_at"] == "2009-02-13T23:31:30Z", meta["packed_at"]
+]])
+out, code = run(("%s %q %q"):format(python, inspectPack, deterministicA))
+check(code == 0, "pack metadata honors SOURCE_DATE_EPOCH: " .. out)
+local invalidEpochPrefix = isWindows
+  and 'set "SOURCE_DATE_EPOCH=not-a-time" && '
+  or "SOURCE_DATE_EPOCH=not-a-time "
+local invalidEpochPkg = root .. "/declared-invalid-epoch.modpkg"
+out, code = run(invalidEpochPrefix ..
+  ("%s tools/modkit.py pack %q -o %q --base fixture")
+    :format(python, declared, invalidEpochPkg))
+check(code == 2, "invalid SOURCE_DATE_EPOCH is a usage failure: " .. out)
+check(out:find("SOURCE_DATE_EPOCH", 1, true) ~= nil,
+  "invalid source epoch names the failed contract")
+check(io.open(invalidEpochPkg, "rb") == nil,
+  "invalid source epoch writes no package")
 
 -- MK305 diffs shipped tables against the imported dataset; fake one under
 -- a scratch repo root so the check exercises the same on ROM-less machines

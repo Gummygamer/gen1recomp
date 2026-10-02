@@ -38,6 +38,7 @@ local Net = require("src.link.Net")
 local Json = require("src.link.Json")
 local Input = require("src.core.Input")
 local LinkBattle = require("src.link.LinkBattle")
+local Handshake = require("src.link.Handshake")
 Input:init()
 require("src.render.Font").load(Data)
 
@@ -66,13 +67,39 @@ table.sort(MOVES)
 -- in the peer's inbox, so one side is mid-queue when the other's action
 -- arrives (Net.loopbackPair on its own delivers instantly, which is the one
 -- thing the real relay never does)
-local function laggyPair(delayA, delayB)
+-- mutation mode: a peer whose messages arrive with a random field (or the
+-- type itself) at the wrong Lua type.  What is delivered is what Session
+-- would deliver -- Wire.sanitize's output, or nothing at all -- so a run
+-- exercises the real receive path rather than a hand-written stand-in.
+local Wire = require("src.link.Wire")
+local HOSTILE = { {}, { 1, 2, 3 }, 0, -1, 999, "s", "", true, false, math.huge }
+
+local function mutate(rnd, msg)
+  local keys = {}
+  for k in pairs(msg) do
+    if k ~= "type" then keys[#keys + 1] = k end
+  end
+  table.sort(keys)
+  if #keys == 0 or rnd(1, 100) <= 20 then
+    msg.type = HOSTILE[rnd(1, #HOSTILE)]
+  else
+    msg[keys[rnd(1, #keys)]] = HOSTILE[rnd(1, #HOSTILE)]
+  end
+  return msg
+end
+
+local function laggyPair(delayA, delayB, rnd, mutateRate)
   local a, b = Net.loopbackPair()
   a.wire, b.wire = {}, {}
   a.delay, b.delay = delayA or 0, delayB or 0
+  a.mutateRate, b.mutateRate = mutateRate or 0, mutateRate or 0
   local function send(self, msg)
     if self.closed then return end
     local decoded = Json.decode(Json.encode(msg)) -- same round trip as the wire
+    if decoded and self.mutateRate > 0 then
+      if rnd(1, 100) <= self.mutateRate then decoded = mutate(rnd, decoded) end
+      decoded = Wire.sanitize(decoded)
+    end
     if decoded then table.insert(self.wire, { msg = decoded, at = self.delay }) end
   end
   local function update(self)
@@ -143,11 +170,15 @@ local function firstMismatch(a, b)
 end
 
 -- Returns nil when the run agreed, or a description of how it split.
-local function runOne(seed)
+local function runOne(seed, mutateRate, rulesetSplit)
   local rnd = makeRandom(seed)
   -- the two sides are deliberately different clients
   local optsA = { animations = false, textSpeed = 1, battleStyle = "SET" }
   local optsB = { animations = true, textSpeed = 3, battleStyle = "SHIFT" }
+  if rulesetSplit then
+    optsA.ruleset = seed % 2 == 0 and "modern_clean" or "gen1_faithful"
+    optsB.ruleset = seed % 2 == 0 and "gen1_faithful" or "modern_clean"
+  end
   local stepsA, stepsB = rnd(1, 4), 1   -- A fast-forwards, B does not
   local lagA, lagB = rnd(0, 8), rnd(0, 8)
 
@@ -155,17 +186,23 @@ local function runOne(seed)
   gameA.save.party = randomParty(rnd, rnd(1, 4))
   gameB.save.party = randomParty(rnd, rnd(1, 4))
 
-  local netA, netB = laggyPair(lagA, lagB)
+  local netA, netB = laggyPair(lagA, lagB, rnd, mutateRate)
   local battleSeed = rnd(1, 2 ^ 30)
+  local dealtRuleset = rulesetSplit and Handshake.ruleset(gameA) or nil
   local battleA = LinkBattle.newHost(gameA, netA, {
     myParty = Protocol.packParty(gameA.save.party),
     theirParty = Protocol.packParty(gameB.save.party),
-    theirName = "BLUE", seed = battleSeed })
+    theirName = "BLUE", seed = battleSeed, ruleset = dealtRuleset })
   local battleB = LinkBattle.newGuest(gameB, netB, {
     myParty = Protocol.packParty(gameB.save.party),
     theirParty = Protocol.packParty(gameA.save.party),
-    theirName = "RED", seed = battleSeed })
+    theirName = "RED", seed = battleSeed, ruleset = dealtRuleset })
   if not battleA or not battleB then return nil, 0 end
+  if rulesetSplit and battleA.ruleset ~= battleB.ruleset then
+    return ("seed %d: the two sides hold different rulesets (%s vs %s)"):format(
+      seed, tostring(battleA.ruleset and battleA.ruleset.name),
+      tostring(battleB.ruleset and battleB.ruleset.name)), 0
+  end
 
   local resA, resB
   battleA.onFinish = function(r) resA = r end
@@ -187,6 +224,13 @@ local function runOne(seed)
   local function drive(side)
     local bt = side.bt
     if bt.result then return end
+    local top = side.game.stack:top()
+    if top and top.forceSwitch and top.party then
+      for i, mon in ipairs(top.party) do
+        if mon.hp > 0 then top.index = i break end
+      end
+      return
+    end
     if bt.phase ~= "menu" then side.menuFrames = 0 end
     if bt.phase == "moveSelect" then
       local usable = {}
@@ -223,6 +267,12 @@ local function runOne(seed)
       end
     end
     local turn, part = firstMismatch(battleA, battleB)
+    if turn and mutateRate then
+      -- a corrupted action IS a divergence; what matters here is that the
+      -- match ends by its own rules (desync draw, forfeit, disconnect)
+      -- rather than throwing
+      return nil, battleA.turnCount or 0
+    end
     if turn then
       return ("seed %d: turn %d %s split (lag %d/%d, steps %d/%d)"):format(
         seed, turn, part, lagA, lagB, stepsA, stepsB), battleA.turnCount or 0
@@ -230,7 +280,7 @@ local function runOne(seed)
   end
   -- a battle still running at the guard is a stalemate (two mons that cannot
   -- KO each other), not a split; only a finished one can be checked mirrored
-  if guard < 60000
+  if not mutateRate and guard < 60000
      and (battleA.player.mon.hp ~= battleB.enemy.mon.hp
           or battleA.enemy.mon.hp ~= battleB.player.mon.hp) then
     return ("seed %d: final HP not mirrored (%d/%d vs %d/%d)"):format(
@@ -242,6 +292,8 @@ end
 
 local RUNS = tonumber(arg and arg[1]) or 40
 local FIRST = tonumber(arg and arg[2]) or 1
+
+local MUTATION_RUNS = tonumber(arg and arg[3]) or math.max(4, math.floor(RUNS / 4))
 
 local failures, turns = 0, 0
 for seed = FIRST, FIRST + RUNS - 1 do
@@ -256,5 +308,38 @@ for seed = FIRST, FIRST + RUNS - 1 do
   end
 end
 print(("link desync fuzz: %d runs, %d turns, %d failures"):format(RUNS, turns, failures))
+
+local mutationFailures = 0
+for seed = FIRST, FIRST + MUTATION_RUNS - 1 do
+  local ok, why = pcall(runOne, seed, 15)
+  if not ok then
+    mutationFailures = mutationFailures + 1
+    print("FAIL link mutation fuzz seed " .. seed .. ": " .. tostring(why))
+  elseif why then
+    mutationFailures = mutationFailures + 1
+    print("FAIL link mutation fuzz " .. why)
+  end
+end
+print(("link mutation fuzz: %d runs, %d failures"):format(
+  MUTATION_RUNS, mutationFailures))
+
+local rulesetFailures, rulesetTurns = 0, 0
+for seed = FIRST, FIRST + RUNS - 1 do
+  local ok, why, t = pcall(runOne, seed, nil, true)
+  rulesetTurns = rulesetTurns + (t or 0)
+  if not ok then
+    rulesetFailures = rulesetFailures + 1
+    print("FAIL link ruleset-split fuzz seed " .. seed .. ": " .. tostring(why))
+  elseif why then
+    rulesetFailures = rulesetFailures + 1
+    print("FAIL link ruleset-split fuzz " .. why)
+  end
+end
+print(("link ruleset-split fuzz: %d runs, %d turns, %d failures"):format(
+  RUNS, rulesetTurns, rulesetFailures))
+
 assert(failures == 0, failures .. " lockstep run(s) diverged")
+assert(mutationFailures == 0, mutationFailures .. " mutated run(s) threw")
+assert(rulesetFailures == 0,
+       rulesetFailures .. " ruleset-split run(s) diverged")
 return true

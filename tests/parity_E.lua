@@ -32,17 +32,44 @@ local check, eq = S.check, S.eq
 local realTextBox = package.loaded["src.render.TextBox"]
 local shownTexts = {}
 local choiceAnswer = true -- scripted YES/NO for opts.choice boxes
+local realSoundOpts = require("src.render.TextBox").soundOpts
 package.loaded["src.render.TextBox"] = {
   new = function(game, text, onDone, opts)
     table.insert(shownTexts, text)
-    if opts and opts.choice then
-      opts.choice(choiceAnswer)
-    elseif onDone then
-      onDone()
-    end
-    return { text = text }
+    return { text = text, box = true, onDone = onDone,
+             stay = opts and opts.stay,
+             choice = opts and opts.choice }
   end,
+  soundOpts = realSoundOpts,
 }
+
+-- ../pokered/scripts/CinnabarLabFossilRoom.asm:74-83
+local realCommands = package.loaded["src.script.Commands"]
+package.loaded["src.script.Commands"] = nil
+local ScriptCommands = require("src.script.Commands")
+local function fakeRunner(game, ow)
+  local runner = {}
+  runner.resume = function() end
+  runner.yield = function() end
+  runner.isRunning = function() return false end
+  function runner:run(script, extra)
+    local ctx = { game = game, save = game.save, overworld = ow, runner = runner }
+    for k, v in pairs(extra or {}) do ctx[k] = v end
+    local labels = {}
+    for i, row in ipairs(script) do
+      if row[1] == "label" then labels[row[2]] = i end
+    end
+    local pc = 1
+    while pc <= #script do
+      local row = script[pc]
+      local fn = ScriptCommands[row[1]]
+      local target = fn and fn(ctx, row[2], row[3], row[4], row[5])
+      pc = target and (labels[target] or (#script + 1)) or (pc + 1)
+    end
+    if ctx.onDone then ctx.onDone() end
+  end
+  return runner
+end
 
 -- The fossil-select menu (GiveFossilToCinnabarLab's bordered list,
 -- src/ui/Menu.lua) selects from frame-stepped input; stub it to pick
@@ -51,16 +78,12 @@ package.loaded["src.render.TextBox"] = {
 local realMenu = package.loaded["src.ui.Menu"]
 local menuPick = 1
 local menuLabels = nil
+local menuUnder, seesUnderMenu = nil, nil
 package.loaded["src.ui.Menu"] = {
   new = function(game, items, opts)
     menuLabels = {}
     for i, it in ipairs(items) do menuLabels[i] = it.label end
-    if menuPick == "cancel" then
-      if opts and opts.onCancel then opts.onCancel() end
-    else
-      items[menuPick].onSelect()
-    end
-    return {}
+    return { menu = true, items = items, opts = opts or {} }
   end,
 }
 
@@ -77,16 +100,53 @@ check(story5.CINNABAR_ISLAND ~= nil and story5.CINNABAR_ISLAND.onEnter ~= nil,
 
 local talkScientist1 = story2.CINNABAR_LAB_FOSSIL_ROOM.talk.TEXT_CINNABARLABFOSSILROOM_SCIENTIST1
 
+local function newStack()
+  local stack = { states = {} }
+  function stack:pop() return table.remove(self.states) end
+  function stack:top() return self.states[#self.states] end
+  function stack:push(state)
+    table.insert(self.states, state)
+    if state.menu then
+      menuUnder = self.states[#self.states - 1]
+      local pick, opts = menuPick, state.opts
+      if pick == "cancel" then
+        if not opts.keepOnCancel then self:pop() end
+        if opts.onCancel then opts.onCancel() end
+      else
+        local item = state.items[pick]
+        if not item.keepOpen then self:pop() end
+        if item.onSelect then item.onSelect() end
+      end
+    elseif state.box then
+      if state.stay then
+        if state.stay.onShown then state.stay.onShown() end
+      elseif state.choice then
+        local below = self.states[#self.states - 1]
+        seesUnderMenu = (below and below.menu) or false
+        self:pop()
+        state.choice(choiceAnswer)
+      else
+        self:pop()
+        if state.onDone then state.onDone() end
+      end
+    end
+  end
+  return stack
+end
+
 local function newGame()
   local save = SaveData.newGame()
-  local game = { data = Data, save = save, stack = { push = function() end } }
+  local game = { data = Data, save = save, stack = newStack() }
   return game
 end
 
 local function talk(game)
   shownTexts = {}
+  game.stack.states = {}
   local doneCalled = false
-  talkScientist1(game, {}, nil, function() doneCalled = true end)
+  local ow = {}
+  ow.runner = fakeRunner(game, ow)
+  talkScientist1(game, ow, nil, function() doneCalled = true end)
   return doneCalled
 end
 
@@ -97,7 +157,7 @@ do
   check(not game.save.flags.EVENT_GAVE_FOSSIL_TO_LAB, "no fossil: GAVE_FOSSIL_TO_LAB not set")
   check(not game.save.flags.EVENT_LAB_STILL_REVIVING_FOSSIL, "no fossil: STILL_REVIVING not set")
   eq(#game.save.party, 0, "no fossil: party unchanged")
-  eq(shownTexts[#shownTexts], "No! Is too bad!", "no fossil shows NoFossilsText")
+  eq(shownTexts[#shownTexts], "No! Is too bad!{DONE}", "no fossil shows NoFossilsText")
 end
 
 -- === 2)-5) full deposit -> pending -> re-entry -> grant cycle ===
@@ -112,6 +172,14 @@ do
   check(talk(game), "deposit talk completes")
   eq(menuLabels and #menuLabels, 1, "fossil menu lists the one carried fossil")
   eq(menuLabels and menuLabels[1], "OLD AMBER", "fossil menu shows the item name")
+  -- under the TextBoxBorder 0,0 menu (engine/events/cinnabar_lab.asm:22-24)
+  check(menuUnder ~= nil and menuUnder.box == true,
+        "the intro dialogue box is still on the stack under the fossil menu")
+  eq(menuUnder and menuUnder.text, shownTexts[1],
+     "and it is the intro text, not a box pushed after it")
+  -- SeesFossilText prints below it (engine/events/cinnabar_lab.asm:55-67)
+  eq(seesUnderMenu, true, "the menu box is still up when SeesFossilText prints")
+  eq(#game.stack.states, 0, "and both boxes are popped exactly once when it ends")
   local sees
   for _, s in ipairs(shownTexts) do
     if s:find("Resurrection") then sees = s end
@@ -131,7 +199,7 @@ do
   check(game.save.flags.EVENT_LAB_STILL_REVIVING_FOSSIL == true,
         "same-visit re-talk: STILL_REVIVING still set")
   eq(#game.save.party, 0, "same-visit re-talk: still no mon granted")
-  eq(shownTexts[#shownTexts], "I take a little\ntime!\fYou go for walk a\nlittle while!",
+  eq(shownTexts[#shownTexts], "I take a little\ntime!\fYou go for walk a\nlittle while!{DONE}",
      "same-visit re-talk shows GoForAWalkText")
 
   -- 4) leaving and re-entering CINNABAR_ISLAND (its onEnter) clears
@@ -154,6 +222,14 @@ do
   check(not game.save.flags.EVENT_LAB_STILL_REVIVING_FOSSIL, "grant resets STILL_REVIVING")
   check(not game.save.flags.EVENT_LAB_HANDING_OVER_FOSSIL_MON, "grant resets HANDING_OVER_FOSSIL_MON")
   eq(game.save.labFossilMon, nil, "pending species cleared after grant")
+  -- GivePokemon prints for itself (engine/events/give_pokemon.asm:52-71)
+  local sawGot, sawNick = false, false
+  for _, s in ipairs(shownTexts) do
+    if s:find("got", 1, true) and s:find("AERODACTYL", 1, true) then sawGot = true end
+    if s:find("nickname", 1, true) then sawNick = true end
+  end
+  check(sawGot, "the grant prints _GotMonText")
+  check(sawNick, "and asks for a nickname (AddPartyMon -> AskName)")
 end
 
 -- === the menu lists every carried fossil in FossilsList scan order
@@ -179,7 +255,9 @@ do
   game.save.inventory.DOME_FOSSIL = 1
   menuPick = "cancel"
   check(talk(game), "menu-cancel talk completes")
-  eq(shownTexts[#shownTexts], "Aiyah! You come\nagain!", "menu B-out shows ComeAgainText")
+  eq(shownTexts[#shownTexts], "Aiyah! You come\nagain!{DONE}", "menu B-out shows ComeAgainText")
+  -- (engine/events/cinnabar_lab.asm:70-73)
+  eq(#game.stack.states, 0, "the B-out path pops the menu and the intro box too")
   eq(game.save.inventory.DOME_FOSSIL, 1, "fossil kept after menu cancel")
   check(not game.save.flags.EVENT_GAVE_FOSSIL_TO_LAB, "menu cancel sets no quest flags")
   eq(game.save.labFossilMon, nil, "menu cancel leaves no pending species")
@@ -191,7 +269,8 @@ do
   game.save.inventory.DOME_FOSSIL = 1
   menuPick, choiceAnswer = 1, false
   check(talk(game), "confirm-NO talk completes")
-  eq(shownTexts[#shownTexts], "Aiyah! You come\nagain!", "NO on the confirm shows ComeAgainText")
+  eq(shownTexts[#shownTexts], "Aiyah! You come\nagain!{DONE}", "NO on the confirm shows ComeAgainText")
+  eq(#game.stack.states, 0, "the NO path pops the menu and the intro box too")
   eq(game.save.inventory.DOME_FOSSIL, 1, "fossil kept after NO")
   check(not game.save.flags.EVENT_GAVE_FOSSIL_TO_LAB, "NO sets no quest flags")
   eq(game.save.labFossilMon, nil, "NO leaves no pending species")
@@ -199,5 +278,6 @@ end
 
 package.loaded["src.render.TextBox"] = realTextBox
 package.loaded["src.ui.Menu"] = realMenu
+package.loaded["src.script.Commands"] = realCommands
 
 S.finish()

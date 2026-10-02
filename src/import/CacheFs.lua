@@ -28,21 +28,29 @@
 -- ordinary love.filesystem/save-directory behaviour.
 
 local CacheFs = {}
+local Platform = require("src.core.Platform")
+local SaveData = setmetatable({}, {
+  __index = function(_, k) return require("src.core.SaveData")[k] end,
+})
 
 local SEP = package.config:sub(1, 1)
 
 -- Cache-relative paths are prefixed with this before every read/write, so a
--- Blue/Yellow import lands under its GameVersion.cachePrefix (blue/, yellow/)
--- while a Red import keeps the historical root.  The launcher sets it per
--- import / per readiness check; it stays "" for Red.  Runtime *reads*
--- (require / newImage) do NOT go through here -- CacheFs.mountVersion overlays
--- the active version's subtree onto the un-prefixed paths instead.
+-- version's import lands under its GameVersion.cachePrefix (red/, blue/,
+-- yellow/, gold/).  The launcher sets it per import / per readiness check; it stays
+-- "" outside those flows.  Runtime *reads* (require / newImage) do NOT go
+-- through here -- CacheFs.mountVersion overlays the active version's subtree
+-- onto the un-prefixed paths instead.
 CacheFs.prefix = ""
 
 local function withPrefix(rel)
   local p = CacheFs.prefix
   if p == nil or p == "" then return rel end
   return p .. rel
+end
+
+local function unsafe_rel(rel)
+  return type(rel) ~= "string" or rel:find("..", 1, true) ~= nil
 end
 
 -- lazily-resolved windowless mkdir: function(absolutePath) or false when
@@ -52,26 +60,10 @@ local mkdirFn = nil
 local function resolveMkdir()
   if mkdirFn ~= nil then return mkdirFn end
   mkdirFn = false
-  local ok, ffi = pcall(require, "ffi")
+  if Platform.isUWP() then return mkdirFn end
+  local ok = pcall(require, "ffi")
   if not ok then return mkdirFn end
-  if ffi.os == "Windows" then
-    -- kernel32 is reliably resolvable through ffi.C on Windows (the engine
-    -- already binds it in DiscordPresence); CreateDirectoryA returns
-    -- nonzero on success and 0 when the directory already exists -- both
-    -- fine, the result is ignored.
-    pcall(ffi.cdef,
-      "int CreateDirectoryA(const char *lpPathName, void *lpSecurityAttributes);")
-    local resolved = pcall(function() return ffi.C.CreateDirectoryA end)
-    if resolved then
-      mkdirFn = function(path) pcall(ffi.C.CreateDirectoryA, path, nil) end
-    end
-  else
-    pcall(ffi.cdef, "int mkdir(const char *pathname, unsigned int mode);")
-    local resolved = pcall(function() return ffi.C.mkdir end)
-    if resolved then
-      mkdirFn = function(path) pcall(ffi.C.mkdir, path, 493) end -- 0755
-    end
-  end
+  mkdirFn = function(path) return SaveData.mkdirNative(path) end
   return mkdirFn
 end
 
@@ -83,6 +75,7 @@ local rmdirFn = nil
 local function resolveRmdir()
   if rmdirFn ~= nil then return rmdirFn end
   rmdirFn = false
+  if Platform.isUWP() then return rmdirFn end
   local ok, ffi = pcall(require, "ffi")
   if not ok then return rmdirFn end
   if ffi.os == "Windows" then
@@ -113,6 +106,8 @@ local physfsMountFn = nil
 local function resolveMount()
   if physfsMountFn ~= nil then return physfsMountFn end
   physfsMountFn = false
+  if Platform.isUWP() then return physfsMountFn end
+  if love and love.filesystem and love.filesystem._mounts then return physfsMountFn end
   local ok, ffi = pcall(require, "ffi")
   if not ok then return physfsMountFn end
   pcall(ffi.cdef,
@@ -156,6 +151,8 @@ local physfsUnmountFn = nil
 local function resolveUnmount()
   if physfsUnmountFn ~= nil then return physfsUnmountFn end
   physfsUnmountFn = false
+  if Platform.isUWP() then return physfsUnmountFn end
+  if love and love.filesystem and love.filesystem._mounts then return physfsUnmountFn end
   local ok, ffi = pcall(require, "ffi")
   if not ok then return physfsUnmountFn end
   pcall(ffi.cdef, "int PHYSFS_unmount(const char *oldDir);")
@@ -216,20 +213,29 @@ end
 -- desktop portable install (SaveData) and a working windowless mkdir.
 local portableRoot = nil
 local portableResolved = false
+local portableFailure = nil
 local function resolvePortableRoot()
   if portableResolved then return portableRoot end
   portableResolved = true
   portableRoot = nil
-  if not resolveMkdir() then return nil end
+  portableFailure = nil
   local base = require("src.core.SaveData").portableBaseDir()
   if not base then return nil end
-  if love.filesystem.getSource and base == love.filesystem.getSource() then
+  if not resolveMkdir() then
+    portableFailure = "portable mode is on (" .. base .. ") but no folder-creation call is available"
+  elseif type(love.filesystem) == "table" and love.filesystem.getSource
+      and base == love.filesystem.getSource() then
     -- source run: the folder is already the physfs source
     portableRoot = base
   elseif mountReadable(base) then
     -- fused build: base is next to the executable; mount it so io.* writes
     -- there are visible to love.filesystem/require/newImage
     portableRoot = base
+  else
+    portableFailure = "portable mode is on (" .. base .. ") but the folder could not be mounted"
+  end
+  if portableFailure then
+    require("src.core.Logger").warn("%s", portableFailure)
   end
   return portableRoot
 end
@@ -238,8 +244,25 @@ function CacheFs.root()
   return resolvePortableRoot()
 end
 
+function CacheFs.portableError()
+  resolvePortableRoot()
+  return portableFailure
+end
+
+function CacheFs._resetPortableForTests()
+  portableRoot = nil
+  portableResolved = false
+  portableFailure = nil
+end
+
 local function realPath(root, rel)
   return root .. SEP .. rel:gsub("/", SEP)
+end
+
+local knownDirs = {}
+
+local function forgetDirs()
+  for k in pairs(knownDirs) do knownDirs[k] = nil end
 end
 
 -- create every parent directory of `rel` under `root` (best effort; an
@@ -247,55 +270,140 @@ end
 -- subsequent io.open write fails)
 local function ensureParents(root, rel)
   local mkdir = resolveMkdir()
-  if not mkdir then return end
   local parts = {}
   for part in rel:gmatch("[^/]+") do parts[#parts + 1] = part end
   local cur = root
+  local curRel = ""
   for i = 1, #parts - 1 do
     cur = cur .. SEP .. parts[i]
-    mkdir(cur)
+    curRel = (curRel == "" and parts[i]) or (curRel .. "/" .. parts[i])
+    if not knownDirs[cur] then
+      if mkdir then
+        mkdir(cur)
+      elseif love and love.filesystem and love.filesystem.createDirectory then
+        love.filesystem.createDirectory(curRel)
+      end
+      knownDirs[cur] = true
+    end
   end
+end
+
+local function resolveWriteRoot()
+  local root = CacheFs.root()
+  if root then return root end
+  if portableFailure then return nil, portableFailure end
+  if Platform.isNX and Platform.isNX() then return nil end
+  if Platform.isUWP and Platform.isUWP() then return nil end
+  if love and (love._version or love.getVersion) and love.filesystem and love.filesystem.getSaveDirectory then
+    local saveDir = love.filesystem.getSaveDirectory()
+    if saveDir and type(saveDir) == "string" and saveDir ~= "" and not unsafe_rel(saveDir) then
+      return saveDir
+    end
+  end
+  return nil
+end
+
+local function ensureDirectory(parent)
+  if not parent or parent == "" or knownDirs[parent] then return true end
+  if not (love and love.filesystem and love.filesystem.createDirectory) then return true end
+  if love.filesystem.createDirectory(parent) then
+    knownDirs[parent] = true
+    return true
+  end
+  local info = love.filesystem.getInfo and love.filesystem.getInfo(parent)
+  if info and info.type == "directory" then
+    knownDirs[parent] = true
+    return true
+  end
+  local reason = info and ("a " .. info.type .. " already exists there") or "unknown reason"
+  return false, "could not create " .. parent .. ": " .. reason
 end
 
 -- write cache-relative `rel` (forward-slash path) with the given bytes;
 -- returns ok, err like love.filesystem.write
 function CacheFs.write(rel, data)
   rel = withPrefix(rel)
-  local root = CacheFs.root()
+  if unsafe_rel(rel) then return false, "unsafe cache path" end
+  local root, rootErr = resolveWriteRoot()
+  if not root and rootErr then return false, rootErr end
   if root then
     ensureParents(root, rel)
-    local f, err = io.open(realPath(root, rel), "wb")
+    local f, err = SaveData.openNative(realPath(root, rel), "wb")
     if not f then return false, err end
     f:write(data)
     f:close()
     return true
   end
   local parent = rel:match("^(.*)/[^/]+$")
-  if parent and not love.filesystem.createDirectory(parent) then
-    local info = love.filesystem.getInfo(parent)
-    local reason = info and ("a " .. info.type .. " already exists there")
-      or "unknown reason"
-    return false, "could not create " .. parent .. ": " .. reason
+  if parent then
+    local okDir, dirErr = ensureDirectory(parent)
+    if not okDir then return false, dirErr end
   end
   return love.filesystem.write(rel, data)
 end
 
--- read cache-relative `rel`; returns the bytes or nil
-function CacheFs.read(rel)
+-- Open a cache-relative file for streaming replacement. The returned handle
+-- has write(bytes) and close() methods and follows the same portable/save-dir
+-- routing as CacheFs.write without forcing the caller to hold the whole file
+-- in one Lua string.
+function CacheFs.openWrite(rel)
   rel = withPrefix(rel)
+  if unsafe_rel(rel) then return nil, "unsafe cache path" end
+  local root, rootErr = resolveWriteRoot()
+  if not root and rootErr then return nil, rootErr end
+  if root then
+    ensureParents(root, rel)
+    local f, err = SaveData.openNative(realPath(root, rel), "wb")
+    if not f then return nil, err end
+    return {
+      write = function(_, data)
+        local ok, writeErr = f:write(data)
+        if not ok then return nil, writeErr end
+        return true
+      end,
+      close = function() f:close() end,
+    }
+  end
+  if not (love and love.filesystem and love.filesystem.newFile) then
+    return nil, "streaming cache writes are unavailable"
+  end
+  local parent = rel:match("^(.*)/[^/]+$")
+  if parent then
+    local okDir, dirErr = ensureDirectory(parent)
+    if not okDir then return nil, dirErr end
+  end
+  local file, makeErr = love.filesystem.newFile(rel)
+  if not file then return nil, makeErr or "could not create cache file" end
+  local ok, openErr = file:open("w")
+  if not ok then return nil, openErr or "could not open cache file" end
+  return file
+end
+
+-- Read an exact version-qualified path without consulting CacheFs.prefix.
+-- Readiness checks use this to inspect another version without global state.
+function CacheFs.readAt(rel)
+  if unsafe_rel(rel) then return nil end
   local root = CacheFs.root()
   if root then
-    local f = io.open(realPath(root, rel), "rb")
+    local f = SaveData.openNative(realPath(root, rel), "rb")
     if not f then return nil end
     local data = f:read("*a")
     f:close()
     return data
   end
+  -- headless (plain luajit, e.g. the modkit validate/pack driver): there is
+  -- no save directory to read from, so a cache miss is nil, not a crash
+  if not (love and love.filesystem and love.filesystem.read) then return nil end
   return love.filesystem.read(rel)
 end
 
+-- read cache-relative `rel`; returns the bytes or nil
+function CacheFs.read(rel)
+  return CacheFs.readAt(withPrefix(rel))
+end
+
 -- Read cache-relative `rel` for the active GameVersion when PhysFS may hide
--- prefixed Blue/Yellow trees (fused NX mount hole). Same order Data:load
+-- prefixed Blue/Yellow/Gold trees (fused NX mount hole). Same order Data:load
 -- already used: active version prefix with CacheFs.prefix cleared, then
 -- `rel` under the caller's CacheFs.prefix. Returns the bytes or nil.
 function CacheFs.readActive(rel)
@@ -312,28 +420,66 @@ function CacheFs.readActive(rel)
   return nil
 end
 
+-- Load a generated Lua table the way Data:load does: versioned save-dir
+-- bytes first (gold/data/generated/maps.lua), then the un-prefixed path.
+-- Game2/World used love.filesystem.load("data/generated/...") which misses
+-- on fused NX when the gold/ overlay mount fails -- intro art still loads
+-- via NxAssetOverlay, but oak_speech.lua / font.lua / maps.lua do not.
+function CacheFs.loadActive(rel)
+  local bytes = CacheFs.readActive(rel)
+  if type(bytes) == "string" then
+    local GameVersion = require("src.core.GameVersion")
+    local loader = loadstring or load
+    local chunk, err = loader(bytes, "@" .. GameVersion.cachePrefix() .. rel)
+    if not chunk then return nil, err end
+    local ok, value = pcall(chunk)
+    if not ok then return nil, value end
+    return value
+  end
+  if love and love.filesystem and love.filesystem.load then
+    local chunk, err = love.filesystem.load(rel)
+    if not chunk then return nil, err end
+    local ok, value = pcall(chunk)
+    if not ok then return nil, value end
+    return value
+  end
+  return nil, "Could not open file " .. rel .. ". Does not exist."
+end
+
 -- does cache-relative `rel` exist as a file?
-function CacheFs.exists(rel)
-  rel = withPrefix(rel)
+function CacheFs.existsAt(rel)
+  if unsafe_rel(rel) then return false end
   local root = CacheFs.root()
   if root then
-    local f = io.open(realPath(root, rel), "rb")
+    local f = SaveData.openNative(realPath(root, rel), "rb")
     if not f then return false end
     f:close()
     return true
   end
-  return love.filesystem.getInfo(rel, "file") ~= nil
+  if love and love.filesystem and love.filesystem.getInfo then
+    return love.filesystem.getInfo(rel, "file") ~= nil
+  end
+  return false
+end
+
+
+function CacheFs.exists(rel)
+  return CacheFs.existsAt(withPrefix(rel))
 end
 
 -- remove a single cache-relative file
 function CacheFs.remove(rel)
+  forgetDirs()
   rel = withPrefix(rel)
+  if unsafe_rel(rel) then return false end
   local root = CacheFs.root()
   if root then
-    os.remove(realPath(root, rel))
+    SaveData.removeNative(realPath(root, rel))
     return
   end
-  love.filesystem.remove(rel)
+  if love and love.filesystem and love.filesystem.remove then
+    love.filesystem.remove(rel)
+  end
 end
 
 -- Remove a single cache-relative directory once its files are gone.  Needed
@@ -343,14 +489,18 @@ end
 -- (issue #74: os.execute would flash a console window per call).  Used by the
 -- mod installer so an uninstall leaves nothing behind (#330).
 function CacheFs.removeDir(rel)
+  forgetDirs()
   rel = withPrefix(rel)
+  if unsafe_rel(rel) then return false end
   local root = CacheFs.root()
   if root then
     local rmdir = resolveRmdir()
     if rmdir then rmdir(realPath(root, rel)) end
     return
   end
-  love.filesystem.remove(rel)
+  if love and love.filesystem and love.filesystem.remove then
+    love.filesystem.remove(rel)
+  end
 end
 
 -- Remove the game-folder copy of a cache subtree before a fresh import, so a
@@ -360,7 +510,9 @@ end
 -- love.filesystem (the game folder is mounted) and the real files deleted
 -- with os.remove; empty directories are harmless and left in place.
 function CacheFs.removeTree(rel)
+  forgetDirs()
   rel = withPrefix(rel)
+  if unsafe_rel(rel) then return end
   local root = CacheFs.root()
   if not root then return end
   local function walk(r)
@@ -371,23 +523,126 @@ function CacheFs.removeTree(rel)
         walk(r .. "/" .. child)
       end
     else
-      os.remove(realPath(root, r))
+      SaveData.removeNative(realPath(root, r))
     end
   end
   walk(rel)
+end
+
+-- One-time move of Red's pre-#899 cache (data/generated, assets/generated
+-- and the rom-cache.complete marker at the cache root) into red/, the
+-- layout Blue and Yellow always used.  Idempotent: an existing red/ cache
+-- wins and a missing root marker means nothing to do.
+--
+-- The two cache homes are handled separately: the save directory goes
+-- through love.filesystem so every host (NX included) and the headless test
+-- stub take the same path, and the portable game folder goes through
+-- os.rename on real paths -- skipped for a source run, where the game
+-- folder IS the checkout and its data/generated is Red's source data, not
+-- a cache.  Called from RomImporter.new (before the readiness loop) and
+-- from mountVersion, so no boot path can probe red/ before the move ran.
+function CacheFs.migrateLegacyRedCache()
+  if not (love and love.filesystem and love.filesystem.getInfo) then return end
+  local fs = love.filesystem
+
+  local function hasFile(p) return fs.getInfo(p, "file") ~= nil end
+  local function hasDir(p) return fs.getInfo(p, "directory") ~= nil end
+
+  local function moveFile(src, dst)
+    local data = fs.read(src)
+    if data then
+      local parent = dst:match("^(.*)/[^/]+$")
+      if parent and fs.createDirectory then fs.createDirectory(parent) end
+      fs.write(dst, data)
+    end
+    fs.remove(src)
+  end
+
+  local function moveTree(src, dst)
+    for _, child in ipairs(fs.getDirectoryItems(src) or {}) do
+      local sp, dp = src .. "/" .. child, dst .. "/" .. child
+      if hasDir(sp) then moveTree(sp, dp) else moveFile(sp, dp) end
+    end
+    -- remove only takes an empty directory; a non-empty one simply stays
+    fs.remove(src)
+  end
+
+  -- --- save directory
+  if hasDir("red/data/generated") or hasFile("red/rom-cache.complete") then
+    -- already on the new layout
+  elseif hasFile("rom-cache.complete") then
+    -- The marker must be a save-dir file before anything moves: a developer
+    -- checkout also resolves data/generated at the root, but from the physfs
+    -- SOURCE, and moving that tree would gut the repository.
+    local real = fs.getRealDirectory and fs.getRealDirectory("rom-cache.complete")
+    if not real or (fs.getSaveDirectory and real == fs.getSaveDirectory()) then
+      -- cheap path first: renames inside the same directory; the copy below
+      -- covers whatever rename could not take (or hosts where the save dir
+      -- is not a plain os path, like the headless stub)
+      local saveDir = fs.getSaveDirectory and fs.getSaveDirectory()
+      if saveDir and fs.createDirectory then
+        fs.createDirectory("red/data")
+        fs.createDirectory("red/assets")
+        os.rename(saveDir .. SEP .. "data" .. SEP .. "generated",
+                  saveDir .. SEP .. "red" .. SEP .. "data" .. SEP .. "generated")
+        os.rename(saveDir .. SEP .. "assets" .. SEP .. "generated",
+                  saveDir .. SEP .. "red" .. SEP .. "assets" .. SEP .. "generated")
+        os.rename(saveDir .. SEP .. "rom-cache.complete",
+                  saveDir .. SEP .. "red" .. SEP .. "rom-cache.complete")
+      end
+      if hasDir("data/generated") then
+        moveTree("data/generated", "red/data/generated")
+      end
+      if hasDir("assets/generated") then
+        moveTree("assets/generated", "red/assets/generated")
+      end
+      if hasFile("rom-cache.complete") then
+        moveFile("rom-cache.complete", "red/rom-cache.complete")
+      end
+      -- drop the emptied roots; a non-empty one (e.g. mods/ beside them is
+      -- untouched -- only data and assets are cache subtrees) simply stays
+      fs.remove("data")
+      fs.remove("assets")
+    end
+  end
+
+  -- --- portable game folder (desktop only): rename on real paths
+  local root = CacheFs.root()
+  if root and not (fs.getSource and root == fs.getSource()) then
+    local function rootHas(rel)
+      local f = SaveData.openNative(realPath(root, rel), "rb")
+      if f then f:close() return true end
+      return false
+    end
+    if rootHas("rom-cache.complete") and not rootHas("red/rom-cache.complete") then
+      local mkdir = resolveMkdir()
+      if mkdir then
+        mkdir(realPath(root, "red"))
+        mkdir(realPath(root, "red/data"))
+        mkdir(realPath(root, "red/assets"))
+        os.rename(realPath(root, "data/generated"),
+                  realPath(root, "red/data/generated"))
+        os.rename(realPath(root, "assets/generated"),
+                  realPath(root, "red/assets/generated"))
+        os.rename(realPath(root, "rom-cache.complete"),
+                  realPath(root, "red/rom-cache.complete"))
+      end
+    end
+  end
 end
 
 -- Overlay the active version's extracted cache onto the un-prefixed read
 -- paths, so require("data.generated.*") and love.graphics.newImage(
 -- "assets/generated/*") resolve to that version's files.
 --
--- Non-Red versions live under blue/ / yellow/ in the save directory.  On
--- desktop fused+portable we PHYSFS_mount that folder by absolute path.  On
--- NX (and any host without a working FFI mount) love.filesystem.mount of
--- the save-dir-relative name must succeed, or Play boots with Red's paths
--- and Data:load dies.  Always also prepend-mount the version's
--- data/generated + assets/generated onto the un-prefixed paths so PhysFS
--- directory non-merge (archive data/ vs save generated) cannot hide them.
+-- Each version lives under its cachePrefix folder in the save directory.
+-- On desktop fused+portable we PHYSFS_mount that folder by absolute path.
+-- On NX (and any host without a working FFI mount) love.filesystem.mount
+-- of the save-dir-relative name must succeed, or Play boots with another
+-- version's paths and Data:load dies.  Always also prepend-mount the
+-- version's data/generated + assets/generated onto the un-prefixed paths
+-- so PhysFS directory non-merge (archive data/ vs save generated) cannot
+-- hide them.
 local function mountGeneratedTrees(prefix)
   prefix = prefix or ""
   if not (love and love.filesystem and love.filesystem.mount) then
@@ -410,10 +665,13 @@ local function mountGeneratedTrees(prefix)
 end
 
 function CacheFs.mountVersion(version)
+  -- A legacy root Red cache has to move into red/ before anything probes
+  -- red/ paths (idempotent and near-free once migrated, issue #899).
+  if version == "red" then CacheFs.migrateLegacyRedCache() end
   local prefix = require("src.core.GameVersion").cachePrefix(version)
   local sub = prefix:gsub("/+$", "")
 
-  -- Save-dir relative mount first (NX / no-FFI). Prepend so blue|yellow win.
+  -- Save-dir relative mount first (NX / no-FFI). Prepend so the version wins.
   if sub ~= "" and love.filesystem.mount
       and love.filesystem.getInfo(sub, "directory") then
     love.filesystem.mount(sub, "", false)
@@ -422,7 +680,7 @@ function CacheFs.mountVersion(version)
   -- Portable / desktop fused: absolute PHYSFS_mount of the version folder.
   if sub ~= "" then
     local base = CacheFs.root()
-    if not base and love.filesystem.getSaveDirectory then
+    if not base and not portableFailure and love.filesystem.getSaveDirectory then
       base = love.filesystem.getSaveDirectory()
     end
     if base then
@@ -430,21 +688,25 @@ function CacheFs.mountVersion(version)
     end
   end
 
-  -- Version-scoped generated trees → un-prefixed paths (Red prefix is "").
+  -- Version-scoped generated trees → un-prefixed paths.
   mountGeneratedTrees(prefix)
   return true
 end
 
--- Undo mountVersion.  A process normally mounts exactly one version and then
--- boots it, but the launcher can open the save editor on a Blue/Yellow save,
--- close it, and press Play on Red: with that version's subtree still
--- prepended, Red's require("data.generated.*") and its generated art would
--- silently resolve to the other game's files.  Callers must also drop the
--- generated modules from package.loaded (src.core.Data:unloadGenerated) --
--- unmounting alone only fixes the read path, not what require already cached.
+-- Undo mountVersion in LIFO order relative to mountVersion: generated-tree
+-- overlays first (assets, then data -- reverse of mountGeneratedTrees), then
+-- the version folder.  PHYSFS resolves by stack order; peeling the wrong
+-- layer first can leave another version's generated files winning a name.
 --
--- Returns true when nothing was mounted or the unmount took.  Red is a no-op
--- because its cache lives at the root and was never overlaid.
+-- A process normally mounts exactly one version and then boots it, but the
+-- launcher can open the save editor on one game's save, close it, and press
+-- Play on another: with the first version's subtree still prepended, the
+-- other's require("data.generated.*") and generated art would silently
+-- resolve to the first game's files.  Callers must also drop the generated
+-- modules from package.loaded (src.core.Data:unloadGenerated) -- unmounting
+-- alone only fixes the read path, not what require already cached.
+--
+-- Returns true when nothing was mounted or the unmount took.
 function CacheFs.unmountVersion(version)
   local prefix = require("src.core.GameVersion").cachePrefix(version)
   if prefix == "" then return true end
@@ -454,6 +716,16 @@ function CacheFs.unmountVersion(version)
     base = love.filesystem.getSaveDirectory()
   end
   local done = false
+  -- LIFO vs mountGeneratedTrees: assets/generated, then data/generated.
+  if love.filesystem and love.filesystem.unmount then
+    local generated = {
+      prefix .. "assets/generated",
+      prefix .. "data/generated",
+    }
+    for _, src in ipairs(generated) do
+      done = love.filesystem.unmount(src) or done
+    end
+  end
   local fn = resolveUnmount()
   if fn and base then
     done = fn(base .. SEP .. sub) or done

@@ -48,6 +48,66 @@ do
   check(bad == nil and err ~= nil, "nil input soft-fails")
 end
 
+-- ------- permanent main source, including options saved before it was built in
+
+do
+  local oldSaveData = package.loaded["src.core.SaveData"]
+  local opts, writes = {}, 0
+  package.loaded["src.core.SaveData"] = {
+    loadOptions = function() return opts end,
+    saveOptions = function(saved) opts = saved; writes = writes + 1; return saved end,
+  }
+  local main = ModIndex.resolveSource("bryanthaboi/gen1recomp-mod-index")
+  local custom = ModIndex.resolveSource("other/community-index")
+  local cached = { checkedAt = 123, mods = { { id = "existing" } } }
+
+  local sources = ModIndex.sources()
+  eq(#sources, 1, "fresh options include the main index")
+  eq(sources[1].feed, main.feed, "the default uses the main feed")
+  eq(sources[1].fallback, main.fallback, "the default includes the raw fallback")
+  sources[1].feed = "changed by caller"
+  eq(ModIndex.sources()[1].feed, main.feed, "callers cannot alter the built-in definition")
+  eq(writes, 0, "reading sources does not rewrite options")
+
+  for _, url in ipairs({ "bryanthaboi/gen1recomp-mod-index",
+      "https://github.com/bryanthaboi/gen1recomp-mod-index",
+      main.base, main.base:sub(1, -2), main.feed }) do
+    local savedMain = ModIndex.resolveSource(url)
+    savedMain.url = url
+    opts = { modIndexes = { custom, savedMain, main },
+      modIndexCache = { [main.feed] = cached } }
+    sources = ModIndex.sources()
+    eq(#sources, 2, "an already-added main index is listed once: " .. url)
+    eq(sources[1], custom, "the existing source precedence is preserved")
+    eq(sources[2], savedMain, "the first saved main-index row is reused")
+    eq(sources[2].url, url, "the player's original URL is preserved")
+    eq(ModIndex.readCache(main.feed), cached, "the existing main-index cache survives")
+    local added, addErr = ModIndex.addSource(url)
+    check(added == nil and addErr ~= nil, "the built-in source cannot be added again")
+    local removed, removeErr = ModIndex.removeSource(main.feed)
+    check(removed == nil and removeErr ~= nil, "an older main-index row cannot be removed")
+    eq(opts.modIndexCache[main.feed], cached, "blocked removal keeps its cache")
+  end
+  eq(writes, 0, "duplicate additions and blocked removals do not write options")
+
+  opts = { modIndexes = { custom }, modIndexCache = { [custom.feed] = cached } }
+  sources = ModIndex.sources()
+  eq(#sources, 2, "existing custom-only options gain the default")
+  eq(sources[1], custom, "adding the default preserves custom-source precedence")
+  eq(sources[2].feed, main.feed, "the missing main source is appended")
+  check(ModIndex.isBuiltIn(main.feed), "the main index is protected")
+  check(not ModIndex.isBuiltIn(custom.feed), "a custom index remains removable")
+  check(ModIndex.removeSource(custom.feed), "a custom source can still be removed")
+  eq(opts.modIndexCache[custom.feed], nil, "custom-source removal clears its cache")
+  eq(#ModIndex.sources(), 1, "removing the last custom source leaves the main index")
+  check(ModIndex.addSource("other/community-index") ~= nil, "custom sources can still be added")
+  eq(#ModIndex.sources(), 2, "the added custom source appears beside the main index")
+
+  package.loaded["src.core.SaveData"].loadOptions = function() error("unavailable options") end
+  eq(ModIndex.sources()[1].feed, main.feed, "the main index remains available if options cannot load")
+  package.loaded["src.core.SaveData"] = oldSaveData
+end
+
 do
   local base = "https://bryanthaboi.github.io/gen1recomp-mod-index/"
   eq(ModIndex.joinUrl(base, "data/mods/bryanthaboi@nuzlocke/thumbnail.png"),
@@ -110,6 +170,114 @@ do
     "the release asset URL survives parsing")
   eq(m.permissions[1], "engine_internals", "permissions are kept")
   eq(m.update_check, "ok", "update_check is kept")
+  check(m.downloads == nil and m.first_release == nil and m.last_release == nil,
+    "a feed without release stats parses them as absent")
+end
+
+-- release stats a feed can publish: download counts and first/last dates
+-- ride along additively, so a feed carrying them stays readable by every
+-- build that predates them
+do
+  local withStats = {}
+  for k, v in pairs(NUZLOCKE) do withStats[k] = v end
+  withStats.downloads = { total = 1578, recent = 388, window_days = 30,
+                          as_of = "2026-08-18T05:17:00.000Z" }
+  withStats.first_release = "2024-05-31"
+  withStats.last_release = "2026-07-01"
+  local index = ModIndex.parse(feed({ withStats }))
+  local m = index.mods[1]
+  eq(m.downloads.total, 1578, "total downloads are kept")
+  eq(m.downloads.recent, 388, "the trailing-window count is kept")
+  eq(m.downloads.window_days, 30, "the window length is kept")
+  eq(m.downloads.as_of, "2026-08-18T05:17:00.000Z", "the read time is kept")
+  eq(m.first_release, "2024-05-31", "first release date is kept")
+  eq(m.last_release, "2026-07-01", "last release date is kept")
+end
+
+-- ------- download counts: unknown is not zero
+--
+-- The feed's `downloads` object has three ways of saying "not known" -- the
+-- field absent, the field null, and a null count inside it -- and every one
+-- of them has to stay distinguishable from a real zero, because the browse
+-- card prints one and sorts the other.
+do
+  local function jsonWith(downloads)
+    local raw = {}
+    for k, v in pairs(NUZLOCKE) do raw[k] = v end
+    raw.downloads = downloads
+    return feed({ raw })
+  end
+  local function statsForJson(text)
+    return ModIndex.downloadStats(ModIndex.parse(text).mods[1])
+  end
+  local function statsFor(downloads)
+    return statsForJson(jsonWith(downloads))
+  end
+
+  check(statsFor(nil) == nil, "an absent downloads field is unknown")
+  -- Json.encode has no null of its own, so the literal the feed actually
+  -- sends is patched into the text.
+  local nulled = jsonWith({}):gsub('"downloads":%[%]', '"downloads":null', 1)
+  check(nulled:find('"downloads":null', 1, true) ~= nil,
+    "the null feed fixture really contains a null")
+  check(statsForJson(nulled) == nil, "a null downloads field is unknown")
+  check(statsFor({}) == nil, "an object with no counts is unknown")
+  eq(statsFor({ total = 0 }).total, 0, "a real zero total survives")
+
+  -- recent / window_days stay null until the index has more than a day of
+  -- history, even once total is a real number.
+  local young = statsFor({ total = 12, as_of = "2026-08-18T05:17:00.000Z" })
+  eq(young.total, 12, "a total with no window yet is still a total")
+  check(young.recent == nil and young.window_days == nil,
+    "no trailing window means no trending figure, not a zero one")
+
+  -- A cache written before the object shipped stored a bare number; it is
+  -- read back through the same door rather than migrated.
+  local legacy = ModIndex.downloadStats({ downloads = 4321 })
+  eq(legacy.total, 4321, "a bare number reads as the total")
+  check(legacy.recent == nil, "and carries no trending figure")
+  check(ModIndex.downloadStats({}) == nil, "a row with no counts is unknown")
+  check(ModIndex.downloadStats(nil) == nil, "no entry is unknown")
+end
+
+-- ------- release dates: the feed already dates every listing it can install
+--
+-- Sorting must span the whole index, not the pages a reader happened to
+-- visit, so the "last updated" date comes off the feed's own `latest` blob
+-- rather than out of a per-mod repo fetch.
+do
+  local raw = {}
+  for k, v in pairs(NUZLOCKE) do raw[k] = v end
+  local d = ModIndex.releaseDates(ModIndex.parse(feed({ raw })).mods[1])
+  eq(d.latest, "2026-07-31", "latest release date comes from latest.published_at")
+  check(d.first == nil, "the feed cannot date a first release from that alone")
+
+  raw.first_release = "2024-05-31"
+  raw.last_release = "2026-07-01"
+  d = ModIndex.releaseDates(ModIndex.parse(feed({ raw })).mods[1])
+  eq(d.first, "2024-05-31", "an explicit first_release wins")
+  eq(d.latest, "2026-07-01", "an explicit last_release beats the latest blob")
+
+  local bare = {}
+  for k, v in pairs(NUZLOCKE) do bare[k] = v end
+  bare.latest, bare.update_check = nil, "no installable release"
+  check(ModIndex.releaseDates(ModIndex.parse(feed({ bare })).mods[1]) == nil,
+    "a listing with no releases has no dates")
+  check(ModIndex.releaseDates(nil) == nil, "no entry has no dates")
+end
+
+-- ------- cache version: a copy written before a field existed cannot answer
+-- for it, and the TTL is a whole day
+do
+  local now = os.time()
+  check(ModIndex.cacheFresh({ checkedAt = now,
+    version = ModIndex.CACHE_VERSION }), "a current cache is fresh")
+  check(not ModIndex.cacheFresh({ checkedAt = now }),
+    "an unstamped cache is refetched rather than trusted for a day")
+  check(not ModIndex.cacheFresh({ checkedAt = now,
+    version = ModIndex.CACHE_VERSION - 1 }), "so is an older stamp")
+  check(not ModIndex.cacheFresh({ checkedAt = now - ModIndex.CACHE_TTL - 1,
+    version = ModIndex.CACHE_VERSION }), "and an expired one")
 end
 
 -- schema_version is a contract, not a hint: an unknown one is refused rather
@@ -121,7 +289,11 @@ do
   index, err = ModIndex.parse(Json.encode({ mods = { NUZLOCKE } }))
   check(index == nil and err ~= nil, "a feed with no schema_version is refused")
   index, err = ModIndex.parse("<!DOCTYPE html><html>404</html>")
-  check(index == nil and err ~= nil, "an HTML error page soft-fails")
+  check(index == nil and tostring(err):find("HTML", 1, true) ~= nil,
+    "an HTML error page is named, not blamed on the parser")
+  index, err = ModIndex.parse("Error: upstream unavailable")
+  check(index == nil and tostring(err):find("not JSON", 1, true) ~= nil,
+    "a plain-text error names the response")
   index, err = ModIndex.parse('{"schema_version":1}')
   check(index == nil and err ~= nil, "a feed with no mods array soft-fails")
 end
@@ -240,6 +412,20 @@ end
 -- ------- search / filter
 
 do
+  local index = ModIndex.parse(feed({
+    { id = "untamed_advanced", title = "Untamed Advanced",
+      games = { "firered", "leafgreen", "emerald" }, categories = { "GAMEPLAY" } },
+  }))
+  for _, game in ipairs({ "gen3", "firered", "leafgreen", "emerald" }) do
+    local rows = ModIndex.filter(index.mods, { game = game, query = "untamed" })
+    eq(#rows, 1, "Untamed Advanced appears when filtering by " .. game)
+    eq(rows[1] and rows[1].id, "untamed_advanced", "the filtered listing is Untamed Advanced")
+  end
+  eq(#ModIndex.filter(index.mods, { game = "gen2", query = "untamed" }), 0,
+    "Untamed Advanced remains excluded from unsupported generations")
+end
+
+do
   local mods = {
     { id = "nuzlocke", title = "Nuzlocke", author = "bryanthaboi",
       summary = "one catch per area", categories = { "GAMEPLAY" },
@@ -266,6 +452,86 @@ do
     "tag filters")
 end
 
+
+do
+  local mods = {
+    { id = "gen1only", title = "Gen 1 Only", games = { "gen1" } },
+    { id = "goldonly", title = "Gold Only", games = { "gold" } },
+    { id = "everywhere", title = "Everywhere", games = { "all" } },
+    { id = "silent", title = "Silent" },
+  }
+  eq(#ModIndex.filter(mods, {}), 4, "no game filter keeps every listing")
+  local gen1 = ModIndex.filter(mods, { game = "gen1" })
+  eq(#gen1, 2, "gen1 keeps the Gen 1 mods and the all-games mod")
+  eq(gen1[1].id, "gen1only", "feed order survives the game filter")
+  local gen2 = ModIndex.filter(mods, { game = "gen2" })
+  eq(#gen2, 2, "gen2 keeps only explicitly matching listings")
+  eq(gen2[1].id, "goldonly", "and keeps the one that names a Gen 2 game")
+  eq(#ModIndex.filter(mods, { game = "red" }), 2,
+    "a single version reads the generation's mods too")
+  eq(ModIndex.filter(mods, { game = "gold" })[1].id, "goldonly",
+    "and a Gen 2 version keeps a mod that names only that game")
+  eq(#ModIndex.filter(mods, { game = "all" }), 4, '"all" filters nothing')
+  eq(#ModIndex.filter(mods, { game = "nonsense" }), 4,
+    "a token naming no game this engine has filters nothing")
+  local silentSeen = false
+  for _, entry in ipairs(gen2) do
+    if entry.id == "silent" then silentSeen = true end
+  end
+  check(not silentSeen, "a listing with no games is excluded by a game filter")
+
+  local carts = {
+    { id = "johto", kind = "cart", base = "gold" },
+    { id = "kanto", kind = "cart", base = "red" },
+  }
+  eq(ModIndex.filter(carts, { game = "gen2" })[1].id, "johto",
+    "a cart is filtered by the game it plays as")
+  eq(#ModIndex.filter(carts, { game = "gen1" }), 1,
+    "and only that game")
+end
+
+do
+  local mods = {
+    { id = "red_audio", games = { "red" }, categories = { "AUDIO" } },
+    { id = "gen2_art", games = { "gen2" }, categories = { "ART" } },
+    { id = "missing_games", categories = { "ART" } },
+    { id = "empty_games", games = {}, categories = { "ART" } },
+    { id = "unknown_games", games = { "nonsense" }, categories = { "ART" } },
+    { id = "missing_category", games = { "red" } },
+    { id = "empty_categories", games = { "red" }, categories = {} },
+  }
+  eq(#ModIndex.filter(mods, { game = "emerald" }), 0,
+    "a game with no declared matches has no results")
+  eq(#ModIndex.filter(mods, { game = "gen2", category = "ART" }), 1,
+    "combined filters require both declared game and category matches")
+  eq(#ModIndex.filter(mods, { game = "gen2", category = "AUDIO" }), 0,
+    "an empty game and category intersection stays empty")
+  eq(#ModIndex.filter(mods, { game = "gen2", query = "missing_games" }), 0,
+    "search cannot restore undeclared game compatibility")
+  eq(#ModIndex.filter(mods, { category = "ART" }), 4,
+    "category filtering requires that category without assuming a game filter")
+  eq(#ModIndex.filter(mods, { category = "AUDIO" }), 1,
+    "missing or empty category metadata is excluded")
+  eq(#ModIndex.filter(mods, { category = "TOOLS" }), 0,
+    "a category with no declared matches has no results")
+  eq(#ModIndex.filter(mods, { game = "all" }), 7,
+    "clearing game filters restores listings with unknown compatibility")
+end
+
+do
+  eq(ModIndex.targetLabel({ games = { "red", "blue", "yellow" } }), "GEN 1",
+    "a whole generation chips as GEN 1")
+  eq(ModIndex.targetLabel({ games = { "all" } }), "GEN 1+2+3",
+    "every game chips as every generation")
+  eq(ModIndex.targetLabel({ games = { "gold" } }), "GOLD",
+    "a lone game chips as its own name")
+  check(ModIndex.targetLabel({}) == nil, "a listing with no games has no chip")
+  check(ModIndex.targetLabel(nil) == nil, "and neither does a nil entry")
+  eq(#ModIndex.targets({ games = { "gen1" } }), 3,
+    "targets expands a generation token to its versions")
+  eq(#ModIndex.targets({}), 0, "and an undeclared games list is empty")
+end
+
 do
   local index = ModIndex.parse(feed({ NUZLOCKE }))
   local cats = ModIndex.categoriesIn(index)
@@ -273,4 +539,152 @@ do
   eq(cats[1], "GAMEPLAY", "and they keep the feed's declared order")
 end
 
-print("ok mod_index_tests")
+-- ------- carts: a second array on the same feed, at the same schema_version
+--
+-- The published index added carts without bumping schema_version, so an older
+-- build has to keep reading the feed and this one has to read both halves.
+-- The fixture below is the shape carts/<Author>@<id>/meta.json validates to.
+
+local OMEGA = {
+  folder = "bryanthaboi@omega_random_competition",
+  id = "omega_random_competition",
+  title = "OMEGA RANDOM COMPETITION",
+  author = "bryanthaboi",
+  summary = "Bois Club Randomizer as its own cartridge.",
+  version = "1.0.0",
+  base = "red",
+  seal = "sealed",
+  shell = "#7B1B22",
+  finish = "holo",
+  speeds = { 1, 2 },
+  tags = { "randomizer", "competition" },
+  repo = "https://github.com/bryanthaboi/omega-random-competition",
+  github = "bryanthaboi/omega-random-competition",
+  automatic_version_check = true,
+  mods = { { id = "bcr", source = "github", repo = "bryanthaboi/bcr",
+             version = "1.0.0", sha256 = ("83a111b4"):rep(8) } },
+  load_order = { "bcr" },
+  license = "MIT",
+  description_url = "data/carts/bryanthaboi@omega_random_competition/description.md",
+  update_check = "pending",
+}
+
+local JOHTO_CART = {
+  id = "johto_run", title = "Johto Run", author = "Ren", version = "2.1.0",
+  base = "gold", seal = "open",
+  repo = "https://github.com/ren/johto-run",
+  github = "ren/johto-run",
+  mods = { { id = "steps", source = "gamebanana", mod = 42, file = 99,
+             md5 = ("ab"):rep(16), enabled = false,
+             options = { pace = "fast" } } },
+  update_check = "ok",
+  latest = { version = "2.1.0", tag = "v2.1.0",
+             zip = { name = "johto_run-2.1.0.zip",
+                     url = "https://example.test/johto_run-2.1.0.zip" } },
+}
+
+local function cartFeed(carts, overrides)
+  local doc = { schema_version = 1, count = 1, cart_count = #carts,
+                categories = { "GAMEPLAY" },
+                base_games = { "red", "blue", "yellow", "gold", "silver" },
+                mods = { NUZLOCKE }, carts = carts }
+  for k, v in pairs(overrides or {}) do doc[k] = v end
+  return Json.encode(doc)
+end
+
+do
+  local index, err = ModIndex.parse(cartFeed({ OMEGA, JOHTO_CART }))
+  check(index ~= nil, "a feed carrying carts parses: " .. tostring(err))
+  eq(index.schemaVersion, 1, "carts arrive at schema_version 1, unbumped")
+  eq(#index.mods, 1, "the mods array still parses")
+  eq(#index.carts, 2, "and the carts array parses beside it")
+  local c = index.carts[1]
+  eq(c.id, "omega_random_competition", "cart id")
+  eq(c.title, "OMEGA RANDOM COMPETITION", "cart title")
+  eq(c.base, "red", "the game the cart plays as")
+  eq(c.seal, "sealed", "its seal")
+  eq(c.shell, "#7B1B22", "its shell colour")
+  eq(c.finish, "holo", "its finish")
+  eq(c.speeds[2], 2, "its speed ladder")
+  eq(c.tags[1], "randomizer", "its tags")
+  eq(c.license, "MIT", "its license")
+  eq(c.load_order[1], "bcr", "its load order")
+  eq(#c.mods, 1, "its pinned mod set")
+  eq(c.mods[1].source, "github", "a github pin keeps its source")
+  eq(c.mods[1].repo, "bryanthaboi/bcr", "with the repo it comes from")
+  eq(c.mods[1].version, "1.0.0", "the exact pinned version")
+  eq(#c.mods[1].sha256, 64, "and the digest that gates it")
+  check(ModIndex.isCart(c), "a parsed cart is marked as one")
+  check(not ModIndex.isCart(index.mods[1]), "a mod is not")
+
+  local g = index.carts[2]
+  eq(g.mods[1].source, "gamebanana", "a gamebanana pin keeps its source")
+  eq(g.mods[1].mod, 42, "with its mod page id")
+  eq(g.mods[1].file, 99, "and its file id")
+  eq(#g.mods[1].md5, 32, "and the digest GameBanana reports")
+  eq(g.mods[1].enabled, false, "a pin shipped switched off stays off")
+  eq(g.mods[1].options.pace, "fast", "frozen options survive")
+  eq(ModIndex.installUrl(g), "https://example.test/johto_run-2.1.0.zip",
+    "a cart resolves its release asset the same way a mod does")
+end
+
+-- the old-feed case: no carts key at all
+do
+  local index, err = ModIndex.parse(feed({ NUZLOCKE }))
+  check(index ~= nil, "a feed with no carts key still parses: " .. tostring(err))
+  eq(#index.mods, 1, "its mods are unaffected")
+  eq(type(index.carts), "table", "and carts is a list, never nil")
+  eq(#index.carts, 0, "an absent carts array is an empty one")
+end
+
+-- a broken cart row costs itself, not the whole feed
+do
+  local noBase = {}
+  for k, v in pairs(OMEGA) do noBase[k] = v end
+  noBase.base = nil
+  local noMods = {}
+  for k, v in pairs(JOHTO_CART) do noMods[k] = v end
+  noMods.id, noMods.mods = "empty_pins", {}
+  local index, err = ModIndex.parse(cartFeed({
+    noBase, "not even an object", { id = "bare" }, noMods, OMEGA }))
+  check(index ~= nil, "a feed with malformed carts still parses: " .. tostring(err))
+  eq(#index.carts, 1, "only the well-formed cart is listed")
+  eq(index.carts[1].id, "omega_random_competition", "and it is the intact one")
+  eq(#index.mods, 1, "the mods array is untouched by a bad cart")
+end
+
+-- search and filter: matches() already spans title / author / summary / id,
+-- so the cart half reuses it wholesale.  The category filter does not apply
+-- (a cart has none); base does.
+do
+  local index = ModIndex.parse(cartFeed({ OMEGA, JOHTO_CART }))
+  local carts = index.carts
+  eq(#ModIndex.filter(carts, {}), 2, "no filter keeps every cart")
+  eq(ModIndex.filter(carts, { query = "omega" })[1].id,
+    "omega_random_competition", "search matches a cart by title")
+  eq(ModIndex.filter(carts, { query = "Ren" })[1].id, "johto_run",
+    "search matches a cart by author")
+  eq(ModIndex.filter(carts, { query = "randomizer" })[1].id,
+    "omega_random_competition", "and by summary")
+  eq(#ModIndex.filter(carts, { query = "omega johto" }), 0,
+    "cart search terms are ANDed too")
+  eq(ModIndex.filter(carts, { base = "gold" })[1].id, "johto_run",
+    "filtering by base game keeps the carts for that game")
+  eq(#ModIndex.filter(carts, { base = "RED" }), 1,
+    "and compares case-insensitively")
+  eq(#ModIndex.filter(carts, { base = "silver" }), 0,
+    "a base no cart plays as filters everything out")
+  eq(#ModIndex.filter(carts, { category = "GAMEPLAY" }), 0,
+    "a cart carries no categories, so a category filter never matches one")
+  eq(ModIndex.filter(carts, { tag = "competition" })[1].id,
+    "omega_random_competition", "cart tags filter")
+
+  local bases = ModIndex.baseGamesIn(index)
+  eq(#bases, 2, "only base games a cart actually plays as are offered")
+  eq(bases[1], "red", "and they keep the feed's declared base_games order")
+  eq(bases[2], "gold", "in that order")
+  eq(#ModIndex.baseGamesIn(ModIndex.parse(feed({ NUZLOCKE }))), 0,
+    "a cartless feed offers no base games")
+end
+
+T.finish("mod index")

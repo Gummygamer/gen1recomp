@@ -32,8 +32,41 @@ OakSpeech.letterboxWhite = true
 
 -- FadeInIntroPic runs a 6-step palette fade; MovePicLeft wipes the mon
 -- sprite in from the right.  Both play out before the beat's text prints.
-local FADE_FRAMES = 24
+-- engine/movie/oak_speech/oak_speech.asm:191-209
+local INTRO_FADE_BGP = { 0x54, 0xA8, 0xFC, 0xF8, 0xF4, 0xE4 }
+local INTRO_FADE_STEP = 10
+-- home/fade.asm:48-62,65-73
+local WHITE_IN_BGP = { 0x40, 0x90, 0xE4 }
+local WHITE_FADE_STEP = 8
 local WIPE_FRAMES = 32
+
+OakSpeech.INTRO_FADE_BGP = INTRO_FADE_BGP
+OakSpeech.INTRO_FADE_STEP = INTRO_FADE_STEP
+OakSpeech.WHITE_IN_BGP = WHITE_IN_BGP
+OakSpeech.WHITE_FADE_STEP = WHITE_FADE_STEP
+
+-- OakSpeechSlidePicRight / OakSpeechSlidePicLeft (oak_speech2.asm:67-89)
+local SLIDE_TILES = 6
+local SLIDE_FRAMES = 3
+
+local PicSlide = {}
+PicSlide.__index = PicSlide
+
+function PicSlide:update(dt)
+  -- OakSpeechSlidePicLeft: ClearScreenArea, ld c, 10 / DelayFrames, Delay3
+  -- before the first slide step (oak_speech2.asm:69-78)
+  if (self.delay or 0) > 0 then
+    self.delay = self.delay - 1
+    return
+  end
+  self.t = self.t + 1
+  local tiles = math.min(SLIDE_TILES, math.floor(self.t / SLIDE_FRAMES))
+  self.speech.picSlide = (self.dir > 0 and tiles or (SLIDE_TILES - tiles)) * 8
+  if tiles >= SLIDE_TILES then
+    self.game.stack:pop()
+    if self.onDone then self.onDone() end
+  end
+end
 
 -- naming presets are boot config (field.boot.namePresets), which a total
 -- conversion replaces; the Red/Blue lists remain the fallback
@@ -98,14 +131,14 @@ function OakSpeech.resolvePic(game, desc, speech)
   local t = desc.type
   if t == "trainer" then
     if speech and desc.id == "OPP_PROF_OAK" and speech.oakPic then
-      return speech.oakPic, false, false
+      return speech.oakPic, false, speech.oakTrueColor or false
     end
     if speech and desc.id == "OPP_RIVAL1" and speech.rivalPic then
-      return speech.rivalPic, false, false
+      return speech.rivalPic, false, speech.rivalTrueColor or false
     end
     local trainers = game.data.trainers or {}
     local tr = trainers[desc.id]
-    return tryImage(tr and tr.pic), false, false
+    return tryImage(tr and tr.pic), false, tr and tr.trueColor or false
   elseif t == "pokemon" then
     if speech and desc.id == speech.demoSpecies and speech.demoPic then
       return speech.demoPic, desc.flip and true or false, speech.demoTrueColor
@@ -139,7 +172,10 @@ function OakSpeech.defaultSteps(speech)
       kind = "say",
       textKey = "_OakSpeechText1",
       pic = "oak",
+      -- text_2.asm:1704
+      -- oak_speech.asm:73
       reveal = "fade",
+      fadeOut = true,
     },
     {
       id = "demo_mon",
@@ -149,12 +185,19 @@ function OakSpeech.defaultSteps(speech)
       id = "world_spiel",
       kind = "say",
       textKey = "_OakSpeechText2B",
+      -- text_2.asm:1725
+      -- oak_speech.asm:84
+      fadeOut = true,
     },
     {
       id = "ask_player_name",
       kind = "say",
       textKey = "_IntroducePlayerText",
       pic = "player",
+      -- oak_speech.asm:89-92: MovePicLeft, then IntroducePlayerText's
+      -- `prompt` (text_2.asm:1730) waits for A and leaves the box up
+      reveal = "wipe",
+      stay = true,
     },
     {
       id = "name_player",
@@ -171,18 +214,26 @@ function OakSpeech.defaultSteps(speech)
       id = "confirm_player_name",
       kind = "say",
       textKey = "_YourNameIsText",
+      -- _YourNameIsText's `prompt` (text_2.asm:1766), then GBFadeOutToWhite
+      -- / ClearScreen with the box still up (oak_speech.asm:93-94)
+      fadeOut = true,
     },
     {
       id = "ask_rival_name",
       kind = "say",
       textKey = "_IntroduceRivalText",
       pic = "rival",
+      -- oak_speech.asm:98-101: FadeInIntroPic, then IntroduceRivalText's
+      -- `prompt` (text_2.asm:1740) leaves the box up for ChooseRivalName
+      reveal = "fade",
+      stay = true,
     },
     {
       id = "name_rival",
       kind = "name",
       who = "rival",
-      title = Strings("HIS NAME?"),
+      -- engine/menus/naming_screen.asm:487
+      title = Strings("RIVAL's NAME?"),
       presetsWho = "rival",
       presetsFallback = { "BLUE", "GARY", "JOHN" },
     },
@@ -191,12 +242,17 @@ function OakSpeech.defaultSteps(speech)
       id = "confirm_rival_name",
       kind = "say",
       textKey = "_HisNameIsText",
+      -- _HisNameIsText's `prompt` (text_2.asm:1772) then the .skipSpeech
+      -- fade with the box up (oak_speech.asm:103-104)
+      fadeOut = true,
     },
     {
       id = "legend",
       kind = "say",
       textKey = "_OakSpeechText3",
       pic = "player",
+      -- oak_speech.asm:106-108
+      reveal = "fade_white_in",
     },
     {
       id = "shrink",
@@ -241,7 +297,11 @@ function OakSpeech.new(game, onDone)
   self.answers = {}
   local trainers = game.data.trainers or {}
   self.oakPic = tryImage(trainers.OPP_PROF_OAK and trainers.OPP_PROF_OAK.pic)
+  self.oakTrueColor = self.oakPic
+    and trainers.OPP_PROF_OAK and trainers.OPP_PROF_OAK.trueColor or false
   self.rivalPic = tryImage(trainers.OPP_RIVAL1 and trainers.OPP_RIVAL1.pic)
+  self.rivalTrueColor = self.rivalPic
+    and trainers.OPP_RIVAL1 and trainers.OPP_RIVAL1.trueColor or false
   local oakGfx = (game.data.field and game.data.field.oakSpeech) or {}
   self.cfg = oakGfx
   -- the show-off mon and the name length cap come from data; the vanilla
@@ -265,7 +325,11 @@ function OakSpeech.new(game, onDone)
                              or "assets/generated/intro/shrink2.png")
   -- RedSprite: the walking sprite the pic shrinks into (frame 0 =
   -- standing, facing down)
-  local red = game.data.sprites and game.data.sprites.SPRITE_RED
+  local playerSprites = (game.data.field and game.data.field.playerSprites) or {}
+  -- The fallback has to read the same guarded table: reaching for
+  -- game.data.sprites.SPRITE_RED after the `and` already found it nil threw.
+  local sprites = game.data.sprites or {}
+  local red = sprites[playerSprites.walk or "SPRITE_RED"] or sprites.SPRITE_RED
   self.walkSheet = tryImage(red and red.image)
   return self
 end
@@ -370,7 +434,27 @@ function OakSpeech:runStep(step)
     self:applyPic(step)
     self:afterReveal(step, function()
       self:runCry(step)
-      self:sayText(self:stepText(step), function() self:advance() end)
+      if step.stay or step.fadeOut then
+        local box = TextBox.new(self.game, self:stepText(step), nil,
+          { stay = { prompt = true, onShown = function()
+            if step.fadeOut then
+              -- GBFadeOutToWhite / ClearScreen (oak_speech.asm:93-94)
+              self.bgpFade = true
+              self.game.stack:push(require("src.render.Transition")
+                .whiteOut(self.game, function()
+                  self.bgpFade = nil
+                  self:closeHoldBox()
+                  self:advance()
+                end))
+            else
+              self:advance()
+            end
+          end } })
+        self.holdBox = box
+        self.game.stack:push(box)
+      else
+        self:sayText(self:stepText(step), function() self:advance() end)
+      end
     end)
   elseif kind == "demo" then
     -- NIDORINO show-off: mirrored front sprite + wipe + cry + text 2A
@@ -378,28 +462,52 @@ function OakSpeech:runStep(step)
     self.picFlip = true
     self.picTrueColor = self.demoTrueColor
     self:revealPic("wipe", function()
-      Sound.playCry(self.game.data, self.demoSpecies)
-      self:say(Strings("_OakSpeechText2A"), function() self:advance() end)
+      local species = self.demoSpecies
+      if not require("src.core.GameVersion").isYellow() and species == "NIDORINO"
+          and not (self.cfg and self.cfg.demoSpecies) then
+        species = "NIDORINA"
+      end
+      self:sayText(textOr(self.game, "_OakSpeechText2A"), function() self:advance() end,
+        {auto = {wait = true, sound = function()
+          return Sound.playCry(self.game.data, species, false)
+        end}})
     end)
   elseif kind == "name" then
     local who = step.who or "player"
     local presets = step.presets
       or namePresets(self.game, step.presetsWho or who,
                      step.presetsFallback or { "RED" })
-    require("src.ui.Screens").push(self.game, "NamingScreen", {
-      title = step.title or (who == "rival" and "HIS NAME?" or Strings("YOUR NAME?")),
-      presets = presets,
-      maxLen = step.maxLen or self.nameLen,
-      onDone = function(name)
-        if who == "rival" then
-          self.game.save.player.rival = name
-        else
-          self.game.save.player.name = name
-        end
-        self:recordAnswer(step, 1, name, name)
-        self:advance()
-      end,
-    })
+    local function openNaming()
+      require("src.ui.Screens").push(self.game, "NamingScreen", {
+        title = step.title or (who == "rival" and Strings("RIVAL's NAME?")
+                                              or Strings("YOUR NAME?")),
+        presets = presets,
+        introBox = true,
+        maxLen = step.maxLen or self.nameLen,
+        onDone = function(name, custom)
+          if who == "rival" then
+            self.game.save.player.rival = name
+          else
+            self.game.save.player.name = name
+          end
+          self:recordAnswer(step, 1, name, name)
+          -- YourNameIsText / HisNameIsText print into the box this one
+          -- held (oak_speech2.asm:26-28, :59-61)
+          self:closeHoldBox()
+          if custom then
+            -- .customName: ClearScreen / Delay3 / pic recentered, no
+            -- slide-back (oak_speech2.asm:21-25)
+            self.picSlide = 0
+            self:advance()
+          else
+            -- OakSpeechSlidePicLeft's 13-frame pre-slide beat
+            -- (oak_speech2.asm:69-78)
+            self:slidePic(-1, function() self:advance() end, 13)
+          end
+        end,
+      })
+    end
+    self:slidePic(1, openNaming)
   elseif kind == "choice" then
     self:applyPic(step)
     self:afterReveal(step, function()
@@ -502,12 +610,40 @@ end
 -- update() while OakSpeech is the top state (before the beat's text box is
 -- pushed), so the fade/wipe plays out ahead of the text like the ROM.
 function OakSpeech:revealPic(kind, next)
+  local tab = (kind == "fade" and INTRO_FADE_BGP)
+              or (kind == "fade_white_in" and WHITE_IN_BGP) or nil
+  local step = (kind == "fade") and INTRO_FADE_STEP or WHITE_FADE_STEP
   self.picReveal = {
     kind = kind,
     t = 0,
-    dur = kind == "fade" and FADE_FRAMES or WIPE_FRAMES,
+    bgp = tab,
+    step = step,
+    dur = tab and (#tab * step) or WIPE_FRAMES,
     next = next,
   }
+end
+
+-- engine/movie/oak_speech/oak_speech.asm:195-198
+function OakSpeech.revealBgp(r)
+  if not (r and r.bgp) then return nil end
+  local i = math.floor((math.max(1, r.t) - 1) / r.step) + 1
+  return r.bgp[math.min(#r.bgp, i)]
+end
+
+-- ..(engine/movie/oak_speech/oak_speech2.asm ln 67)
+function OakSpeech:slidePic(dir, onDone, delay)
+  self.picSlide = (dir > 0 and 0 or SLIDE_TILES * 8)
+  self.game.stack:push(setmetatable({
+    game = self.game, speech = self, dir = dir, t = 0, onDone = onDone,
+    delay = delay,
+  }, PicSlide))
+end
+
+-- IntroducePlayerText's text_end box (oak_speech.asm:90) is ours to close
+function OakSpeech:closeHoldBox()
+  local box = self.holdBox
+  self.holdBox = nil
+  if box and self.game.stack:top() == box then self.game.stack:pop() end
 end
 
 function OakSpeech:advance()
@@ -601,20 +737,23 @@ end
 function OakSpeech:draw()
   love.graphics.setColor(1, 1, 1, 1)
   love.graphics.rectangle("fill", 0, 0, 160, 144)
+  -- home/fade.asm:58
+  local revealBgp = OakSpeech.revealBgp(self.picReveal)
+  if revealBgp then
+    require("src.render.PaletteFX").setShadeMap(
+      require("src.render.Transition").shadeMapFor(revealBgp))
+  end
   if self.pic then
     -- IntroDisplayPicCenteredOrUpperRight centered: the 7x7-tile pic
     -- area sits at hlcoord 6,4 = (48,32); smaller mon pics pad inside
     -- it like the sprite buffer does ((8 - w) >> 1) tiles across,
     -- bottom-aligned
     local w, h = self.pic:getDimensions()
-    local x = 48 + math.floor((8 - w / 8) / 2) * 8
+    local x = 48 + math.floor((8 - w / 8) / 2) * 8 + (self.picSlide or 0)
     local y = 32 + (7 - h / 8) * 8
     local reveal = self.picReveal
     local off = 0
-    if reveal and reveal.kind == "fade" then
-      -- FadeInIntroPic: ramp the pic's alpha up over the fade window
-      love.graphics.setColor(1, 1, 1, math.min(1, reveal.t / reveal.dur))
-    elseif reveal and reveal.kind == "wipe" then
+    if reveal and reveal.kind == "wipe" then
       -- MovePicLeft: the pic slides in from the right edge to its spot
       off = math.floor((160 - x) * (1 - math.min(1, reveal.t / reveal.dur)))
     end
@@ -625,7 +764,7 @@ function OakSpeech:draw()
     else
       love.graphics.draw(self.pic, x + off, y)
     end
-    if self.picTrueColor then
+    if self.picTrueColor and not revealBgp and not self.bgpFade then
       require("src.render.PaletteFX").markTrueColor(x + off, y, w, h)
     end
     love.graphics.setColor(1, 1, 1, 1)

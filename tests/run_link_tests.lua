@@ -152,41 +152,135 @@ end
 -- operate directly on rxBuf, so this much runs even under plain luajit.
 do
   local n = Net.new()
-  local encoded = Json.encode({ type = "hosted", code = "ABCDEF" })
+  local encoded = Json.encode({ type = "lobby_welcome", session = "abc" })
   n.rxBuf = encoded .. "\n"
   n:drainLines()
-  eq(n.code, "ABCDEF", "relay framing: a complete hosted line sets net.code")
+  eq(n.inbox[1] and n.inbox[1].session, "abc",
+     "relay framing: a complete line lands in the inbox")
   check(n.rxBuf == "", "relay framing: a complete line is fully consumed")
 
   local n2 = Net.new()
-  n2.rxBuf = encoded:sub(1, 5) -- the line straddles two reads
+  n2.rxBuf = encoded:sub(1, 5)
   n2:drainLines()
-  check(n2.code == nil, "relay framing: a partial line doesn't parse yet")
+  eq(#n2.inbox, 0, "relay framing: a partial line doesn't parse yet")
   n2.rxBuf = n2.rxBuf .. encoded:sub(6) .. "\n"
   n2:drainLines()
-  eq(n2.code, "ABCDEF", "relay framing: completing the line resolves it")
+  eq(n2.inbox[1] and n2.inbox[1].session, "abc",
+     "relay framing: completing the line resolves it")
 
-  local n3 = Net.new()
-  n3.rxBuf = Json.encode({ type = "join_error", reason = "not_found" }) .. "\n"
-  n3:drainLines()
-  check(n3.error ~= nil and n3.closed, "relay framing: join_error sets error and closes")
-
-  local n4 = Net.new()
-  n4.rxBuf = Json.encode({ type = "paired" }) .. "\n"
-  n4:drainLines()
-  check(n4.paired, "relay framing: paired flips net.paired")
-
-  local n5 = Net.new()
-  n5.paired = true
-  n5.rxBuf = Json.encode({ type = "peer_gone" }) .. "\n"
-  n5:drainLines()
-  check(n5.closed, "relay framing: peer_gone closes the connection")
+  check(Net.hostOnline == nil and Net.joinOnline == nil,
+        "relay: the v1 host/join dialers are gone")
+  for _, v1 in ipairs({ "hosted", "paired", "peer_gone", "join_error" }) do
+    local nv = Net.new()
+    nv.rxBuf = Json.encode({ type = v1, code = "ABCDEF", reason = "not_found" }) .. "\n"
+    nv:drainLines()
+    check(not nv.closed and not nv.paired and nv.error == nil and #nv.inbox == 1,
+          "relay framing: a v1 " .. v1 .. " is no transport control any more")
+  end
 
   local n6 = Net.new()
   n6.rxBuf = Json.encode({ type = "hello", name = "RED" }) .. "\n"
   n6:drainLines()
   eq(#n6.inbox, 1, "relay framing: an unrecognized control type lands in the inbox")
   eq(n6.inbox[1] and n6.inbox[1].name, "RED", "relay framing: ...with its payload intact")
+
+  -- heartbeat: ping and pong are relay control, never inbox traffic
+  local n7 = Net.new()
+  n7.tcpSocket = true -- Net:send queues into txBuf on the relay arm
+  n7.rxBuf = Json.encode({ type = "ping", t = 1234 }) .. "\n"
+  n7:drainLines()
+  eq(#n7.inbox, 0, "relay heartbeat: a server ping never reaches the inbox")
+  check(n7.txBuf:find('"pong"', 1, true) ~= nil,
+        "relay heartbeat: a server ping is answered with a pong")
+  check(n7.txBuf:find("1234", 1, true) ~= nil,
+        "relay heartbeat: the pong echoes the ping's t")
+
+  local n8 = Net.new()
+  n8.pendingPings = 2
+  n8.rxBuf = Json.encode({ type = "pong", t = 5 }) .. "\n"
+  n8:drainLines()
+  eq(#n8.inbox, 0, "relay heartbeat: a pong never reaches the inbox")
+  check(n8.sawPong, "relay heartbeat: a pong marks the relay as answering")
+  eq(n8.pendingPings, 0, "relay heartbeat: a pong clears the missed-ping counter")
+
+  -- a relay that has never ponged (a v1 server) is never timed out
+  local n9 = Net.new()
+  n9.tcpSocket = true
+  n9.lastSendAt = -1000
+  for _ = 1, 6 do n9:heartbeatTCP(); n9.lastSendAt = -1000 end
+  check(not n9.closed, "relay heartbeat: a relay that never ponged is never timed out")
+  check(n9.pendingPings >= 6, "relay heartbeat: ...but pings still go out")
+
+  -- once a pong has been seen, three missed ones close the connection
+  local n10 = Net.new()
+  n10.tcpSocket = true
+  n10.sawPong = true
+  n10.lastSendAt = -1000
+  n10:heartbeatTCP()
+  check(not n10.closed, "relay heartbeat: one missed pong is not fatal")
+  n10.lastSendAt = -1000
+  n10:heartbeatTCP()
+  check(not n10.closed, "relay heartbeat: two missed pongs are not fatal")
+  n10.lastSendAt = -1000
+  n10:heartbeatTCP()
+  check(n10.closed and n10.error ~= nil,
+        "relay heartbeat: three missed pongs close the connection with an error")
+
+  -- close() drains txBuf through a socket that only accepts partial writes
+  local function stubSocket(chunk)
+    local sent = {}
+    return {
+      sent = sent,
+      send = function(_, data)
+        if chunk <= 0 then return nil, "timeout", 0 end
+        local n = math.min(chunk, #data)
+        sent[#sent + 1] = data:sub(1, n)
+        if n == #data then return n end
+        return nil, "timeout", n
+      end,
+      receive = function() return nil, "timeout", "" end,
+      close = function() end,
+      setoption = function() end,
+    }
+  end
+
+  local n11 = Net.new()
+  n11.selectable = false
+  local closing = stubSocket(4)
+  n11.tcpSocket = closing
+  n11:send({ type = "bye" })
+  n11:close()
+  eq(table.concat(closing.sent), '{"type":"bye"}\n',
+     "relay close: close() flushes the queued bye instead of discarding it")
+  check(n11.closed and n11.tcpSocket == nil,
+        "relay close: close() still closes and releases the connection")
+
+  local n12 = Net.new()
+  n12.selectable = false
+  local stub = stubSocket(4)
+  n12.tcpSocket = stub
+  n12:send({ type = "bye" })
+  n12:flushTCP(0.25)
+  eq(table.concat(stub.sent), '{"type":"bye"}\n',
+     "relay close: a partial-write socket is pumped until txBuf is empty")
+  eq(n12.txBuf, "", "relay close: the flush leaves nothing queued")
+
+  -- a socket that never drains gives up at the deadline instead of hanging
+  local n13 = Net.new()
+  n13.selectable = false
+  local attempts = 0
+  n13.tcpSocket = {
+    send = function() attempts = attempts + 1 return nil, "timeout", 0 end,
+    receive = function() return nil, "timeout", "" end,
+    close = function() end,
+  }
+  n13:send({ type = "bye" })
+  n13:flushTCP(0.05)
+  check(attempts > 0 and attempts <= Net.CLOSE_FLUSH_ATTEMPTS,
+        "relay close: a socket that never drains gives up at the attempt bound")
+  check(#n13.txBuf > 0, "relay close: ...and the undelivered bytes stay queued")
+  n13:close()
+  check(n13.closed, "relay close: an undrainable socket still closes")
 end
 
 -- real pokeserver over TCP localhost (only when luasocket is present, i.e.
@@ -230,36 +324,50 @@ else
   if not ready then
     print("skip real relay pairing (couldn't reach the spawned pokeserver)")
   else
-    local host = Net.new()
-    check(host:hostOnline("127.0.0.1:" .. PORT), "relay: hostOnline connects: " .. tostring(host.error))
-    local deadline = os.clock() + 3
-    while not host.code and os.clock() < deadline do host:update() end
-    check(host.code ~= nil, "relay: a real server assigns a room code")
-
-    local guest = Net.new()
-    check(guest:joinOnline("127.0.0.1:" .. PORT, host.code or ""),
-          "relay: joinOnline connects: " .. tostring(guest.error))
-    deadline = os.clock() + 3
-    while (not host.paired or not guest.paired) and os.clock() < deadline do
-      host:update()
-      guest:update()
-    end
-    check(host.paired and guest.paired, "relay: both sides pair over a real TCP server")
-
-    host:send({ type = "hello", name = "RED" })
-    local relayed = nil
-    deadline = os.clock() + 3
-    while not relayed and os.clock() < deadline do
-      host:update()
-      guest:update()
-      for _, m in ipairs(guest:poll()) do
-        if m.type == "hello" then relayed = m end
+    local function waitFor(net, pred, seconds)
+      local deadline = os.clock() + (seconds or 3)
+      while os.clock() < deadline do
+        net:update()
+        for _, m in ipairs(net:poll()) do
+          if pred(m) then return m end
+        end
+        if net.closed then return nil end
       end
+      return nil
     end
-    eq(relayed and relayed.name, "RED", "relay: a message round-trips through the real server")
 
-    host:close()
-    guest:close()
+    local lobby = Net.new()
+    check(lobby:connectTCP("127.0.0.1:" .. PORT),
+          "relay: connectTCP dials the real server: " .. tostring(lobby.error))
+    lobby:send({ type = "lobby_hello", protocol = 3, name = "RED", profiles = {} })
+    local welcome = waitFor(lobby, function(m) return m.type == "lobby_welcome" end)
+    check(welcome ~= nil and type(welcome.session) == "string",
+          "relay: a protocol 3 lobby_hello is welcomed over real TCP")
+    lobby:close()
+
+    local relaySrc = io.open("../pokeserver/relay.js", "r")
+    local relayText = relaySrc and relaySrc:read("*a") or ""
+    if relaySrc then relaySrc:close() end
+    if not relayText:find("upgrade_required", 1, true) then
+      print("skip real relay upgrade_required (../pokeserver predates protocol 3)")
+    else
+      local old = Net.new()
+      check(old:connectTCP("127.0.0.1:" .. PORT), "relay: a v1 client still dials")
+      old:send({ type = "host" })
+      local up = waitFor(old, function(m) return m.type == "upgrade_required" end)
+      check(up ~= nil, "relay: a v1 host answers upgrade_required")
+      old:close()
+
+      local stale = Net.new()
+      check(stale:connectTCP("127.0.0.1:" .. PORT), "relay: a v2 client still dials")
+      stale:send({ type = "lobby_hello", protocol = 2, name = "OLD", profiles = {} })
+      local up2 = waitFor(stale, function(m)
+        return m.type == "upgrade_required" or m.type == "lobby_welcome"
+      end)
+      eq(up2 and up2.type, "upgrade_required",
+         "relay: a protocol 2 lobby_hello answers upgrade_required")
+      stale:close()
+    end
   end
 
   local pidHandle = io.open(pidFile, "r")
@@ -313,6 +421,17 @@ tC:handle({ type = "pick", index = 1 })
 tC:confirm(true)
 tC:handle({ type = "confirm", ok = false })
 eq(tC.stage, "cancelled", "declined trade cancels")
+
+-- TradeCenter_PrintPartyListNames (engine/link/cable_club.asm:657) reads
+local LinkStateMod = require("src.link.LinkState")
+local labelState = setmetatable({ game = { data = Data } }, LinkStateMod)
+local nicked = Pokemon.new(Data, "SANDSHREW", 5)
+nicked.nickname = "FLUFFY"
+eq(labelState:listLabel(nicked), "SANDSHREW", "the list shows the species, not the nickname")
+eq(#labelState:listLabel(nicked), 9, "a 9-char species name is not truncated")
+local pickStub = { canPick = function() return false end }
+eq(labelState:listLabel(nicked, pickStub, 1), "SANDSHREWX",
+   "an unpickable mon keeps its X mark")
 
 -- ---------------------------------------------------------------- link battle (lockstep)
 -- Both sides run the full engine locally on a shared seed; this drives
@@ -430,7 +549,7 @@ eq(gameH.save.party[1].level, 100, "...on both sides")
 -- ---------------------------------------------------------------- "ANY" level ruling (#204)
 -- The link "level ruling" picker cycles a string sentinel "ANY" meaning
 -- "use each mon's real level" (Gen1 link cable always used the real level).
--- LinkState/Tournament.levelForWire turns that sentinel into nil on the wire;
+-- LinkState.levelForWire turns that sentinel into nil on the wire;
 -- a broken `x and nil or y` idiom used to let the literal "ANY" through into
 -- opts.forceLevel, and Protocol.unpackMon then called math.floor("ANY") ->
 -- "bad argument #1 to 'floor' (number expected, got string)", crashing the
@@ -636,6 +755,130 @@ check(fxAdvances("waitRemote", nil),
 check(fxAdvances("messages", "linkNext"),
       "the fx clock keeps running while a resolved turn drains")
 
+-- ---------------------------------------------------------------- ruleset draw count
+local Damage = require("src.battle.Damage")
+local faithful = require("src.battle.rulesets.gen1_faithful")
+local modern = require("src.battle.rulesets.modern_clean")
+local function countingRng()
+  local n = 0
+  return function(a, b)
+    n = n + 1
+    if a == nil then return 0 end
+    if b == nil then a, b = 1, a end
+    return a
+  end, function() return n end
+end
+local accMove = { accuracy = 100 }
+local accAttacker = { stages = { accuracy = 0 } }
+local accDefender = { stages = { evasion = 0 } }
+local rngF, drawsF = countingRng()
+Damage.accuracyRoll(faithful, accMove, accAttacker, accDefender, rngF)
+eq(drawsF(), 1, "gen1_faithful spends one RNG draw on a 100-accuracy roll")
+local rngM, drawsM = countingRng()
+Damage.accuracyRoll(modern, accMove, accAttacker, accDefender, rngM)
+eq(drawsM(), 0, "modern_clean spends none (the 1/256 miss is gone)")
+
+-- ---------------------------------------------------------------- host-dealt ruleset
+local Handshake = require("src.link.Handshake")
+local Wire = require("src.link.Wire")
+local gameK = makeFakeGame("CHARIZARD")
+local gameL = makeFakeGame("BLASTOISE")
+gameL.save.player.name = "BLUE"
+gameK.save.options.ruleset = "gen1_faithful"
+gameL.save.options.ruleset = "modern_clean"
+eq(Handshake.ruleset(gameK), "gen1_faithful", "the hello reports the local ruleset")
+eq(Handshake.ruleset(gameL), "modern_clean", "...on each side independently")
+
+local netK, netL = Net.loopbackPair()
+local packedK = Protocol.packParty(gameK.save.party)
+local packedL = Protocol.packParty(gameL.save.party)
+local rsSeed = 424242
+local dealt = Wire.sanitize({ type = "party", mons = packedK, seed = rsSeed,
+                              ruleset = Handshake.ruleset(gameK) })
+eq(dealt.ruleset, "gen1_faithful", "the ruleset survives the party schema")
+
+local battleK = LinkBattle.newHost(gameK, netK, {
+  myParty = packedK, theirParty = packedL, theirName = "BLUE", seed = rsSeed,
+  ruleset = Handshake.ruleset(gameK),
+})
+local battleL = LinkBattle.newGuest(gameL, netL, {
+  myParty = packedL, theirParty = packedK, theirName = "RED", seed = dealt.seed,
+  ruleset = dealt.ruleset,
+})
+eq(battleK.rulesetId, battleL.rulesetId, "both machines run the host's ruleset id")
+eq(battleL.ruleset.name, "gen1_faithful",
+   "the guest's own modern_clean OPTIONS row is overridden by the host's")
+check(battleL.ruleset ~= modern,
+      "...and the local selection is not the record the battle holds")
+
+local resK, resL = nil, nil
+battleK.onFinish = function(r) resK = r end
+battleL.onFinish = function(r) resL = r end
+gameK.stack:push(battleK)
+gameL.stack:push(battleL)
+local guardRs = 0
+while (resK == nil or resL == nil) and guardRs < 60000 do
+  guardRs = guardRs + 1
+  Input.pressed = { a = true }
+  gameK.stack:update(1 / 60)
+  gameL.stack:update(1 / 60)
+end
+check(resK ~= nil and resL ~= nil,
+      "mismatched-OPTIONS battle completes on both sides")
+check((resK == "win" and resL == "lose") or (resK == "lose" and resL == "win")
+      or (resK == "draw" and resL == "draw"),
+      "...and the two simulations agree on the outcome")
+eq(battleK.player.mon.hp, battleL.enemy.mon.hp,
+   "mismatched-OPTIONS battle: host mon HP identical on both sides")
+eq(battleK.enemy.mon.hp, battleL.player.mon.hp,
+   "mismatched-OPTIONS battle: guest mon HP identical on both sides")
+eq(battleK.rngDraws, battleL.rngDraws,
+   "the two sides took the same number of RNG draws")
+local rsSplit = false
+for turn, h in pairs(battleK.localHashes) do
+  if battleL.localHashes[turn] and battleL.localHashes[turn] ~= h then rsSplit = true end
+end
+check(not rsSplit, "no desync across a battle between differently-configured players")
+
+local netM, netN = Net.loopbackPair()
+local gameM = makeFakeGame("PIKACHU")
+local gameN = makeFakeGame("GEODUDE")
+gameN.save.player.name = "BLUE"
+gameM.save.options.ruleset = "modern_clean"
+gameN.save.options.ruleset = "gen1_faithful"
+local battleM = LinkBattle.newHost(gameM, netM, {
+  myParty = Protocol.packParty(gameM.save.party),
+  theirParty = Protocol.packParty(gameN.save.party),
+  theirName = "BLUE", seed = 777 })
+local battleN = LinkBattle.newGuest(gameN, netN, {
+  myParty = Protocol.packParty(gameN.save.party),
+  theirParty = Protocol.packParty(gameM.save.party),
+  theirName = "RED", seed = 777 })
+eq(battleM.ruleset.name, "gen1_faithful", "no dealt ruleset falls back to the default")
+eq(battleN.ruleset.name, "gen1_faithful", "...identically on the other machine")
+
+-- ---------------------------------------------------------------- ruleset in the handshake
+local rsHelloA = Handshake.hello(gameK, "battle")
+local rsHelloB = Handshake.hello(gameL, nil)
+eq(rsHelloA.ruleset, "gen1_faithful", "the hello carries the local ruleset")
+local rsVerdict, rsReason = Handshake.checkCompat(rsHelloA, rsHelloB)
+eq(rsVerdict, "ruleset_skew", "two peers on different rulesets do not pair as full")
+eq(rsReason, "ruleset_mismatch", "...with the ruleset named as the reason")
+eq(Handshake.battleAllowed(rsVerdict), false, "a ruleset mismatch refuses battle")
+eq(Handshake.tradeAllowed(rsVerdict), true, "...and leaves trading alone")
+eq(Handshake.strict(rsVerdict), true, "both peers are v2, so the trade stays strict")
+local rsLines = Handshake.describe(rsHelloA, rsHelloB, rsVerdict, "battle")
+check(#rsLines > 0, "the incompatibility screen has something to say")
+local rsText = table.concat(rsLines, " ")
+check(rsText:find("RULESET") ~= nil, "...and it names the OPTIONS row to change")
+gameL.save.options.ruleset = "gen1_faithful"
+eq(Handshake.checkCompat(rsHelloA, Handshake.hello(gameL, nil)), "full",
+   "matching rulesets still pair as full")
+local rsOld = Handshake.hello(gameL, nil)
+rsOld.ruleset = nil
+eq(Handshake.checkCompat(rsHelloA, rsOld), "full",
+   "a peer without the field is treated as the default ruleset")
+
 -- ---------------------------------------------------------------- desync fuzz
 -- The lockstep battle above holds A through one Charizard/Blastoise duel,
 -- which is one path.  This walks the rest -- random parties, switches,
@@ -645,11 +888,55 @@ check(fxAdvances("messages", "linkNext"),
 local fuzzOk, fuzzErr = pcall(dofile, "tests/link_desync_fuzz.lua")
 check(fuzzOk, "lockstep desync fuzz" .. (fuzzOk and "" or (": " .. tostring(fuzzErr))))
 
+-- ---------------------------------------------------------------- hostile wire
+-- Every message type crossed with every wrong Lua type, through the real
+-- Session choke point and into the real consumers.  The regression net for
+-- the remote-crash payloads; self-contained like the fuzz above.
+local hostileOk, hostileErr = pcall(dofile, "tests/link_hostile.lua")
+check(hostileOk, "hostile wire suite"
+      .. (hostileOk and "" or (": " .. tostring(hostileErr))))
+
 -- ---------------------------------------------------------------- mod link compat
 -- Self-contained like the tests/mod_*.lua suites: own bootstrap and
 -- assert-based checks, so it lands here as a single pass/fail line.
 local modOk, modErr = pcall(dofile, "tests/mod_link_tests.lua")
 check(modOk, "mod link compat suite" .. (modOk and "" or (": " .. tostring(modErr))))
+
+local clientOk, clientErr = pcall(dofile, "tests/online_client.lua")
+check(clientOk, "online client suite" .. (clientOk and "" or (": " .. tostring(clientErr))))
+
+local client3Ok, client3Err = pcall(dofile, "tests/online_client_gen3.lua")
+check(client3Ok, "online client gen 3 suite"
+      .. (client3Ok and "" or (": " .. tostring(client3Err))))
+
+-- ---------------------------------------------------------------- gen 2 lockstep
+-- The Gold peer of the lockstep section above: two src/link/LinkBattle2.lua
+-- simulations over a loopback, driven through the real Gen 2 battle screen.
+-- ROM-free (its own Gen 2 shaped fixture), so it runs here whatever the cache
+-- holds.
+local link2Ok, link2Err = pcall(dofile, "tests/link2_lockstep.lua")
+check(link2Ok, "gen 2 lockstep suite"
+      .. (link2Ok and "" or (": " .. tostring(link2Err))))
+
+local fuzz2Ok, fuzz2Err = pcall(dofile, "tests/link2_desync_fuzz.lua")
+check(fuzz2Ok, "gen 2 lockstep desync fuzz"
+      .. (fuzz2Ok and "" or (": " .. tostring(fuzz2Err))))
+
+local LUA = os.getenv("LUA") or "luajit"
+local function standalone(path)
+  local status = os.execute(LUA .. " " .. path)
+  return status == true or status == 0
+end
+
+for _, suite in ipairs({
+  { "tests/link3_lockstep_test.lua", "gen 3 lockstep suite" },
+  { "tests/link3_arena_state_test.lua", "gen 3 arena state suite" },
+  { "tests/link3_desync_fuzz.lua", "gen 3 lockstep desync fuzz" },
+  { "tests/link3_multi_test.lua", "gen 3 multi battle lockstep suite" },
+  { "tests/emerald_link_xver_test.lua", "gen 3 cross-version host-rules battles" },
+}) do
+  check(standalone(suite[1]), suite[2])
+end
 
 print(("\n%s"):format(failures == 0 and "ALL LINK TESTS PASSED" or failures .. " FAILURES"))
 os.exit(failures == 0 and 0 or 1)

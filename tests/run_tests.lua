@@ -12,6 +12,10 @@ love = require("tests.love_stub")
 -- assertions and the RNG seed come off the shared harness; this file keeps
 -- its own tail because the verdict line ("N FAILURES") is what CI greps
 local T = require("tests.harness")
+-- every suite below is dofile'd in this process, so a suite that reaches for
+-- T.finish must raise into runSuites' pcall instead of os.exit(0)-ing the tier
+_G.POKEPORT_TEST_CHILD = true
+_G.POKEPORT_LOOP_PANEL_SYNC = true
 -- this suite has always streamed a line per check, and it is the one a
 -- developer watches for progress through ~1600 assertions
 T.verbose = true
@@ -114,6 +118,12 @@ do
         "cont boundary waits for A with contAdvance")
   check(not box.done, "cont wait is not the final done prompt")
   eq(box.lineIndex, 2, "cont wait stays on the finished line until A")
+  -- ProtectedDelay3 (home/text.asm:265): the ▼ swallows the button for
+  -- three frames before ManualTextScroll starts listening
+  for _ = 1, 80 do
+    if (box.preWait or 0) == 0 then break end
+    box:update(0)
+  end
   pressed.a = true
   box:update(0)
   check(not box.waiting and not box.contAdvance, "A clears cont wait")
@@ -277,6 +287,16 @@ do
   eq(ItemEffects.use(Data, save, "HM_SURF", pikachu, {}), "failed",
      "HM refuses mid-battle")
 end
+do
+  local rRepel, repelMsg = ItemEffects.use(Data, save, "MAX_REPEL", nil, {})
+  eq(rRepel, "failed", "Max Repel refuses mid-battle (#894)")
+  check(repelMsg and repelMsg[1] and repelMsg[1]:find("isn't the", 1, true),
+        "Max Repel mid-battle Oak text")
+  eq(ItemEffects.use(Data, save, "REPEL", nil, {}), "failed",
+     "Repel refuses mid-battle")
+  eq(ItemEffects.use(Data, save, "SUPER_REPEL", nil, {}), "failed",
+     "Super Repel refuses mid-battle")
+end
 local r5, _, extra = ItemEffects.use(Data, save, "THUNDER_STONE", pikachu)
 eq(r5, "consumed", "Thunder Stone works on Pikachu")
 eq(extra.evolveTo, "RAICHU", "Thunder Stone evolves Pikachu to Raichu")
@@ -421,25 +441,28 @@ check(Damage.compute(ruleset, confused, confused, confMove,
 -- (StatModifierDownEffect's side-effect branch skips MoveHitTest)
 local MoveEffects = require("src.battle.MoveEffects")
 local sideRng = { rng = function() return 0 end }
+-- player attacker: effects.asm:552's 25 percent miss is the enemy's branch
+local sideUser = { isPlayer = true, stages = {}, mon = {} }
 local misted = { stages = {}, mist = true, name = "MISTY", mon = {} }
-MoveEffects.secondary.ATTACK_DOWN_SIDE_EFFECT(sideRng, nil, misted)
+MoveEffects.secondary.ATTACK_DOWN_SIDE_EFFECT(sideRng, sideUser, misted)
 eq(misted.stages.attack, -1, "secondary stat drop pierces MIST")
 local misted2 = { stages = {}, mist = true, name = "MISTY", mon = {} }
-local mistMsgs = MoveEffects.primary.ATTACK_DOWN1_EFFECT(sideRng, nil, misted2)
+local mistMsgs = MoveEffects.primary.ATTACK_DOWN1_EFFECT(sideRng, sideUser, misted2)
 check(misted2.stages.attack == nil
       and mistMsgs[1]:find("MIST", 1, true) ~= nil,
       "primary stat drop still blocked by MIST")
 
--- Substitute boundary: built at exactly 1/4 max HP, leaving 0 HP
--- (substitute.asm only fails on subtraction underflow)
+-- Substitute boundary: the move must fail when its quarter-HP cost would
+-- consume all current HP, preventing a zero-HP user with a live substitute.
 local subUser = { mon = { stats = { hp = 40 }, hp = 10 }, name = "SUBBY" }
-MoveEffects.primary.SUBSTITUTE_EFFECT(sideRng, subUser)
-check(subUser.substituteHP ~= nil and subUser.mon.hp == 0,
-      "substitute built at exactly 1/4 max HP leaves 0 HP")
-local subUser2 = { mon = { stats = { hp = 40 }, hp = 9 }, name = "SUBBY" }
-local subMsgs = MoveEffects.primary.SUBSTITUTE_EFFECT(sideRng, subUser2)
-check(subUser2.substituteHP == nil
+local subMsgs = MoveEffects.primary.SUBSTITUTE_EFFECT(sideRng, subUser)
+check(subUser.substituteHP == nil and subUser.mon.hp == 10
       and subMsgs[1]:find("weak", 1, true) ~= nil,
+      "substitute fails at exactly 1/4 max HP")
+local subUser2 = { mon = { stats = { hp = 40 }, hp = 9 }, name = "SUBBY" }
+local subMsgs2 = MoveEffects.primary.SUBSTITUTE_EFFECT(sideRng, subUser2)
+check(subUser2.substituteHP == nil and subUser2.mon.hp == 9
+      and subMsgs2[1]:find("weak", 1, true) ~= nil,
       "substitute fails below 1/4 max HP")
 
 -- Haze clears Disable/X ACCURACY on both sides and forfeits the turn of
@@ -874,8 +897,7 @@ do
     check(tb:lockedAction(tb.enemy) == nil, "victim is free after the release")
   end
 
-  -- #2: recoil and drain use the RAW computed damage, not the HP-capped
-  -- amount dealt
+  -- engine/battle/core.asm ApplyDamageToEnemyPokemon
   do
     Game.save.party = { Pokemon.new(Data, "BULBASAUR", 20) }
     local rb = BattleState.newWild(Game, "RATTATA", 3)
@@ -886,8 +908,8 @@ do
     rb.rng = mkseq({ 0, 255, 255 })
     local hpBefore = rb.player.mon.hp
     rb:performMove(rb.player, rb.enemy, { id = "TAKE_DOWN", pp = 10 })
-    eq(hpBefore - rb.player.mon.hp, math.floor(raw / 4),
-       "recoil is raw damage / 4 even when only 1 HP was dealt")
+    eq(hpBefore - rb.player.mon.hp, 1,
+       "recoil is capped damage / 4 with a minimum of 1")
 
     local db = BattleState.newWild(Game, "RATTATA", 3)
     db.enemy.mon.hp = 1
@@ -897,9 +919,9 @@ do
     check(rawD >= 4, "raw MEGA DRAIN damage is meaningful (" .. rawD .. ")")
     db.rng = mkseq({ 0, 255, 255 })
     db:performMove(db.player, db.enemy, { id = "MEGA_DRAIN", pp = 10 })
-    eq(db.player.mon.hp - 1, math.floor(rawD / 2),
-       "drain heals raw damage / 2 even when only 1 HP was dealt")
-    eq(db.lastDamage, math.floor(rawD / 2),
+    eq(db.player.mon.hp - 1, 1,
+       "drain heals capped damage / 2 with a minimum of 1")
+    eq(db.lastDamage, 1,
        "drain halves wDamage in place (Counter would see the half)")
   end
 
@@ -1044,7 +1066,7 @@ do
     kb.player.mon.status = "PSN"
     kb.enemy.mon.hp = 0 -- the opponent was already knocked out this turn
     local hpBefore = kb.player.mon.hp
-    kb:endOfTurn()
+    kb:residualFor(kb.player, kb.enemy)
     eq(kb.player.mon.hp, hpBefore,
        "no residual poison on the turn the poisoned mon lands the KO")
 
@@ -1052,7 +1074,7 @@ do
     local lb = BattleState.newWild(Game, "RATTATA", 5)
     lb.player.mon.status = "PSN"
     local live = lb.player.mon.hp
-    lb:endOfTurn()
+    lb:residualFor(lb.player, lb.enemy)
     check(lb.player.mon.hp < live, "poison still ticks while the opponent lives")
   end
 
@@ -1078,6 +1100,11 @@ do
       if it.text and it.text:find(s, 1, true) then return true end
     end
     return false
+  end
+  -- constants/charmap.asm:19-20
+  local function plain(s)
+    if type(s) ~= "string" then return s end
+    return (s:gsub("{DONE}%s*$", ""):gsub("{PROMPT}%s*$", ""))
   end
   local function hasDrain(b)
     for _, it in ipairs(b.queue) do
@@ -1110,9 +1137,14 @@ do
     { rng = mkseq({}) }, pb.player, pb.enemy, Data.moves.THUNDER_WAVE)
   eq(parMsgs[1], "Enemy RATTATA's\nparalyzed! It may\nnot attack!",
      "_ParalyzedMayNotAttackText wording + prefix")
+  -- move_effects/paralyze.asm:12
   local failMsgs = MoveFx.primary.PARALYZE_EFFECT(
     { rng = mkseq({}) }, pb.player, pb.enemy, Data.moves.THUNDER_WAVE)
-  eq(failMsgs[1], "But, it failed!", "_ButItFailedText has the comma")
+  eq(failMsgs[1], "It didn't affect\nEnemy RATTATA!",
+     "an already-statused target is DidntAffect, not ButItFailed")
+  local TextBox = require("src.render.TextBox")
+  eq(TextBox.strip(Data.text._ButItFailedText):gsub("%s+$", ""),
+     "But, it failed!", "_ButItFailedText has the comma")
 
   -- send-out shout buckets (PrintSendOutMonMessage thresholds)
   pb.enemy.mon.stats = { hp = 20 }
@@ -1126,14 +1158,17 @@ do
   eq(pb:sendOutText("PIKA"), "The enemy's weak!\nGet'm! PIKA!",
      "send-out below 10%")
 
-  -- HP-bar drain converges at UpdateHPBar's pixel pace (maxHP/96/frame)
+  -- HP-bar drain converges at UpdateHPBar's per-side pace (2 frames per
+  -- bar pixel, enemy HP steps free; hp_bar.asm:81-148 via Timing)
   local db = BattleState.newWild(Game, "RATTATA", 5)
   local maxHP = db.enemy.mon.stats.hp
+  local startHP = db.enemy.mon.hp
   db.enemy.mon.hp = math.max(0, db.enemy.mon.hp - 5)
   local frames = 0
   while db:stepHPDrain() and frames < 2000 do frames = frames + 1 end
   eq(db.enemy.shownHP, db.enemy.mon.hp, "drain settles on the true HP")
-  local expect = math.ceil(5 / (maxHP / 96))
+  local expect = require("src.core.Timing").hpDrainFrames(
+    startHP, db.enemy.mon.hp, maxHP, false)
   check(math.abs(frames - expect) <= 1,
         ("drain speed ~2 frames per bar pixel (%d ~ %d)"):format(frames, expect))
 
@@ -1187,7 +1222,7 @@ do
     for _, r in ipairs(mhk.queue) do
       if r.anim == "DOUBLE_KICK" then seq[#seq + 1] = "anim"
       elseif r.drain then seq[#seq + 1] = "drain"
-      elseif r.text == "It's super\neffective!" then seq[#seq + 1] = "se"
+      elseif plain(r.text) == "It's super\neffective!" then seq[#seq + 1] = "se"
       elseif r.text and r.text:find("times!", 1, true) then seq[#seq + 1] = "count"
       end
     end
@@ -1204,20 +1239,65 @@ do
     local mhc = BattleState.newWild(Game, "SNORLAX", 40)
     mhc.rng = mkseq({ 0, 255 }) -- acc, damage; crit from the hook
     mhc:performMove(mhc.player, mhc.enemy, { id = "DOUBLE_KICK", pp = 10 })
-    eq(countText(mhc, "Critical hit!"), 2,
-       "multi-hit prints Critical hit! once per strike")
+    eq(countText(mhc, "Critical hit!"), 1,
+       "PrintCriticalOHKOText clears wCriticalHitOrOHKO, so the crit line prints once")
     local cseq = {}
     for _, r in ipairs(mhc.queue) do
       if r.anim == "DOUBLE_KICK" then cseq[#cseq + 1] = "anim"
       elseif r.drain then cseq[#cseq + 1] = "drain"
-      elseif r.text == "Critical hit!" then cseq[#cseq + 1] = "crit"
-      elseif r.text == "It's super\neffective!" then cseq[#cseq + 1] = "se"
+      elseif plain(r.text) == "Critical hit!" then cseq[#cseq + 1] = "crit"
+      elseif plain(r.text) == "It's super\neffective!" then cseq[#cseq + 1] = "se"
       end
     end
-    eq(table.concat(cseq, ","), "anim,drain,crit,se,anim,drain,crit,se",
-       "crit then effectiveness follow each multi-hit drain")
+    eq(table.concat(cseq, ","), "anim,drain,crit,se,anim,drain,se",
+       "the crit line prints once, effectiveness after every drain")
+    -- data/text/text_2.asm:1144
+    local function rowFor(b, s)
+      for _, r in ipairs(b.queue) do
+        if plain(r.text) == s then return r end
+      end
+      return nil
+    end
+    local critRow = rowFor(mhc, "Critical hit!")
+    check(critRow ~= nil and critRow.auto ~= true,
+          "_CriticalHitText ends in prompt, so the crit line waits on A")
+    -- data/text/text_2.asm:1321
+    local seRow = rowFor(mhc, "It's super\neffective!")
+    check(seRow ~= nil and seRow.auto ~= true,
+          "_SuperEffectiveText ends in prompt too")
     unsub()
     Runtime.install(savedE, savedH)
+
+    -- home/text.asm:218
+    local Timing = require("src.core.Timing")
+    local hold = BattleState.newWild(Game, "SNORLAX", 40)
+    hold.queue, hold.current, hold.introSlide = {}, nil, 0
+    hold.phase, hold.afterQueue = "messages", nil
+    local realWasPressed = Input.wasPressed
+    local pressA = false
+    Input.wasPressed = function(_, k) return k == "a" and pressA end
+    local ranNext = false
+    hold:say("Critical hit!")
+    hold:waitNext(20)
+    hold:actNext(function() ranNext = true end)
+    for _ = 1, 600 do
+      hold:update(1 / 60)
+      if hold.msgPrompt then break end
+    end
+    check(hold.msgPrompt == true, "the crit page raises the prompt arrow")
+    for _ = 1, Timing.TEXT_PRE_ADVANCE do hold:update(1 / 60) end
+    pressA = true
+    hold:update(1 / 60)
+    pressA = false
+    check(hold.current == nil and hold.msgHold == true,
+          "PromptText blanks only the arrow, so the page stays held after A")
+    for _ = 1, 600 do
+      hold:update(1 / 60)
+      if ranNext then break end
+    end
+    check(ranNext and hold.msgHold == true,
+          "and it is still drawn through the rows that follow")
+    Input.wasPressed = realWasPressed
   end
   Game.save.party = { Pokemon.new(Data, "SNORLAX", 30) }
   local mh2 = BattleState.newWild(Game, "RATTATA", 5)
@@ -1225,6 +1305,14 @@ do
   mh2:performMove(mh2.enemy, mh2.player, { id = "DOUBLESLAP", pp = 10 })
   check(hasText(mh2, "Hit 5 times!"),
         "enemy multi-hit uses _HitXTimesText (plural, no '(s)')")
+  do
+    local countRow
+    for _, r in ipairs(mh2.queue) do
+      if plain(r.text) == "Hit 5 times!" then countRow = r end
+    end
+    check(countRow ~= nil and countRow.auto ~= true,
+          "the hit-count line stays readable until the command menu redraws")
+  end
 
   -- GainedText parity (experience.asm:342-354 + text_2.asm:1207-1226):
   -- the amount from wExpAmountGained, "a boosted" for traded mons,
@@ -1239,7 +1327,9 @@ do
         "_GainedText + _ExpPointsText show the amount")
 
   Game.save.party = { Pokemon.new(Data, "BULBASAUR", 30) }
+  -- GainExperience: MON_OTID vs wPlayerID (experience.asm:69-88) (#1488)
   Game.save.party[1].traded = true
+  Game.save.party[1].otId = (Game.save.player.id or 0) + 1
   local eb2 = BattleState.newWild(Game, "RATTATA", 10)
   eb2.participants = { [Game.save.party[1]] = true }
   eb2:enemyMonFainted()
@@ -1317,7 +1407,7 @@ do
   Game.save.pokedex.owned.EKANS = nil
   local cb = BattleState.newWild(Game, "EKANS", 5)
   cb:storeCaughtMon()
-  check(hasText(cb, "New POKéDEX data\nwill be added for\nEKANS!"),
+  check(hasText(cb, "New POKéDEX data\nwill be added for\vEKANS!"),
         "_ItemUseBallText06 on a first catch")
   check(Game.save.pokedex.owned.EKANS == true, "species registered as owned")
   eq(cb.result, "caught", "catch resolves the battle")
@@ -1327,7 +1417,7 @@ do
   for _ = 1, 6 do table.insert(Game.save.party, Pokemon.new(Data, "RATTATA", 5)) end
   local cb2 = BattleState.newWild(Game, "EKANS", 5)
   cb2:storeCaughtMon()
-  check(hasText(cb2, "EKANS was\ntransferred to\nsomeone's PC!"),
+  check(hasText(cb2, "EKANS was\ntransferred to\vsomeone's PC!"),
         "_ItemUseBallText08 before meeting Bill")
   check(not hasText(cb2, "New POKéDEX data"),
         "no dex page for an already-owned species")
@@ -1351,7 +1441,7 @@ do
   Game.save.flags.EVENT_MET_BILL = true
   local cb3 = BattleState.newWild(Game, "EKANS", 5)
   cb3:storeCaughtMon()
-  check(hasText(cb3, "EKANS was\ntransferred to\nBILL's PC!"),
+  check(hasText(cb3, "EKANS was\ntransferred to\vBILL's PC!"),
         "_ItemUseBallText07 after meeting Bill")
   Game.save.flags.EVENT_MET_BILL = nil
 
@@ -1394,6 +1484,46 @@ do
     StateStack:update(1 / 60)
     Input.pressed = {}
     check(cancelled, "PartyMenu onCancel fires on B")
+  end
+
+  -- (engine/menus/start_sub_menus.asm:660-693) #2059
+  do
+    local PartyMenu = require("src.ui.PartyMenu")
+    Game.save.party = { Pokemon.new(Data, "BULBASAUR", 5),
+                        Pokemon.new(Data, "CHARMANDER", 6),
+                        Pokemon.new(Data, "SQUIRTLE", 7) }
+    local pm = PartyMenu.new(Game, {})
+    StateStack:push(pm)
+    pm.swapFrom, pm.index = 1, 3
+    Input.pressed = { a = true }
+    StateStack:update(1 / 60)
+    Input.pressed = {}
+    eq(Game.save.party[1].species, "SQUIRTLE", "SWITCH swaps slot 1 with slot 3")
+    eq(Game.save.party[3].species, "BULBASAUR", "SWITCH swaps slot 3 with slot 1")
+    check(pm.swapFrom == nil, "the swap arrow clears on the confirming A")
+    check(pm.swapAnim ~= nil and pm.swapAnim.blank[1] == true,
+          "wSwappedMenuItem's row blanks while SFX_SWAP plays")
+    check(pm.swapAnim.blank[3] ~= true,
+          "wCurrentMenuItem's row is still up on the first ClearGfx")
+    StateStack:update(1 / 60)
+    check(pm.swapAnim ~= nil, "the blank outlives the frame it started on")
+    check(pm.swapAnim.blank[3] == true,
+          "the second ClearGfx blanks wCurrentMenuItem's row too (#2126)")
+    for _ = 1, 12 do StateStack:update(1 / 60) end
+    check(pm.swapAnim == nil, "RedrawPartyMenu_ restores both rows")
+    -- .pickedMonsToSwap (start_sub_menus.asm:711)
+    pm.swapFrom, pm.index = 2, 2
+    Input.pressed = { a = true }
+    StateStack:update(1 / 60)
+    Input.pressed = {}
+    eq(Game.save.party[2].species, "CHARMANDER", "self-swap leaves the party alone")
+    check(pm.swapAnim ~= nil and pm.swapAnim.blank[2] == true,
+          "self-swap still blanks its own row")
+    StateStack:update(1 / 60)
+    check(pm.swapAnim.blank[2] == true and pm.swapAnim.to == 2,
+          "self-swap's second ClearGfx hits the same row (#2126)")
+    for _ = 1, 12 do StateStack:update(1 / 60) end
+    StateStack:pop()
   end
 
   Game.save.party = savedParty
@@ -1535,6 +1665,38 @@ while not ap:isDone() and frames < 600 do
   ap:update()
 end
 check(ap:isDone(), "THUNDERBOLT plays mirrored for the enemy")
+do
+local animFailures = {}
+for id in pairs(Data.battle_anims.moveAnims) do
+  for _, side in ipairs({ true, false }) do
+    local ok, err = pcall(ap.start, ap, id, side)
+    if not ok or (#ap.steps == 0 and #ap.events == 0) then
+      animFailures[#animFailures + 1] = id .. "(" .. tostring(side) .. "): "
+        .. tostring(err or "no steps")
+    end
+  end
+end
+table.sort(animFailures)
+eq(table.concat(animFailures, "; "), "", "every battle anim compiles from both sides")
+-- engine/battle/animations.asm:2418
+local fallingDX = Data.battle_anims.fallingDeltaXs
+check(fallingDX ~= nil and fallingDX[63] ~= nil, "falling-object delta-X bytes extracted")
+if fallingDX then
+  local head = {}
+  for i = 0, 8 do head[#head + 1] = fallingDX[i] end
+  eq(table.concat(head, ","), "0,1,3,5,7,9,11,13,15", "delta-X table head")
+  ap:start("PETAL_DANCE", true)
+  local petals
+  for _, st in ipairs(ap.steps) do
+    if #st.sprites == 20 then petals = st; break end
+  end
+  check(petals ~= nil, "PETAL_DANCE drops twenty petals")
+  if petals then
+    eq(petals.sprites[10].x, (0x4A - fallingDX[10]) % 256,
+       "petal 10 reads past the delta-X table on its first tick")
+  end
+end
+end
 
 -- ---------------------------------------------------------------- tile-pair collisions
 check(Data.field.tilePairs and #Data.field.tilePairs.land > 0,
@@ -1637,7 +1799,7 @@ do
   rep.options = {
     textSpeed = 3, animations = false, battleStyle = "SET",
     ruleset = "gen1_faithful", musicVol = 4, sfxVol = 2, musicFilter = 2,
-    colors = "og", tilt = 2, gbcfx = 3,
+    colors = "og", tilt = 2,
   }
   rep.defeatedTrainers = { ["OPP_BROCK:1"] = true }
   rep.pokedex = { seen = { PIKACHU = true, CATERPIE = true },
@@ -1666,7 +1828,6 @@ do
   eq(back.options.animations, false, "options.lua round-trips animations")
   eq(back.options.colors, "og", "options.lua round-trips colors")
   eq(back.options.tilt, 2, "options.lua round-trips tilt")
-  eq(back.options.gbcfx, 3, "options.lua round-trips gbcfx")
   -- zoom / voidFill ride the same options.lua path when present
   rep.options.zoom = -2
   rep.options.voidFill = "water"
@@ -2148,7 +2309,7 @@ end
 -- plays a tink + 40-frame pause per shake, rewinding the same subanim.
 do
   local AnimPlayer = require("src.battle.AnimPlayer")
-  local ap = AnimPlayer.new(require("data.generated.battle_anims"))
+  local ap = AnimPlayer.new(Data.battle_anims)
   ap:start("SHAKE_ANIM", true, { shakes = 3 })
   local tinks = 0
   for _, e in ipairs(ap.events) do
@@ -2287,13 +2448,38 @@ do
     StateStack:update(1 / 60)
     Input.pressed = {}
   end
+  local function waitTop(pred)
+    for _ = 1, 600 do
+      if pred(StateStack:top()) then return true end
+      StateStack:update(1 / 60)
+    end
+    return pred(StateStack:top())
+  end
+  check(StateStack:top() ~= shop and StateStack:top().isTextBox,
+        "the greeting types before BUY/SELL/QUIT (text_script.asm:141-150)")
+  check(waitTop(function(t) return t == shop end), "the greeting hands over to the mart menu")
   press("a") -- BUY
   check(StateStack:top() ~= shop, "BUY opens the buy list")
+  eq(shop.hollowIndex, 1, "BUY leaves a hollow cursor (text_box.asm:176)")
+  check(waitTop(function(t) return t ~= nil and t.onChoose ~= nil end),
+        "the buy list follows Take your time.")
   press("b") -- close the list
-  eq(StateStack:top(), shop, "closing the list returns to the mart menu")
+  check(waitTop(function(t) return t == shop end), "closing the list returns to the mart menu")
+  eq(shop.index, 1, "the mart menu cursor is back on BUY (pokemart.asm:10)")
+  eq(shop.hollowIndex, nil, "and filled again")
   press("down")
   press("down")
   press("a") -- QUIT
+  check(not quitCalled, "QUIT says goodbye before it returns (pokemart.asm:220)")
+  local goodbye = StateStack:top()
+  check(goodbye ~= shop and goodbye.isTextBox,
+        "QUIT prints _PokemartThankYouText")
+  eq(StateStack.states[#StateStack.states - 1], shop,
+     "the mart menu stays under the goodbye (pokemart.asm:220)")
+  for _ = 1, 600 do
+    if quitCalled then break end
+    press("a")
+  end
   check(quitCalled, "QUIT fires onQuit (script runner resume)")
   eq(#StateStack.states, depth0, "mart menu unwound cleanly")
 end
@@ -2318,18 +2504,27 @@ end
   Game.save.inventory = { GREAT_BALL = 5, HYPER_POTION = 99 }
   local sellShop = require("src.ui.ShopMenu").new(Game, { "POTION" }, function() end)
   StateStack:push(sellShop)
+  for _ = 1, 600 do
+    if StateStack:top() == sellShop then break end
+    StateStack:update(1 / 60)
+  end
   Input.pressed = { down = true }; StateStack:update(1 / 60); Input.pressed = {}
   Input.pressed = { a = true }; StateStack:update(1 / 60); Input.pressed = {}
+  for _ = 1, 600 do
+    if StateStack:top() ~= sellShop and StateStack:top().items then break end
+    StateStack:update(1 / 60)
+  end
   local sellList = StateStack:top()
   local foundHyper
   for _, it in ipairs(sellList.items or {}) do
     if it.value == "HYPER_POTION" then
       foundHyper = it
       local nameEnd = 16 + Font.width(it.label)
-      local rightX = 160 - 8 - Font.width(it.right)
+      local rightX = 112
       check(nameEnd <= rightX,
             "sell HYPER POTION name does not overlap quantity")
-      check(not tostring(it.right):find("¥", 1, true),
+      eq(it.count, 99, "sell list carries the quantity as a count")
+      check(it.right == nil and it.price == nil,
             "sell list keeps prices out of the right column")
       check(tostring(it.label):find("x", 1, true) == nil,
             "sell list does not glue quantity into the name")
@@ -2508,11 +2703,15 @@ do
   cb4.onFinish = function() end
   cb4.rng = function(a, b) return a end -- rng low: guaranteed capture
   local origStart = cb4.startMessage
-  local ballAtCaughtText
+  local ballAtCaughtText, ballObpAtCaughtText
   cb4.startMessage = function(s, item)
     log[#log + 1] = "text:" .. item.text:gsub("\n.*", "")
     if item.text:find("All right!", 1, true) then
       ballAtCaughtText = cb4.lockedBall and #cb4.lockedBall > 0
+      ballObpAtCaughtText = ballAtCaughtText
+      for _, sp in ipairs(cb4.lockedBall or {}) do
+        if sp.obp ~= "e4" then ballObpAtCaughtText = false end
+      end
     end
     return origStart(s, item)
   end
@@ -2543,13 +2742,16 @@ do
   end
   eq(fanfares, 1, "one caught fanfare per capture")
   eq(tinks, 3, "three wobble tinks on a $43 capture")
-  check(fanfareAt and caughtAt and fanfareAt < caughtAt,
-        "Caught_Mon sounds with the caught text, not after its dismissal")
+  check(fanfareAt and caughtAt and caughtAt < fanfareAt,
+        "Caught_Mon sounds once the caught text is out, before its prompt")
   eq(cb4.result, "caught", "the capture resolved the battle")
   -- the nickname AskName that follows clears it (ClearSprites), so the
   -- assertion is sampled while the caught text is up
   check(ballAtCaughtText,
         "the resting closed ball stays compiled for the caught text")
+  -- engine/battle/animations.asm:258-260
+  check(ballObpAtCaughtText,
+        "the resting ball wears the popped rOBP0 ($e4), not wAnimPalette")
   Game.save.party = savedParty
 end
 
@@ -2614,91 +2816,137 @@ do
 -- option boxes (the port rows plus the MODS/CONTROLS entries) through a 4-box
 -- viewport with a $EE ▼ marker; MUSIC VOL / SFX VOL clamp at 0..7 like
 -- the text-speed cursor clamps at its ends (.pressedLeftInTextSpeed),
--- MUSIC FILTER cycles OFF/1X/2X/3X, and COLORS / TILT / GBC FX / VIDEO MODE
--- cycle their display modes.
-do
+-- MUSIC FILTER cycles OFF/1X/2X/3X, and COLORS / TILT / VIDEO MODE
+-- cycle their display modes (SHADER FX activates a pushed screen instead).
+-- Nested function so LuaJIT's 200-local main-chunk limit is not hit.
+(function()
   local OptionsMenu = require("src.ui.OptionsMenu")
   local OInput = require("src.core.Input")
   local PaletteFX = require("src.render.PaletteFX")
   local Tilt = require("src.render.Tilt")
-  local GBCFX = require("src.render.GBCFX")
+  local ShaderFX = require("src.render.ShaderFX")
   local GameSpeed = require("src.core.GameSpeed")
-  local VideoMode = require("src.core.VideoMode")
   local FrameCap = require("src.core.FrameCap")
   local SD = require("src.core.SaveData")
   -- Isolate from earlier save/options writes in this suite
   SD.saveOptions(SD.defaultOptions())
   local popped = false
+  local om
+  -- the rows sit on group pages now, so the stub needs a real push/pop/top
+  -- stack for a group opener to have anywhere to go
+  local ostack = { states = {} }
+  function ostack:push(s) self.states[#self.states + 1] = s end
+  function ostack:pop()
+    local s = table.remove(self.states)
+    if s == om then popped = true end
+    return s
+  end
+  function ostack:top() return self.states[#self.states] end
   local og = { data = Data, save = SD.newGame(),
-               input = OInput, stack = { pop = function() popped = true end },
-               writeOptions = function(self) SD.saveOptions(self.save.options) end }
-  local om = OptionsMenu.new(og)
+               input = OInput, stack = ostack,
+               writeOptions = function(self) SD.saveOptions(self.save.options) end,
+               -- the PERFORMANCE row routes through Game:applyOptions; the
+               -- stub carries the headless slice of it (the tier record),
+               -- the display modules are re-applied at the end of the suite
+               applyOptions = function(self, o)
+                 require("src.core.Performance").applyOptions(o)
+               end }
+  om = OptionsMenu.new(og)
+  ostack:push(om)
+  local OptionRows = require("src.ui.OptionRows")
+  -- cur is whichever screen the cursor is on: the top level, or the group
+  -- page seek() walked into
+  local cur = om
   local function press(btn)
     OInput.pressed = { [btn] = true }
-    om:update(1 / 60)
+    cur:update(1 / 60)
     OInput.pressed = {}
+  end
+  local function rowAt(s)
+    local rows = s.view or s.rows
+    return rows[s.index]
+  end
+  -- put the cursor on a row by id, opening its group page first, so a row
+  -- added to OptionsMenu shifts these blocks instead of silently
+  -- retargeting them
+  local function seek(id)
+    while ostack:top() ~= om do ostack:pop() end
+    cur = om:focusRow(id) or om
+    local row = rowAt(cur)
+    return row ~= nil and row.id == id
   end
   eq(og.save.options.textSpeed, 3,
      "new saves default to MEDIUM text (InitOptions TEXT_DELAY_MEDIUM)")
   eq(og.save.options.colors, "gbc", "new saves default COLORS to GBC")
   eq(og.save.options.tilt, 0, "new saves default TILT to OFF")
-  eq(og.save.options.gbcfx, 0, "new saves default GBC FX to OFF")
   eq(og.save.options.zoom, 0, "new saves default ZOOM to FIT")
   eq(og.save.options.voidFill, "trees", "new saves default VOID FILL to TREES")
   eq(og.save.options.videoMode, "windowed",
      "new saves default VIDEO MODE to WINDOWED")
   eq(om.scroll, 0, "options viewport starts at the top")
-  for _ = 1, 3 do press("down") end
-  eq(om.index, 4, "cursor reaches BATTLE LAYOUT")
+  check(seek("battleLayout"), "cursor reaches BATTLE LAYOUT")
   press("a")
   eq(og.save.options.battleLayout, "wide",
      "A switches the battle screen to the WIDE layout")
   press("a")
   eq(og.save.options.battleLayout, "og", "BATTLE LAYOUT wraps back to OG")
-  for _ = 1, 2 do press("down") end
-  eq(om.index, 6, "cursor reaches MUSIC VOL")
-  eq(om.scroll, 2, "viewport scrolls to keep MUSIC VOL on screen")
+  -- the BATTLE page's sixth row sits past the 4-box viewport
+  check(seek("battleBg"), "cursor reaches BATTLE BG")
+  eq(cur.scroll, cur.index - OptionRows.VISIBLE,
+     "viewport scrolls to keep a deep group row on screen")
+  check(seek("musicVol"), "cursor reaches MUSIC VOL")
   press("left")
   eq(og.save.options.musicVol, 6, "left lowers MUSIC VOL")
   press("right")
   eq(og.save.options.musicVol, 7, "right raises MUSIC VOL back")
   press("right")
   eq(og.save.options.musicVol, 7, "MUSIC VOL clamps at 7")
-  press("down"); press("left")
+  seek("sfxVol"); press("left")
   eq(og.save.options.sfxVol, 6, "SFX VOL adjusts on its own row")
-  press("down")
+  seek("musicFilter")
   for _ = 1, 3 do press("a") end
   eq(og.save.options.musicFilter, 3, "A cycles MUSIC FILTER to 3X")
   press("a")
   eq(og.save.options.musicFilter, 0, "MUSIC FILTER wraps back to OFF")
-  press("down")
-  eq(om.index, 9, "cursor reaches COLORS")
+  check(seek("performance"), "cursor reaches PERFORMANCE")
+  press("a")
+  eq(og.save.options.performance, "high", "A cycles PERFORMANCE to HIGH")
+  eq(require("src.core.Performance").tier, "high",
+     "the live tier tracks the PERFORMANCE option")
+  for _ = 1, 3 do press("a") end
+  eq(og.save.options.performance, "auto", "PERFORMANCE wraps back to AUTO")
+  check(seek("colors"), "cursor reaches COLORS")
   press("a")
   for _ = 1, 4 do press("a") end
-  press("down")
-  eq(om.index, 10, "cursor reaches TILT")
+  check(seek("tilt"), "cursor reaches TILT")
   press("a")
   eq(og.save.options.tilt, 1, "A cycles TILT to 15")
   eq(Tilt.level, 1, "Tilt level tracks TILT option")
   press("a"); press("a"); press("a")
   eq(og.save.options.tilt, 0, "TILT wraps back to OFF")
-  press("down")
-  eq(om.index, 11, "cursor reaches GBC FX")
-  press("a")
-  eq(og.save.options.gbcfx, 1, "A cycles GBC FX to 1")
-  eq(GBCFX.level, 1, "GBCFX level tracks GBC FX option")
-  for _ = 1, 4 do press("a") end
-  eq(og.save.options.gbcfx, 0, "GBC FX wraps back to OFF")
-  press("down")
-  eq(om.index, 12, "cursor reaches ZOOM")
+  check(seek("shaderfx"), "cursor reaches SHADER FX")
+  -- this row activates a pushed ShaderFXScreen rather than cycling in
+  -- place like the rest of this suite's rows, so activate() is not called
+  -- here -- tests/mod_ui_tests.lua exercises it end to end against a real
+  -- game.
+  check(rowAt(cur).step == nil, "SHADER FX row has no step()")
+  check(type(rowAt(cur).activate) == "function",
+    "SHADER FX row has an activate()")
+  check(seek("shaderfx2"), "cursor reaches SHADER FX 2")
+  -- the dual-shader secondary slot: same shared ShaderFXScreen, opened on
+  -- "secondary" instead -- see the SHADER FX row above for why activate()
+  -- isn't exercised here either.
+  check(rowAt(cur).step == nil, "SHADER FX 2 row has no step() either")
+  check(type(rowAt(cur).activate) == "function",
+    "SHADER FX 2 row has an activate()")
+  check(seek("zoom"), "cursor reaches ZOOM")
   local ZoomOpt = require("src.render.Zoom")
   press("a")
   eq(og.save.options.zoom, 1, "A cycles ZOOM to IN1")
   eq(ZoomOpt.offset, 1, "Zoom.offset tracks ZOOM option")
   press("left")
   eq(og.save.options.zoom, 0, "left steps ZOOM back to FIT")
-  press("down")
-  eq(om.index, 13, "cursor reaches VOID FILL")
+  check(seek("voidFill"), "cursor reaches VOID FILL")
   local TR = require("src.render.TileRenderer")
   press("a")
   eq(og.save.options.voidFill, "water", "A cycles VOID FILL to WATER")
@@ -2707,56 +2955,69 @@ do
   eq(og.save.options.voidFill, "black", "A cycles VOID FILL to BLACK")
   press("a")
   eq(og.save.options.voidFill, "trees", "VOID FILL wraps back to TREES")
-  press("down")
-  eq(om.index, 14, "cursor reaches VIDEO MODE")
+  check(seek("videoMode"), "cursor reaches VIDEO MODE")
   press("a")
   eq(og.save.options.videoMode, "borderless",
      "A cycles VIDEO MODE to BORDERLESS")
   press("a")
   eq(og.save.options.videoMode, "windowed",
      "VIDEO MODE wraps back to WINDOWED")
-  press("down")
-  eq(om.index, 15, "cursor reaches MAX FPS")
+  check(seek("faithfulRes"), "cursor reaches FAITHFUL RATIO")
+  check(seek("fpsCap"), "cursor reaches MAX FPS")
   press("a")
   eq(og.save.options.fpsCap, 75, "A cycles MAX FPS up from 60 to 75")
   eq(FrameCap.current, 75, "the live render cap tracks the MAX FPS option")
-  -- Driven by the step list rather than a literal press count, like GAME
-  -- SPEED below: a full loop of #STEPS presses returns to the 60 default.
-  for _ = 1, #FrameCap.STEPS - 1 do press("a") end
+  for _ = 1, #FrameCap.CYCLE - 1 do press("a") end
   eq(og.save.options.fpsCap, 60, "MAX FPS wraps back to 60")
-  press("down")
-  eq(om.index, 16, "cursor reaches GAME SPEED")
+  check(seek("vsync"), "cursor reaches VSYNC")
   press("a")
-  eq(og.save.options.speed, 2, "A cycles GAME SPEED to 2X")
+  eq(og.save.options.vsync, "off", "A cycles VSYNC to OFF")
+  check(seek("speedOverworld"), "cursor reaches OVERWORLD SPEED")
+  press("a")
+  eq(og.save.options.speedOverworld, 2, "A cycles OVERWORLD SPEED to 2X")
   -- Driven by the level list rather than a literal press count: adding a
   -- speed (20X went in for the bot runs) otherwise fails this as a wrap
   -- bug when the cycling is fine and the row is simply one longer.
   for _ = 1, #GameSpeed.LEVELS - 1 do press("a") end
-  eq(og.save.options.speed, 1, "GAME SPEED wraps back to NORMAL")
+  eq(og.save.options.speedOverworld, 1, "OVERWORLD SPEED wraps back to NORMAL")
+  check(seek("speedBattle"), "cursor reaches BATTLE SPEED")
+  press("a")
+  eq(og.save.options.speedBattle, 2, "A cycles BATTLE SPEED to 2X")
+  for _ = 1, #GameSpeed.LEVELS - 1 do press("a") end
+  eq(og.save.options.speedBattle, 1, "BATTLE SPEED wraps back to NORMAL")
+  check(seek("speedMenu"), "cursor reaches MENU SPEED")
+  press("a")
+  eq(og.save.options.speedMenu, 2, "A cycles MENU SPEED to 2X")
+  for _ = 1, #GameSpeed.LEVELS - 1 do press("a") end
+  eq(og.save.options.speedMenu, 1, "MENU SPEED wraps back to NORMAL")
+  check(seek("mods"), "cursor reaches MODS")
+  check(seek("controls"), "cursor reaches CONTROLS")
+  check(seek("dateFormat"), "cursor reaches DATE FORMAT")
+  check(seek("timeFormat"), "cursor reaches TIME FORMAT")
   press("down")
-  eq(om.index, 17, "cursor reaches MODS")
-  press("down")
-  eq(om.index, 18, "cursor reaches CONTROLS")
-  press("down")
-  eq(om.index, 19, "CANCEL stays the fixed final row")
-  eq(om.scroll, 14, "CANCEL keeps the last option boxes on screen")
+  -- CANCEL is appended after the top-level view rather than living in it, so
+  -- it lands one past #view and the window holds the last six boxes.  Counted
+  -- off #view so the next row added here is not read as a wrap bug.
+  local cancelRow = #om.view + 1
+  eq(om.index, cancelRow, "CANCEL stays the fixed final row")
+  eq(om.scroll, cancelRow - 5, "CANCEL keeps the last option boxes on screen")
   om:draw() -- smoke: scrolled layout draws under the headless stub
   press("a")
   check(popped, "A on CANCEL closes the options menu")
   local om2 = OptionsMenu.new(og)
   OInput.pressed = { up = true }; om2:update(1 / 60); OInput.pressed = {}
-  eq(om2.index, 19, "up from the top wraps to CANCEL")
-  eq(om2.scroll, 14, "wrapping to CANCEL scrolls to the tail")
+  eq(om2.index, cancelRow, "up from the top wraps to CANCEL")
+  eq(om2.scroll, cancelRow - 5, "wrapping to CANCEL scrolls to the tail")
   -- headless-safe: no love.audio, setters only update internal state
   require("src.core.Music").applyOptions(og.save.options)
   require("src.core.Sound").applyOptions(og.save.options)
   PaletteFX.applyOptions(og.save.options)
   Tilt.applyOptions(og.save.options)
-  GBCFX.applyOptions(og.save.options)
+  ShaderFX.applyOptions(og.save.options)
   require("src.render.Zoom").applyOptions(og.save.options)
   require("src.render.TileRenderer").applyOptions(og.save.options)
-  VideoMode.applyOptions(og.save.options)
-end
+  require("src.core.VideoMode").applyOptions(og.save.options)
+end)()
 end
 
 -- ------------------------------------------------------------------
@@ -2809,16 +3070,19 @@ do
   menu:update(0)
   eq(game.popCount(), 1, "Menu START-press closes when startCloses (start menu's PAD_START mask; no beep per HandleMenuInput_)")
 
+  -- both DisplayTwoOptionMenu branches hold 15 frames with the menu still
+  -- on screen before the answer lands (ChoiceBox.pending), so pump the
+  -- hold out after the press
   game = stubGame({ a = true })
   local yes
   local box = ChoiceBox.new(game, function(v) yes = v end)
-  box:update(0)
+  for _ = 0, require("src.core.Timing").YES_NO_ANSWER do box:update(0) end
   eq(yes, true, "ChoiceBox A on YES chooses true")
 
   game = stubGame({ b = true })
   local no
   box = ChoiceBox.new(game, function(v) no = v end)
-  box:update(0)
+  for _ = 0, require("src.core.Timing").YES_NO_ANSWER do box:update(0) end
   eq(no, false, "ChoiceBox B chooses false")
 end
 end
@@ -2837,7 +3101,8 @@ do
   local qreturned = 0
   local qg = {
     data = Data, save = qsave, stack = qstack,
-    input = { wasPressed = function(_, k) return qpressed[k] end },
+    input = { wasPressed = function(_, k) return qpressed[k] end,
+              isDown = function(_, k) return qpressed[k] or false end },
     returnToTitle = function() qreturned = qreturned + 1 end,
   }
   local qmenu = StartMenuQ.new(qg)
@@ -2853,12 +3118,18 @@ do
   qpressed = { a = true }
   qmenu:update(1 / 60)
   qpressed = {}
-  eq(qsave.startMenuIndex, quitIdx, "QUIT selection persists the cursor slot")
+  eq(qg.startMenuIndex, quitIdx, "QUIT selection persists the cursor slot")
+  check(qsave.startMenuIndex == nil, "and keeps it off the saved data")
   local qbox = qstack:top()
   check(qbox ~= qmenu and qbox ~= nil and qbox.pages ~= nil,
         "QUIT pushes a confirmation textbox")
   eq(qbox.pages[1][1], "RETURN TO MAIN", "confirm asks RETURN TO MAIN MENU?")
-  qbox.onDone()
+  -- opts.choice: the box pushes the YES/NO itself once the last page has
+  -- typed out, so pump it rather than reaching for the old onDone hook
+  for _ = 1, 600 do
+    if qstack:top() ~= qbox then break end
+    qbox:update(1 / 60)
+  end
   local qchoice = qstack:top()
   check(qchoice ~= qbox and qchoice ~= nil and qchoice.onChoose ~= nil,
         "textbox is followed by a YES/NO choice")
@@ -3142,19 +3413,17 @@ end
 -- == issue #4: tile anim tick accumulates wall-clock into 60Hz steps ==
 do
   local TileRenderer = require("src.render.TileRenderer")
-  TileRenderer.setSpinning(true)
-  local before = TileRenderer.spinBlurActive()
-  for _ = 1, 8 do TileRenderer.tick(1 / 60) end
-  check(before ~= TileRenderer.spinBlurActive(),
-        "tick(1/60) advances water/spinner clock at fixed 60Hz")
-  local mid = TileRenderer.spinBlurActive()
+  local before = TileRenderer.animClock()
+  for _ = 1, 16 do TileRenderer.tick(1 / 60) end
+  eq(TileRenderer.animClock() - before, 16,
+     "tick(1/60) advances water/spinner clock at fixed 60Hz")
+  local mid = TileRenderer.animClock()
   TileRenderer.tick(1 / 120)
-  eq(TileRenderer.spinBlurActive(), mid,
+  eq(TileRenderer.animClock(), mid,
      "sub-frame dt does not advance the tile anim clock")
   TileRenderer.tick(1 / 120)
-  -- second half-frame completes one step; phase may or may not flip
-  -- (8-tick blur period), but the clock must have accepted the step
-  TileRenderer.setSpinning(false)
+  eq(TileRenderer.animClock(), mid + 1,
+     "the second half-frame completes one step")
 end
 end
 
@@ -3291,7 +3560,7 @@ end
 -- ---------------------------------------------- suite discovery
 -- The chains below used to be hard-coded arrays, so adding a suite meant
 -- editing a list and forgetting to meant the suite silently never ran.
--- They are globbed now (21-testing-and-ci §CI).
+-- They're globbed now instead.
 --
 -- Order still matters: these suites share one process and one Data, and
 -- the sequence they were chained in is the sequence they are known to
@@ -3324,10 +3593,61 @@ local function orderedGlob(pattern, preferred, skip)
   return ordered
 end
 
+-- Put the `love` stub back between suites.
+--
+-- Every one of these files fakes the parts of LOVE it needs, and several
+-- replace a whole subtable (`love.filesystem = {...}`) or a single probe
+-- (`love.system.getOS = function() return "Android" end`) and never put it
+-- back.  Nothing notices until a LATER file reads the leftover, and then the
+-- failure lands nowhere near its cause:
+--
+--   * suites that swap in a minimal love.filesystem drop
+--     getDirectoryItems, so three rom_importer suites then die on
+--     "attempt to call field 'getDirectoryItems' (a nil value)".
+--
+-- Snapshotting one level deep is enough: the leaks are whole-subtable
+-- assignments and single-function overwrites, both of which this restores.
+local function snapshotLove()
+  if type(love) ~= "table" then return nil end
+  local snap = { root = {}, subs = {} }
+  for k, v in pairs(love) do
+    snap.root[k] = v
+    if type(v) == "table" then
+      local sub = {}
+      for k2, v2 in pairs(v) do sub[k2] = v2 end
+      snap.subs[k] = sub
+    end
+  end
+  return snap
+end
+
+local function restoreLove(snap)
+  if not snap or type(love) ~= "table" then return end
+  for k in pairs(love) do
+    if snap.root[k] == nil then love[k] = nil end
+  end
+  for k, v in pairs(snap.root) do
+    love[k] = v
+    local sub = snap.subs[k]
+    if sub and type(v) == "table" then
+      for k2 in pairs(v) do
+        if sub[k2] == nil then v[k2] = nil end
+      end
+      for k2, v2 in pairs(sub) do v[k2] = v2 end
+    end
+  end
+end
+
 local function runSuites(paths)
+  local LEAKED_KEYS = { "src.render.TextBox", "src.core.Music" }
   for _, path in ipairs(paths) do
     local label = path:match("([^/]+)%.lua$") or path
+    local snap = snapshotLove()
+    local msnap = {}
+    for _, k in ipairs(LEAKED_KEYS) do msnap[k] = package.loaded[k] end
     local ok, err = pcall(dofile, path)
+    restoreLove(snap)
+    for _, k in ipairs(LEAKED_KEYS) do package.loaded[k] = msnap[k] end
     check(ok, label .. (ok and " suite" or (": " .. tostring(err))))
   end
 end
@@ -3358,6 +3678,8 @@ do
   local lua = (arg and arg[-1]) or "luajit"
   local status = os.execute(("%q tests/save_editor_mod_tests.lua"):format(lua))
   check(status == 0 or status == true, "save_editor_mod_tests suite")
+  status = os.execute(("%q tests/save_editor_gen2_tests.lua"):format(lua))
+  check(status == 0 or status == true, "save_editor_gen2_tests suite")
 end
 
 -- ---------------------------------------------- input hold regressions
@@ -3365,6 +3687,165 @@ runSuites({ "tests/input_hold_test.lua" })
 
 -- ---------------------------------------------- launcher cursor (#114)
 runSuites({ "tests/rom_importer_cursor_test.lua" })
+
+-- ---------------------------------------------- launcher last played tab (#835)
+runSuites({ "tests/rom_importer_last_version_test.lua" })
+
+-- ---------------------------------------------- Gold / Crystal (Gen 2)
+-- All ROM-free: own fixtures, or a self-skip on a missing cache.  Globbed on
+-- the historical chain; tests/run_gen2.lua runs the same set, one per process.
+local LEAKS_SAVE_SLOT_STATE = {
+  ["tests/gen2_save_export_test.lua"] = true,
+}
+runSuites(orderedGlob(
+  "tests/gen2_*.lua tests/crystal_*.lua tests/rom_lz3_test.lua", {
+  "tests/rom_lz3_test.lua",
+  "tests/gen2_world_test.lua",
+  "tests/gen2_audio_test.lua",
+  "tests/gen2_oak_speech_test.lua",
+  "tests/gen2_vm_test.lua",
+  "tests/gen2_palettes_test.lua",
+  "tests/gen2_battle_test.lua",
+  "tests/gen2_menus_test.lua",
+  "tests/gen2_save_test.lua",
+  "tests/gen2_trainers_test.lua",
+  "tests/gen2_boxes_test.lua",
+  "tests/gen2_intro_test.lua",
+  "tests/gen2_battle_anims_test.lua",
+  -- The list had fallen behind the directory: these seven were written and
+  -- green when run file by file, but never ran here.
+  "tests/gen2_breeding_test.lua",
+  "tests/gen2_contest_test.lua",
+  "tests/gen2_evolution_test.lua",
+  "tests/gen2_gamecorner_test.lua",
+  "tests/gen2_halloffame_test.lua",
+  "tests/gen2_phone_test.lua",
+  "tests/gen2_summary_test.lua",
+  "tests/gen2_steps_test.lua",
+  "tests/gen2_cmdqueue_test.lua",
+  "tests/gen2_events_test.lua",
+  "tests/gen2_map_callbacks_test.lua",
+  "tests/gen2_roamers_test.lua",
+  "tests/gen2_border_test.lua",
+  "tests/gen2_hidden_items_test.lua",
+  "tests/gen2_object_event_test.lua",
+  "tests/gen2_autoinput_test.lua",
+  "tests/gen2_catch_tutorial_test.lua",
+  "tests/gen2_unown_test.lua",
+  "tests/gen2_unown_printer_test.lua",
+  "tests/gen2_decorations_test.lua",
+  "tests/gen2_pokerus_test.lua",
+  "tests/gen2_common_text_test.lua",
+  "tests/gen2_rom_text_test.lua",
+  "tests/gen2_magnet_train_test.lua",
+  "tests/gen2_bank_of_mom_test.lua",
+  "tests/gen2_trainerhouse_test.lua",
+  "tests/gen2_mail_test.lua",
+  "tests/gen2_callasm_test.lua",
+  "tests/gen2_sprites_test.lua",
+  "tests/gen2_diploma_test.lua",
+  "tests/gen2_trade_gfx_test.lua",
+  "tests/gen2_prize_test.lua",
+  -- The four the Gold route bot found.  Every one of them needs a long play
+  -- session to reach, which is why no unit test caught them first and why they
+  -- are worth keeping in the list: struggle at 0 PP, the evolution screen's
+  -- lifecycle-hook collision, badges written to a store nothing read, and a
+  -- lost trainer battle running the winner's script.
+  "tests/gen2_struggle_test.lua",
+  "tests/gen2_evolution_anim_test.lua",
+  "tests/gen2_egg_hatch_anim_test.lua",
+  "tests/gen2_badges_test.lua",
+  "tests/gen2_battle_loss_test.lua",
+  "tests/gen2_variable_sprites_test.lua",
+  "tests/gen2_pokecenter_spawn_test.lua",
+  "tests/gen2_charge_lock_test.lua",
+  "tests/gen2_faint_once_test.lua",
+  "tests/gen2_nests_test.lua",
+  "tests/gen2_bg_events_test.lua",
+  "tests/gen2_ice_pathfind_test.lua",
+  "tests/gen2_party_menu_test.lua",
+  "tests/gen2_hof_continue_test.lua",
+  "tests/gen2_pokecenter_stairs_test.lua",
+  "tests/gen2_canlose_test.lua",
+  "tests/gen2_wild_cooldown_bug1229_test.lua",
+  "tests/gen2_pc_screens_test.lua",
+  "tests/gen2_badge_boosts_test.lua",
+  "tests/gen2_held_items_test.lua",
+  "tests/gen2_exp_share_test.lua",
+  "tests/gen2_obedience_test.lua",
+  "tests/gen2_specialty_balls_test.lua",
+  "tests/gen2_x_items_test.lua",
+  "tests/gen2_move_effects_test.lua",
+  "tests/gen2_trap_escape_test.lua",
+  "tests/gen2_forceshiny_test.lua",
+  "tests/gen2_berry_juice_test.lua",
+  "tests/gen2_object_hours_test.lua",
+  "tests/gen2_temp_events_test.lua",
+  "tests/gen2_npc_interact_test.lua",
+  "tests/gen2_text_flow_test.lua",
+  "tests/gen2_field_items_test.lua",
+  "tests/gen2_phone_call_test.lua",
+  "tests/gen2_battle_items_test.lua",
+  "tests/gen2_battle_ui_test.lua",
+  "tests/gen2_dig_pic_2139_test.lua",
+  "tests/gen2_dig_warp_test.lua",
+  "tests/gen2_repel_test.lua",
+  "tests/gen2_swarm_test.lua",
+  "tests/gen2_fishing_swarm_test.lua",
+  "tests/gen2_facing_edge_2352_test.lua",
+  "tests/gen2_rock_smash_test.lua",
+  "tests/gen2_currents_test.lua",
+  "tests/gen2_big_object_test.lua",
+  "tests/gen2_prize_counter_test.lua",
+  -- Presentation: the blit scale every widescreen screen shares, the naming
+  -- bracket, the teleport / fly / fishing step types, the two clock screens,
+  -- FLY's town-map picker and the two script-ordering commands.
+  "tests/gen2_screen_layout_test.lua",
+  "tests/gen2_font_ui_test.lua",
+  "tests/gen2_field_anim_test.lua",
+  "tests/gen2_clock_test.lua",
+  "tests/gen2_time_routing_test.lua",
+  "tests/gen2_fly_map_test.lua",
+  "tests/gen2_script_order_test.lua",
+  -- Glue between the Gen 1 modules Gold still shares and the Gen 2 data: sfx
+  -- name resolution, and the .sav converter refusing a Gen 2 save table.
+  "tests/gen2_sound_alias_test.lua",
+  "tests/gen2_save_convert_cli_test.lua",
+  -- The wall radios (`special MapRadio`).  gen2_save_export_test cannot share a
+  -- process (LEAKS_SAVE_SLOT_STATE above); tests/run_gen2.lua runs it alone.
+  "tests/gen2_map_radio_test.lua",
+  -- The two seams where a battle meets everything else: what ends a round and
+  -- a battle (and what a battle may not leave on the party), and BattlePack --
+  -- which shares its screen with the field PACK but none of its jumptable.
+  "tests/gen2_battle_end_test.lua",
+  "tests/gen2_battle_exit_fade_test.lua",
+  "tests/gen2_battle_pack_test.lua",
+  -- Battle core internals: where DoWeatherModifiers sits in the damage chain,
+  -- which failures suppress the attack animation, and the Rollout /
+  -- EFFECT_RAMPAGE lock-ins.  ROM-free like the rest of this block.
+  "tests/gen2_battle_lockin_test.lua",
+  -- Crystal rides the same glob: crystal_*.lua and the gen2_crystal_* files.
+  "tests/crystal_import_test.lua",
+  "tests/crystal_world_test.lua",
+  "tests/gen2_crystal_anim_test.lua",
+  "tests/gen2_crystal_caught_data_test.lua",
+  "tests/gen2_crystal_gender_test.lua",
+  "tests/gen2_crystal_tile_attrs_test.lua",
+  -- Pinned in the order the glob already ran them in, alphabetically last.
+  "tests/gen2_battle_cursor_test.lua",
+  "tests/gen2_battle_options_test.lua",
+  "tests/gen2_billspc_deposit_test.lua",
+  "tests/gen2_billspc_dpad_test.lua",
+  "tests/gen2_box_intake_test.lua",
+  "tests/gen2_cycling_road_test.lua",
+  "tests/gen2_dex_gift_test.lua",
+  "tests/gen2_ledge_hop_test.lua",
+  "tests/gen2_ow_bounce_test.lua",
+  "tests/gen2_pack_rows_test.lua",
+  "tests/gen2_sleep_counter_test.lua",
+  "tests/gen2_timed_heal_test.lua",
+  "tests/gen2_whirlpool_test.lua",
+}, LEAKS_SAVE_SLOT_STATE))
 
 -- ---------------------------------------------- Android second ROM pick (#167)
 runSuites({ "tests/rom_importer_android_pick_test.lua" })
@@ -3375,10 +3856,14 @@ runSuites({ "tests/rom_importer_android_mod_pick_test.lua" })
 -- ---------------------------------------------- import with no picker (#482)
 runSuites({ "tests/rom_importer_no_picker_test.lua" })
 runSuites({ "tests/rom_importer_double_pick_test.lua" })
+-- the same pickerless scan, asked for one version in particular (#1274)
+runSuites({ "tests/rom_importer_choose_version_test.lua" })
 -- ---------------------------------------------- Switch platform capabilities
 -- platform_nx_* / rom_importer_nx_* live in tests/engine/ (ROM-free T2) so
 -- CI's headless lane runs them without data/generated/.
 runSuites({ "tests/launcher_mods_install_zip_test.lua" })
+-- ---------------------------------------------- pet Pokemon cries (#1687, #1649)
+runSuites({ "tests/pet_cries_test.lua" })
 -- ---------------------------------------------- parity workstream tests
 -- Each tests/parity_*.lua is a self-contained file (own bootstrap + check,
 -- error()s if any assertion fails).  Globbed, so dropping a new parity
@@ -3397,7 +3882,6 @@ runSuites(orderedGlob("tests/parity_*.lua", {
   "tests/parity_yellow_bills_pikachu.lua",
   "tests/parity_trainer_evolution_order.lua",
   "tests/parity_intro.lua", "tests/parity_tilt.lua",
-  "tests/parity_gbcfx.lua",
 }))
 
 -- ---------------------------------------------- the globbed tiers

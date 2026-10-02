@@ -59,7 +59,11 @@ local t = battler{
   disabledSlot = 1, disabledTurns = 2, xAccuracy = true,
   mon = { status = "SLP" }, name = "TARGET",
 }
-local msg = MoveEffects.primary.HAZE_EFFECT(nil, u, t)
+-- Effect rows take the battle handle first so romText can serve the ROM's
+-- own wording; a data-only stub is all these pure rows dereference.
+local B = { data = Data }
+
+local msg = MoveEffects.primary.HAZE_EFFECT(B, u, t)
 
 check(next(u.stages) == nil, "Haze clears all of the user's stat stages")
 check(next(t.stages) == nil, "Haze clears all of the target's stat stages")
@@ -85,17 +89,17 @@ eq(u.mon.status, "PSN", "user's own major status is kept (still poisoned)")
 -- Target's major status is cured; its SLP forfeits the move this turn.
 eq(t.mon.status, nil, "target's major status is cured")
 check(t.skipMove == true, "curing target's sleep forfeits its move (skipMove)")
-eq(msg[1], "All STATUS changes\nare eliminated!", "Haze prints the elimination text")
+eq(msg[1], "All STATUS changes\nare eliminated!{PROMPT}", "Haze prints the elimination text")
 
 -- FRZ target also forfeits its move.
 local frz = battler{ mon = { status = "FRZ" }, name = "FROZEN" }
-MoveEffects.primary.HAZE_EFFECT(nil, battler{ mon = {} }, frz)
+MoveEffects.primary.HAZE_EFFECT(B, battler{ mon = {} }, frz)
 eq(frz.mon.status, nil, "target's freeze is cured")
 check(frz.skipMove == true, "curing target's freeze forfeits its move")
 
 -- Badly-poisoned TARGET: status cured, no forfeit, toxic counter gone.
 local psnT = battler{ mon = { status = "PSN" }, toxicCounter = 4, name = "PSN_T" }
-MoveEffects.primary.HAZE_EFFECT(nil, battler{ mon = {} }, psnT)
+MoveEffects.primary.HAZE_EFFECT(B, battler{ mon = {} }, psnT)
 eq(psnT.mon.status, nil, "badly-poisoned target is fully cured of poison")
 check(psnT.toxicCounter == nil, "badly-poisoned target's toxic counter cleared")
 check(not psnT.skipMove, "curing poison does NOT forfeit the target's move")
@@ -103,14 +107,14 @@ check(not psnT.skipMove, "curing poison does NOT forfeit the target's move")
 -- BRN / PAR targets: cured, no forfeit.
 for _, st in ipairs({ "BRN", "PAR" }) do
   local tb = battler{ mon = { status = st }, name = st }
-  MoveEffects.primary.HAZE_EFFECT(nil, battler{ mon = {} }, tb)
+  MoveEffects.primary.HAZE_EFFECT(B, battler{ mon = {} }, tb)
   eq(tb.mon.status, nil, "target's " .. st .. " is cured")
   check(not tb.skipMove, st .. " target keeps its move (no sleep/freeze forfeit)")
 end
 
 -- A burned USER keeps its own burn (status not the one Haze cures).
 local burnedUser = battler{ mon = { status = "BRN" }, name = "BURNER" }
-MoveEffects.primary.HAZE_EFFECT(nil, burnedUser, battler{ mon = {} })
+MoveEffects.primary.HAZE_EFFECT(B, burnedUser, battler{ mon = {} })
 eq(burnedUser.mon.status, "BRN", "user's own burn is not cured by Haze")
 
 -- =====================================================================
@@ -143,27 +147,67 @@ local dBurnedHaze = Damage.compute(ruleset, hazedAtk, defender, move, opts)
 check(dBurnedRaw < dHealthy, "burn halves a burned mon's physical damage (sanity)")
 eq(dBurnedHaze, dHealthy, "Haze lifts the burn Attack-halving (damage == unburned)")
 
--- A stat-stage change re-bakes the penalty (effects.asm:505-506). Bump the
--- attacker's DEFENSE (irrelevant to its own offense) so only hazeStatReset flips.
-MoveEffects.primary.DEFENSE_UP1_EFFECT(nil, hazedAtk, nil)
-check(hazedAtk.hazeStatReset == nil, "a stat-stage change re-arms the burn penalty")
+-- pokered engine/battle/effects.asm:414-415
+local faithful = require("src.battle.rulesets.gen1_faithful")
+local BF = { data = Data, ruleset = faithful }
+BF.player, BF.enemy = hazedAtk, defender
+MoveEffects.primary.DEFENSE_UP1_EFFECT(BF, hazedAtk, nil)
+check(hazedAtk.hazeStatReset == nil, "a stat-stage change clears the Haze flag")
 local dAfter = Damage.compute(ruleset, hazedAtk, defender, move, opts)
-eq(dAfter, dBurnedRaw, "burn Attack-halving returns after the stage change")
+eq(dAfter, dHealthy, "a self stat-up does not re-halve the user's own attack")
+
+local screeched = attacker("BRN", nil)
+local BD = { data = Data, ruleset = faithful, player = defender, enemy = screeched }
+MoveEffects.primary.DEFENSE_DOWN2_EFFECT(BD, defender, screeched)
+local dScreech = Damage.compute(ruleset, screeched, defender, move, opts)
+check(dScreech < dBurnedRaw, "burn + SCREECH compounds the Attack-halving")
 
 -- =====================================================================
--- (C) New quirk: Haze temporarily lifts the paralysis Speed-quartering.
+-- pokered engine/battle/effects.asm:414-415
 -- =====================================================================
 
-local para = battler{
-  curStats = { speed = 100, attack = 50, defense = 50, special = 50, hp = 100 },
-  mon = { status = "PAR", level = 50, stats = { hp = 100 } }, name = "PARA",
-}
+local function paralyzed()
+  return battler{
+    curStats = { speed = 100, attack = 50, defense = 50, special = 50, hp = 100 },
+    mon = { status = "PAR", level = 50, stats = { hp = 100 } }, name = "PARA",
+  }
+end
+
+local para = paralyzed()
 eq(TurnOrder.effectiveSpeed(para), 25, "paralysis quarters speed before Haze (100 -> 25)")
-MoveEffects.primary.HAZE_EFFECT(nil, para, battler{ mon = {} })
+MoveEffects.primary.HAZE_EFFECT(B, para, battler{ mon = {} })
 eq(TurnOrder.effectiveSpeed(para), 100, "Haze lifts paralysis Speed-quartering")
--- Re-arm via an ATTACK stage change (irrelevant to the speed calc).
-MoveEffects.primary.ATTACK_UP1_EFFECT(nil, para, nil)
-check(para.hazeStatReset == nil, "stage change re-arms the paralysis penalty")
-eq(TurnOrder.effectiveSpeed(para), 25, "Speed-quartering resumes after the stage change")
+local BP = { data = Data, ruleset = faithful, player = para, enemy = battler{ mon = {} } }
+MoveEffects.primary.ATTACK_UP1_EFFECT(BP, para, nil)
+check(para.hazeStatReset == nil, "the stage change clears the Haze flag")
+eq(TurnOrder.effectiveSpeed(para), 100,
+  "the quarter does not come back after the stage change")
+
+local agile = paralyzed()
+local BA = { data = Data, ruleset = faithful, player = agile, enemy = battler{ mon = {} } }
+MoveEffects.primary.SPEED_UP2_EFFECT(BA, agile, nil)
+eq(TurnOrder.effectiveSpeed(agile), 200, "paralysis then AGILITY: 100 -> 200, no quarter")
+
+-- top of the boosted stat (move_effects/paralyze.asm:35)
+local boosted = battler{
+  curStats = { speed = 100, attack = 50, defense = 50, special = 50, hp = 100 },
+  mon = { level = 50, stats = { hp = 100 } }, name = "BOOST",
+}
+local BB = { data = Data, ruleset = faithful, player = boosted, enemy = battler{ mon = {} } }
+MoveEffects.primary.SPEED_UP2_EFFECT(BB, boosted, nil)
+require("src.battle.StatusRegistry").inflict(BB, boosted, "PAR", {})
+eq(TurnOrder.effectiveSpeed(boosted), 50, "AGILITY then paralysis: 200 -> 50")
+
+-- QuarterSpeedDueToParalysis (effects.asm:697-698)
+local growled = paralyzed()
+local BG = { data = Data, ruleset = faithful, player = battler{ mon = {} }, enemy = growled }
+MoveEffects.primary.ATTACK_DOWN1_EFFECT(BG, BG.player, growled)
+eq(TurnOrder.effectiveSpeed(growled), 6, "paralysis + GROWL quarters speed twice")
+
+local modern = require("src.battle.rulesets.modern_clean")
+local mc = paralyzed()
+local BM = { data = Data, ruleset = modern, player = mc, enemy = battler{ mon = {} } }
+MoveEffects.primary.SPEED_UP2_EFFECT(BM, mc, nil)
+eq(TurnOrder.effectiveSpeed(mc), 50, "modern_clean quarters the boosted speed")
 
 S.finish()

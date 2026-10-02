@@ -20,6 +20,8 @@ local PaletteFX = {}
 local shader -- false = unavailable (headless / no shader support)
 local gbcPack -- false = missing; nil = not loaded yet
 local yellowPack -- false = missing; nil = not loaded yet
+local gbcYellowPack -- Yellow Advanced deltas; false = missing; nil = not loaded yet
+
 
 -- Cycle order matches OptionsMenu / hotkey 2.  The three real colorizations
 -- come first (OG RED/BLUE/YELLOW = GBC hardware, SGB = per-map Super Game Boy,
@@ -65,19 +67,78 @@ function PaletteFX.darkKey() return darkWorld and "#dark" or "" end
 -- black silhouettes until FLASH (#383).  Applied to whatever 4-colour OBP the
 -- active mode resolved, with a distinct cache group so the lit and dark bakes
 -- of one sheet never collide in SpriteRenderer's obpCache.
+--
+-- It runs per sprite per frame in a dark cave, so the permuted palette is
+-- kept per source palette (and per map, should DARK_BGP ever be swapped) and
+-- the group name per group; permute's result is only ever read.
+local darkPermuted = setmetatable({}, { __mode = "k" })
+local darkGroupNames = {}
+
+-- permute(colors, map), remembered in memo[colors] while `map` stays the same
+local function permuteMemo(memo, colors, map)
+  local hit = memo[colors]
+  if hit and hit.map == map then return hit.colors end
+  local out = PaletteFX.permute(colors, map)
+  if type(colors) == "table" then memo[colors] = { map = map, colors = out } end
+  return out
+end
+
+-- tostring(group) .. suffix, remembered per group
+local function suffixedGroup(names, group, suffix)
+  if group == nil or group ~= group then return tostring(group) .. suffix end
+  local name = names[group]
+  if not name then
+    name = tostring(group) .. suffix
+    names[group] = name
+  end
+  return name
+end
+
 function PaletteFX.darkObp(colors, group)
   if not (colors and darkWorld) then return colors, group end
-  return PaletteFX.permute(colors, PaletteFX.DARK_BGP), tostring(group) .. "dark"
+  return permuteMemo(darkPermuted, colors, PaletteFX.DARK_BGP),
+    suffixedGroup(darkGroupNames, group, "dark")
 end
 
 -- the same shift folded into a baked 8-group world palette array (ADVANCED)
-local function darkGroups(groups)
-  if not (groups and darkWorld) then return groups end
+local function darkGroups(groups, lit)
+  if lit or not (groups and darkWorld) then return groups end
   local out = {}
   for i = 1, #groups do
     out[i] = PaletteFX.permute(groups[i], PaletteFX.DARK_BGP)
   end
   return out
+end
+
+-- home/fade.asm:52-58
+local fadeObpMap = nil
+local fadeObpGroups = setmetatable({}, { __mode = "k" })
+-- per fade map: the permuted palettes and suffixed group names (see darkObp)
+local fadePermuted = setmetatable({}, { __mode = "k" })
+local fadeGroupNames = setmetatable({}, { __mode = "k" })
+
+function PaletteFX.setFadeObp(map)
+  fadeObpMap = map
+end
+
+function PaletteFX.fadeObp(colors, group)
+  if not (colors and fadeObpMap) then return colors, group end
+  local suffix = fadeObpGroups[fadeObpMap]
+  if not suffix then
+    suffix = "#fade" .. fadeObpMap[0] .. fadeObpMap[1]
+             .. fadeObpMap[2] .. fadeObpMap[3]
+    fadeObpGroups[fadeObpMap] = suffix
+  end
+  local memo = fadePermuted[fadeObpMap]
+  local names = fadeGroupNames[fadeObpMap]
+  if not memo then
+    memo = setmetatable({}, { __mode = "k" })
+    names = {}
+    fadePermuted[fadeObpMap] = memo
+    fadeGroupNames[fadeObpMap] = names
+  end
+  return permuteMemo(memo, colors, fadeObpMap),
+    suffixedGroup(names, group, suffix)
 end
 
 -- Classic DMG pea-soup greens (#9BBC0F / #8BAC0F / #306230 / #0F380F)
@@ -99,6 +160,20 @@ PaletteFX.GBC_OBJ = {
   { 255, 255, 255 }, { 123, 255, 49 }, { 0, 132, 0 }, { 0, 0, 0 },
 }
 
+-- OG RED display correction.  The boot-ROM entries above are the canonical
+-- digital GBC ramp, but a raw 8-bit expansion is much harder and more neon
+-- than the LCD/reference captures people use for the original hardware.
+-- Keep the source ramp available for parity tests and tools; the OG RED
+-- presentation uses this softer, lower-saturation grade for both the red BG
+-- and green OBJ layers.  These are the four values from the Gambatte palette
+-- reference attached to issue #155, in lightest-to-darkest order.
+PaletteFX.OG_RED_SOFT_BG = {
+  { 248, 248, 248 }, { 225, 128, 150 }, { 127, 56, 72 }, { 0, 0, 0 },
+}
+PaletteFX.OG_RED_SOFT_OBJ = {
+  { 248, 248, 248 }, { 131, 198, 86 }, { 16, 96, 16 }, { 0, 0, 0 },
+}
+
 -- OG BLUE: Pokemon Blue's Game Boy Color boot-ROM auto-palette.  Same
 -- one-global-pair scheme as OG RED (Blue also ships no CGB code), but the boot
 -- ROM gives Blue its OWN entry rather than a recolored Red: a light-blue/blue
@@ -113,19 +188,17 @@ PaletteFX.GBC_OBJ = {
 PaletteFX.GBC_BG_BLUE = {
   { 255, 255, 255 }, { 99, 165, 255 }, { 0, 0, 255 }, { 0, 0, 0 },
 }
--- Blue's OBJ palette (OBP0) is the red/pink ramp -- the very same colors OG
--- RED uses for its BACKGROUND (GBC_BG), just applied to objects instead.
+-- Blue's OBJ palette (OBP0) is the canonical red/pink ramp -- the same raw
+-- colors as Red's source BG table, just applied to objects instead.  OG RED's
+-- display path uses the softer LCD grade above; Blue remains on the canonical
+-- boot-ROM ramp.
 PaletteFX.GBC_OBJ_BLUE = {
   { 255, 255, 255 }, { 255, 132, 132 }, { 148, 58, 58 }, { 0, 0, 0 },
 }
 
--- The active game's OG boot-ROM background palette: blue for a Blue
--- playthrough, red for Red.  White (index 1) and black (index 4) are
--- identical across Red/Blue, so callers that only touch the endpoints
--- (e.g. BattleState's zone white/black snap) need no version branch there.
--- Yellow is CGB-enhanced (pokeyellow CGBBasePalettes): named zones go through
--- pal() / usesYellowCgb(), and ogBg() falls back to CGBBase PAL_ROUTE for any
--- remaining whole-screen callers -- never Blue's GBC_BG_BLUE.
+-- The active game's OG boot-ROM background palette: blue for Blue, red for Red.
+-- Yellow is CGB-enhanced (pokeyellow CGBBasePalettes), so ogBg() falls back to
+-- CGBBase PAL_ROUTE there, never Blue's GBC_BG_BLUE.
 function PaletteFX.ogBg()
   if GameVersion.isBlue() then return PaletteFX.GBC_BG_BLUE end
   if GameVersion.isYellow() then
@@ -133,7 +206,15 @@ function PaletteFX.ogBg()
     local route = y and y.cgbBase and y.cgbBase.ROUTE
     if route then return route end
   end
-  return PaletteFX.GBC_BG
+  return PaletteFX.OG_RED_SOFT_BG
+end
+
+-- The base display ramp before transient dark-world/fade register permutations.
+-- Callers that need to emulate a battle/intro register write should use ogObj()
+-- instead, which applies those stateful permutations and returns its cache key.
+function PaletteFX.ogObjBase()
+  if GameVersion.isBlue() then return PaletteFX.GBC_OBJ_BLUE end
+  return PaletteFX.OG_RED_SOFT_OBJ
 end
 
 -- The active game's OG boot-ROM object palette (OBP0): Blue's pink ramp for a
@@ -145,9 +226,29 @@ end
 -- is unused there and kept as Red green only as a safe leftover.
 function PaletteFX.ogObj()
   if GameVersion.isBlue() then
-    return PaletteFX.darkObp(PaletteFX.GBC_OBJ_BLUE, "gbcobj_blue")
+    return PaletteFX.fadeObp(PaletteFX.darkObp(PaletteFX.GBC_OBJ_BLUE, "gbcobj_blue"))
   end
-  return PaletteFX.darkObp(PaletteFX.GBC_OBJ, "gbcobj")
+  return PaletteFX.fadeObp(PaletteFX.darkObp(PaletteFX.OG_RED_SOFT_OBJ, "gbcobj_soft"))
+end
+
+-- engine/battle/init_battle_variables.asm:18
+function PaletteFX.ogObjLit()
+  if GameVersion.isBlue() then
+    return PaletteFX.fadeObp(PaletteFX.GBC_OBJ_BLUE, "gbcobj_blue")
+  end
+  return PaletteFX.fadeObp(PaletteFX.OG_RED_SOFT_OBJ, "gbcobj_soft")
+end
+
+local function obp3100(c) return { c[1], c[1], c[2], c[4] } end
+local OG_OBJ_NORMAL = obp3100(PaletteFX.OG_RED_SOFT_OBJ)
+local OG_OBJ_NORMAL_BLUE = obp3100(PaletteFX.GBC_OBJ_BLUE)
+
+-- home/palettes.asm:24
+function PaletteFX.ogObjNormal()
+  if GameVersion.isBlue() then
+    return OG_OBJ_NORMAL_BLUE, "gbcobjnormal_blue"
+  end
+  return OG_OBJ_NORMAL, "gbcobjnormal_soft"
 end
 
 -- The DMG object ramp every mode except OG RED bakes onto overworld sprites,
@@ -167,6 +268,11 @@ PaletteFX.OBP0_SHADES = {
 
 function PaletteFX.dmgObj()
   return PaletteFX.darkObp(PaletteFX.OBP0_SHADES, "obp0")
+end
+
+-- home/palettes.asm:24
+function PaletteFX.dmgObjLit()
+  return PaletteFX.OBP0_SHADES, "obp0"
 end
 
 local INV_MAP = { [0] = 3, [1] = 2, [2] = 1, [3] = 0 }
@@ -304,9 +410,57 @@ function PaletteFX.yellowPack()
   return yellowPack or nil
 end
 
+-- Yellow-only Advanced deltas (BEACH_HOUSE, sprite remap, YELLOWMON).  Never
+-- consulted on Red/Blue (#1639).
+function PaletteFX.gbcYellowPack()
+  if gbcYellowPack == nil then
+    local ok, pack = pcall(require, "data.palettes_gbc_yellow")
+    gbcYellowPack = ok and pack or false
+  end
+  return gbcYellowPack or nil
+end
+
+-- Active world bake tables for Advanced.  Yellow merges gbc_yellow deltas
+-- via __index so shared Red tilesets stay identical byte-for-byte.
+local yellowWorld, yellowWorldBase, yellowWorldDelta
+
+function PaletteFX.worldPack()
+  local pack = PaletteFX.gbcPack()
+  local w = pack and pack.world
+  if not w then return nil end
+  if not GameVersion.isYellow() then return w end
+  local y = PaletteFX.gbcYellowPack()
+  local yw = y and y.world
+  if not yw then return w end
+  -- per sprite per frame on Yellow: build the merged view once per pair of
+  -- packs (a reload loads new tables, so identity is the whole key)
+  if yellowWorld and yellowWorldBase == w and yellowWorldDelta == yw then
+    return yellowWorld
+  end
+  yellowWorldBase, yellowWorldDelta = w, yw
+  yellowWorld = {
+    tileGroups = setmetatable(yw.tileGroups or {}, { __index = w.tileGroups }),
+    groupColors = setmetatable(yw.groupColors or {}, { __index = w.groupColors }),
+    roofGroup = w.roofGroup,
+    roofByMapIndex = w.roofByMapIndex,
+    spriteAssignment = yw.spriteAssignment or w.spriteAssignment,
+    spritePalettes = yw.spritePalettes
+      and setmetatable(yw.spritePalettes, { __index = w.spritePalettes })
+      or w.spritePalettes,
+  }
+  return yellowWorld
+end
+
 function PaletteFX.usesGbcPack(mode)
   mode = mode or PaletteFX.mode
   return mode == "redpp"
+end
+
+function PaletteFX.honorsTrueColor()
+  if GameVersion.generation() >= 2 then
+    return require("src.render.GbcPalette").mode == "gbc"
+  end
+  return PaletteFX.mode == "redpp"
 end
 
 -- Yellow's authentic GBC look is CGBBasePalettes (per-map), not a boot-ROM
@@ -354,23 +508,14 @@ function PaletteFX.usesSpriteObp(mode)
   return mode == "ogred" and not GameVersion.isYellow()
 end
 
--- ------- post-zone sprite redraw (OG RED)
---
--- In OG RED the world canvas still runs through the whole-screen zone
--- shade-remap shader, which would corrupt an OBP-baked sprite's true-color
--- pixels.  (SGB used to come through here too; it no longer bakes an object
--- palette at all, so its characters are colorized by the zone like the ground
--- they stand on and never queue a replay -- see usesSpriteObp, #301.)  So SpriteRenderer draws the baked sprite into the canvas (its
--- pixels come out zone-tinted there) AND records the draw here;
--- Renderer:endFrame replays the list on top of the finished zone pass,
--- scaled into screen space -- the GBC's OBJ-over-BG compositing, one draw
--- late.  Entries carrying `colors` are re-colorized draws (the tall-grass
--- feet overdraw, which must keep hiding sprite feet) issued through the
--- color-0-keyed shade-remap shader.  World pass only; cleared per frame.
+-- ------- post-zone sprite redraw (OG RED): OBP-baked draws recorded here and
+-- replayed by Renderer:endFrame on top of the zone pass (usesSpriteObp, #301)
 local spriteRedraws = {}
+local uiSpriteRedraws = {}
 
 function PaletteFX.clearSpriteRedraws()
   for i = #spriteRedraws, 1, -1 do spriteRedraws[i] = nil end
+  for i = #uiSpriteRedraws, 1, -1 do uiSpriteRedraws[i] = nil end
 end
 
 function PaletteFX.markSpriteRedraw(image, quad, x, y, sx, colors, keyed)
@@ -388,14 +533,35 @@ function PaletteFX.spriteRedrawPassActive()
   return currentPass == "world"
 end
 
+function PaletteFX.pass()
+  return currentPass
+end
+
 function PaletteFX.spriteRedraws()
   return spriteRedraws
 end
 
+function PaletteFX.markUiSpriteRedraw(image, quad, x, y, opts)
+  if currentPass ~= "ui" then return end
+  local clip = opts and opts.clip
+  if clip then clip = { clip[1] + markOffsetX, clip[2], clip[3], clip[4] } end
+  uiSpriteRedraws[#uiSpriteRedraws + 1] =
+    { image = image, quad = quad, x = x + markOffsetX, y = y,
+      sx = opts and opts.sx or 1, sy = opts and opts.sy or 1,
+      clip = clip, color = opts and opts.color }
+end
+
+function PaletteFX.uiSpriteRedraws()
+  return uiSpriteRedraws
+end
+
 -- Active named-palette table for COLORS: RED++ uses data/palettes_gbc.lua,
--- everything else uses the ROM-imported data.palettes.
+-- Yellow uses data/palettes_yellow.lua, everything else uses the ROM-imported data.palettes.
 function PaletteFX.pack(data)
-  if PaletteFX.usesGbcPack() then
+  if GameVersion.isYellow() then
+    local y = PaletteFX.yellowPack()
+    if y then return y end
+  elseif PaletteFX.usesGbcPack() then
     local g = PaletteFX.gbcPack()
     if g then return g end
   end
@@ -445,23 +611,29 @@ function PaletteFX.pal(data, name)
     local fromRom = romNamedPal(data, name)
     if fromRom then return fromRom end
   end
-  if PaletteFX.usesYellowCgb() then
-    local fromCgb = yellowCgbNamedPal(data, name)
-    if fromCgb then return fromCgb end
-  end
-  local p = PaletteFX.pack(data)
-  local c = p and p.palettes[name]
-  if c then return c end
   if GameVersion.isYellow() then
+    -- OG YELLOW and Advanced both use CGBBase for named pals: SuperPalettes
+    -- wash out yellows (title MEWMON/LOGO, YELLOWMON) to pale cream.  World
+    -- tile bake still comes from the Advanced GBC pack via worldPack (#1639).
+    if PaletteFX.usesYellowCgb() or PaletteFX.usesGbcPack() then
+      local fromCgb = yellowCgbNamedPal(data, name)
+      if fromCgb then return fromCgb end
+    end
     local y = PaletteFX.yellowPack()
     local yc = y and y.palettes and y.palettes[name]
     if yc then return yc end
+    local fromRom = romNamedPal(data, name)
+    if fromRom then return fromRom end
   end
+  local p = PaletteFX.pack(data)
+  local c = p and p.palettes and p.palettes[name]
+  if c then return c end
   if PaletteFX.usesGbcPack() then
     return romNamedPal(data, name)
   end
   return nil
 end
+
 
 -- the species' palette (data/pokemon/palettes.asm), MEWMON for unknowns.
 -- transformed forces PAL_GRAYMON (Ditto's palette) regardless of species
@@ -501,7 +673,8 @@ function PaletteFX.monPal(data, species, transformed)
     if pal then return pal end
   end
   local name = p.pokemon[species] or "MEWMON"
-  if PaletteFX.usesYellowCgb() then
+  if PaletteFX.usesYellowCgb()
+     or (GameVersion.isYellow() and PaletteFX.usesGbcPack()) then
     local yc = PaletteFX.pal(data, name)
     if yc then return yc end
   end
@@ -608,16 +781,14 @@ local ROUTE_6_SAFFRON = { mapId = "ROUTE_6", useMapId = "SAFFRON_CITY", cellYBel
 -- (false for a mod tileset with no pokered-gbc counterpart, or when the
 -- pack failed to load at all)
 function PaletteFX.hasWorldTileset(tileset)
-  local pack = PaletteFX.gbcPack()
-  local w = pack and pack.world
+  local w = PaletteFX.worldPack()
   return (w and w.tileGroups[tileset]) ~= nil
 end
 
 -- the palette-group (0-7) a tile GRAPHIC id resolves to in this tileset,
 -- with the current map's tile-id exceptions (if any) applied first
 function PaletteFX.worldGroupAt(tileset, mapId, tileId)
-  local pack = PaletteFX.gbcPack()
-  local w = pack and pack.world
+  local w = PaletteFX.worldPack()
   local groups = w and w.tileGroups[tileset]
   if not groups then return nil end
   local exc = TILE_GROUP_EXCEPTIONS[mapId]
@@ -631,12 +802,11 @@ end
 -- slot swapped to the current town/route (Route 6's north end uses
 -- Saffron's roof colors while the player stands in its top 2 cell rows,
 -- like pokered's wYCoord check -- data is Game.data, for the map lookup)
-function PaletteFX.worldGroupColors(data, tileset, mapId, playerCellY)
-  local pack = PaletteFX.gbcPack()
-  local w = pack and pack.world
+function PaletteFX.worldGroupColors(data, tileset, mapId, playerCellY, lit)
+  local w = PaletteFX.worldPack()
   local base = w and w.groupColors[tileset]
   if not base then return nil end
-  if not w.roofGroup[tileset] then return darkGroups(base) end
+  if not w.roofGroup[tileset] then return darkGroups(base, lit) end
   local roofMapId = mapId
   if mapId == ROUTE_6_SAFFRON.mapId and playerCellY
      and playerCellY < ROUTE_6_SAFFRON.cellYBelow then
@@ -644,7 +814,7 @@ function PaletteFX.worldGroupColors(data, tileset, mapId, playerCellY)
   end
   local roofMap = data and data.maps and data.maps[roofMapId]
   local roof = roofMap and w.roofByMapIndex[roofMap.index]
-  if not roof then return darkGroups(base) end
+  if not roof then return darkGroups(base, lit) end
   local out = {}
   for i = 1, 8 do out[i] = base[i] end
   -- LoadTownPalette only overwrites W2_BgPaletteData + $32, i.e. colors 1
@@ -654,7 +824,7 @@ function PaletteFX.worldGroupColors(data, tileset, mapId, playerCellY)
   -- material's 2 middle shades are town-specific
   local base4 = base[ROOF_GROUP + 1]
   out[ROOF_GROUP + 1] = { base4[1], roof[1], roof[2], base4[4] }
-  return darkGroups(out)
+  return darkGroups(out, lit)
 end
 
 -- an overworld sprite's resolved 4-color OBJ palette (ColorOverworldSprite),
@@ -667,34 +837,64 @@ end
 -- (`swap a; and 3` on the sprite's OAM offset, which has no equivalent
 -- here): a stable hash instead, so the same NPC instance always shows the
 -- same one of the 4 SPR_PAL_* colors.
+local sourceKinds = {}
+local seedGroups = setmetatable({}, { __mode = "k" })
+
 function PaletteFX.spriteObp(spriteDef, seed)
-  local pack = PaletteFX.gbcPack()
-  local w = pack and pack.world
+  local w = PaletteFX.worldPack()
   local src = spriteDef and (spriteDef.paletteSource or spriteDef.source)
   if not (w and src) then return nil end
-  local idx = tonumber(src:match("%[(%d+)%]"))
+  -- the parse depends only on the string (per sprite per frame otherwise)
+  local parsed = sourceKinds[src]
+  if not parsed then
+    local n = tonumber(src:match("%[(%d+)%]"))
+    parsed = n or (src:find("RedBikeSprite", 1, true) and "bike")
+      or (src:find("SurfingPikachuSprite", 1, true) and "surf") or "none"
+    sourceKinds[src] = parsed
+  end
+  local idx = type(parsed) == "number" and parsed or nil
   -- RedBikeSprite and SurfingPikachuSprite load outside
   -- SpriteSheetPointerTable, so their source has no bracketed index;
-  -- they wear the player's OBP palette (spriteAssignment[0]).
-  if not idx and (src:find("RedBikeSprite", 1, true)
-                  or src:find("SurfingPikachuSprite", 1, true)) then
+  -- they wear the player's OBP palette (spriteAssignment[0]) on Red/Blue.
+  -- On Yellow, Surfing Pikachu uses the Pikachu yellow OBJ group (#1639).
+  if parsed == "bike" then
     idx = 0
+  elseif parsed == "surf" then
+    idx = GameVersion.isYellow() and 60 or 0
   end
   local group = idx and w.spriteAssignment[idx]
   if group == nil then return nil end
   if group == "random" then
-    local h = 0
-    seed = tostring(seed or "")
-    for i = 1, #seed do h = (h * 31 + seed:byte(i)) % 4294967296 end
-    group = h % 4
+    local key = seed == nil and "" or seed
+    local h = seedGroups[key]
+    if not h then
+      h = 0
+      local str = tostring(seed or "")
+      for i = 1, #str do h = (h * 31 + str:byte(i)) % 4294967296 end
+      h = h % 4
+      if key == key then seedGroups[key] = h end
+    end
+    group = h
   end
   return PaletteFX.darkObp(w.spritePalettes[group], group)
 end
 
--- GetHealthBarColor (home/palettes.asm) on the standard 48px bar
-function PaletteFX.barPalName(hp, maxHp)
-  local px = maxHp > 0 and math.floor(hp * 48 / maxHp) or 0
-  if hp > 0 and px < 1 then px = 1 end
+-- engine/overworld/healing_machine.asm:74
+-- color/data/spritepalettes.asm:2
+PaletteFX.HEAL_MACHINE_GROUP = 4
+
+function PaletteFX.healMachineObp()
+  local w = PaletteFX.worldPack()
+  return w and w.spritePalettes
+     and w.spritePalettes[PaletteFX.HEAL_MACHINE_GROUP] or nil
+end
+
+-- GetHealthBarColor (home/palettes.asm) on the standard 48px bar.  It reads
+-- the bar's own length, so a caller mid-drain passes the animated `pixels`
+-- rather than let it be re-derived from hp.
+function PaletteFX.barPalName(hp, maxHp, pixels)
+  local px = pixels or (maxHp > 0 and math.floor(hp * 48 / maxHp) or 0)
+  if not pixels and hp > 0 and px < 1 then px = 1 end
   return px >= 27 and "GREENBAR" or px >= 10 and "YELLOWBAR" or "REDBAR"
 end
 
@@ -739,6 +939,9 @@ end
 -- leaves the original.
 PaletteFX.DARK_BGP = { [0] = 2, [1] = 3, [2] = 3, [3] = 3 }
 
+-- engine/gfx/screen_effects.asm:1-12
+PaletteFX.POISON_BGP = { [0] = 2, [1] = 1, [2] = 2, [3] = 3 }
+
 local shadeMap = nil
 
 function PaletteFX.setShadeMap(map)
@@ -747,6 +950,18 @@ end
 
 function PaletteFX.shadeMap()
   return shadeMap
+end
+
+local function invalidateColorCaches()
+  pcall(function() require("src.battle.BattleState").invalidate() end)
+  pcall(function() require("src.render.SpriteRenderer").invalidate() end)
+  pcall(function()
+    require("src.world.MapLoader").invalidateAll()
+    local Game = require("src.core.Game")
+    if Game.overworld and Game.overworld.map and Game.overworld.reloadMap then
+      Game.overworld:reloadMap(Game.overworld.map.id, "colors")
+    end
+  end)
 end
 
 function PaletteFX.setMode(mode)
@@ -760,25 +975,33 @@ function PaletteFX.setMode(mode)
     end
   end
   if not ok then PaletteFX.mode = "gbc" end
-  -- battle pics and overworld sprites bake the active pack into ImageData;
-  -- drop those caches when the pack (or any COLORS mode) changes so the
-  -- next draw re-tints
-  if prev ~= PaletteFX.mode then
-    pcall(function() require("src.battle.BattleState").invalidate() end)
-    pcall(function() require("src.render.SpriteRenderer").invalidate() end)
-    -- RED++'s baked tileset atlas (TileRenderer.getGbcAtlas) is built once
-    -- per loaded map, so a mode toggle needs every cached Map/TileRenderer
-    -- dropped and the currently-visible one rebuilt in place -- otherwise
-    -- the on-screen map keeps its stale (wrong-mode) atlas until the next
-    -- map transition happens to reload it.
-    pcall(function()
-      require("src.world.MapLoader").invalidateAll()
-      local Game = require("src.core.Game")
-      if Game.overworld and Game.overworld.map and Game.overworld.reloadMap then
-        Game.overworld:reloadMap(Game.overworld.map.id, "colors")
-      end
-    end)
+  if prev ~= PaletteFX.mode then invalidateColorCaches() end
+end
+
+PaletteFX.customRamp = nil
+
+function PaletteFX.setCustomRamp(ramp)
+  local prev = PaletteFX.customRamp
+  PaletteFX.customRamp = ramp
+  if (prev ~= nil) ~= (ramp ~= nil) or prev ~= ramp then
+    invalidateColorCaches()
   end
+end
+
+function PaletteFX.pickerActive()
+  local ok, Game = pcall(require, "src.core.Game")
+  local states = ok and Game.stack and Game.stack.states
+  local top = states and states[#states]
+  return top ~= nil and top.screenId == "PaletteScreen"
+end
+
+-- Whether the active COLORS state needs a battle pic rendered as raw DMG
+-- grays instead of real colour, the same "forced-mono" contract OG/OG
+-- INV/CLASSIC already use (issue #207). A custom palette needs this too,
+-- since ensureZones re-thresholds the already-drawn frame. Keep this in
+-- sync with ensureZones and the mode checks in BattleState and WideBattle.
+function PaletteFX.forcesRawGrays()
+  return PaletteFX.customRamp ~= nil
 end
 
 function PaletteFX.cycleMode()
@@ -793,6 +1016,13 @@ end
 
 function PaletteFX.applyOptions(opts)
   PaletteFX.setMode(opts and opts.colors or "gbc")
+  local id = opts and opts.palette
+  if id and id ~= "" then
+    local ok, Palette = pcall(require, "src.render.Palette")
+    PaletteFX.setCustomRamp(ok and Palette.ramp(id) or nil)
+  else
+    PaletteFX.setCustomRamp(nil)
+  end
 end
 
 function PaletteFX.modeLabel(mode)
@@ -805,12 +1035,11 @@ function PaletteFX.modeLabel(mode)
 end
 
 -- When a state exposes no SGB zones but COLORS needs a forced palette
--- (OG / OG INV / CLASSIC), invent a whole-screen zone so the shade-remap
--- shader still runs.  GBC / RED++ / GBC INV leave nil alone (raw DMG canvas).
 function PaletteFX.ensureZones(zones)
   if zones and zones[1] then return zones end
   local mode = PaletteFX.mode or "gbc"
-  if mode == "og" or mode == "og_inv" or mode == "classic" then
+  if mode == "og" or mode == "og_inv" or mode == "classic"
+      or (PaletteFX.forcesRawGrays() and not PaletteFX.pickerActive()) then
     return { PaletteFX.whole(PaletteFX.GRAYS) }
   end
   return zones
@@ -840,7 +1069,9 @@ function PaletteFX.effectiveColors(c)
   if not c then return nil end
   local mode = PaletteFX.mode or "gbc"
   local out = c
-  if mode == "og" then
+  if PaletteFX.customRamp and not PaletteFX.pickerActive() then
+    out = PaletteFX.customRamp
+  elseif mode == "og" then
     out = PaletteFX.GRAYS
   elseif mode == "og_inv" then
     out = PaletteFX.permute(PaletteFX.GRAYS, INV_MAP)
@@ -857,15 +1088,102 @@ function PaletteFX.effectiveColors(c)
   return PaletteFX.permute(out, shadeMap)
 end
 
+local stockEffectiveColors = PaletteFX.effectiveColors
+
+-- ------- uniform sends
+--
+-- sendColors runs per zone per frame and per colored sprite, and a send to
+-- the active shader flushes LOVE's draw batch.  Remember what each shader
+-- was last given (weak-keyed, so a released or replaced shader drops its
+-- record) and only send a uniform whose value changed.  The {r,g,b} arrays
+-- are scratch: shader:send copies the values, so they are reused.
+local UNIFORMS = { "c0", "c1", "c2", "c3" }
+local scratch = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } }
+local lastSent = setmetatable({}, { __mode = "k" })
+
+-- A caller that sends c0..c3 itself (AnimPlayer's per-cell OBJ colors) has
+-- to drop the record, or the next sendColors of the old colors would be
+-- skipped.  AnimPlayer:drawSprites does this after its direct sends.
+function PaletteFX.forgetSent(sh)
+  local rec = sh and lastSent[sh]
+  if rec then rec.valid = false end
+end
+
+local function sendOne(sh, rec, i, col, valid)
+  local r, g, b = col[1] / 255, col[2] / 255, col[3] / 255
+  local k = i * 3
+  if valid and rec[k - 2] == r and rec[k - 1] == g and rec[k] == b then
+    return
+  end
+  local v = scratch[i]
+  v[1], v[2], v[3] = r, g, b
+  sh:send(UNIFORMS[i], v)
+  rec[k - 2], rec[k - 1], rec[k] = r, g, b
+end
+
+local function sendFour(sh, a, b, c, d)
+  local rec = lastSent[sh]
+  if not rec then
+    rec = { valid = false }
+    lastSent[sh] = rec
+  end
+  -- An error from send propagates as the unconditional sends' did; the
+  -- record only counts once all four landed, so a raise mid-way never
+  -- leaves a half-written palette looking current.
+  local valid = rec.valid
+  rec.valid = false
+  sendOne(sh, rec, 1, a, valid)
+  sendOne(sh, rec, 2, b, valid)
+  sendOne(sh, rec, 3, c, valid)
+  sendOne(sh, rec, 4, d, valid)
+  rec.valid = true
+end
+
 -- send a 4-color (0-255 RGB) palette to the shade-remap shader, after
--- applying the active COLORS display mode
+-- applying the active COLORS display mode.  Resolves the same colors
+-- effectiveColors returns, indexing through the mode and shade maps rather
+-- than building the permuted tables.
 function PaletteFX.sendColors(shader, c)
-  c = PaletteFX.effectiveColors(c)
   if not c then return end
-  shader:send("c0", { c[1][1] / 255, c[1][2] / 255, c[1][3] / 255 })
-  shader:send("c1", { c[2][1] / 255, c[2][2] / 255, c[2][3] / 255 })
-  shader:send("c2", { c[3][1] / 255, c[3][2] / 255, c[3][3] / 255 })
-  shader:send("c3", { c[4][1] / 255, c[4][2] / 255, c[4][3] / 255 })
+  if PaletteFX.effectiveColors ~= stockEffectiveColors then
+    -- something replaced effectiveColors: honour it, as the send always did
+    c = PaletteFX.effectiveColors(c)
+    if not c then return end
+    return sendFour(shader, c[1], c[2], c[3], c[4])
+  end
+  local mode = PaletteFX.mode or "gbc"
+  local base, modeMap = c, nil
+  if PaletteFX.customRamp and not PaletteFX.pickerActive() then
+    base = PaletteFX.customRamp
+  elseif mode == "og" then
+    base = PaletteFX.GRAYS
+  elseif mode == "og_inv" then
+    base, modeMap = PaletteFX.GRAYS, INV_MAP
+  elseif mode == "classic" then
+    base = PaletteFX.CLASSIC
+  elseif mode == "gbc_inv" then
+    modeMap = INV_MAP
+  end
+  local sm = shadeMap
+  local i0, i1, i2, i3 = 0, 1, 2, 3
+  if sm then i0, i1, i2, i3 = sm[0], sm[1], sm[2], sm[3] end
+  if modeMap then
+    i0, i1, i2, i3 = modeMap[i0], modeMap[i1], modeMap[i2], modeMap[i3]
+  end
+  sendFour(shader, base[i0 + 1], base[i1 + 1], base[i2 + 1], base[i3 + 1])
+end
+
+-- The same send with NO display-mode substitution and no shade map: the four
+-- colors reach the shader exactly as given.  Only for an INTERMEDIATE pass
+-- whose output is re-thresholded downstream -- the classic battle's zone pass
+-- under a forced-mono mode, where ensureZones' whole-screen zone already
+-- substitutes once at blit time and doing it again here applies the mode
+-- twice (#822).  Everything that draws a final pixel wants sendColors.
+function PaletteFX.sendShades(shader, c)
+  -- headless (no love.graphics) leaves shader() nil; sendColors reaches the
+  -- same no-op through effectiveColors returning nil for an absent palette
+  if not shader or not c then return end
+  sendFour(shader, c[1], c[2], c[3], c[4])
 end
 
 return PaletteFX

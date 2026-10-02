@@ -88,14 +88,24 @@ mkdir -p "$GAME_SRC"
 # Same payload as scripts/build.sh's game.love — never ship ROM-derived cache.
 # tools/save-editor is part of that payload: the launcher's Edit button on a
 # save row opens it in-process (main.lua).
+rm -f "$WORK/game-payload.zip"
 (cd "$ROOT" && zip -q -9 -r "$WORK/game-payload.zip" \
   main.lua conf.lua src libs data assets tools/save-editor \
   tools/rom_manifest.json tools/rom_manifest_blue.json \
+  tools/rom_manifest_yellow.json tools/rom_manifest_gold.json \
+  tools/rom_manifest_silver.json tools/rom_manifest_crystal.json \
+  tools/rom_manifest_firered.json tools/rom_manifest_leafgreen.json tools/rom_manifest_emerald.json \
   -x '*.DS_Store' 'data/generated/*' 'assets/generated/*')
-if unzip -Z1 "$WORK/game-payload.zip" \
-    | grep -Eq '^(data|assets)/generated/[^/]+|^(data|assets)/generated/.+/'; then
+unzip -Z1 "$WORK/game-payload.zip" > "$WORK/payload-listing.txt"
+if grep -Eq '^(data|assets)/generated/[^/]+|^(data|assets)/generated/.+/' "$WORK/payload-listing.txt"; then
   fail "payload unexpectedly contains generated ROM data"
 fi
+for manifest in rom_manifest.json rom_manifest_blue.json rom_manifest_yellow.json \
+                rom_manifest_gold.json rom_manifest_silver.json rom_manifest_crystal.json \
+                rom_manifest_firered.json rom_manifest_leafgreen.json rom_manifest_emerald.json; do
+  grep -qxF "tools/$manifest" "$WORK/payload-listing.txt" \
+    || fail "payload is missing tools/$manifest"
+done
 unzip -q "$WORK/game-payload.zip" -d "$GAME_SRC"
 rm -f "$WORK/game-payload.zip"
 
@@ -148,6 +158,20 @@ chmod +x "$PORT_ROOT/$PORT_DIR_NAME/bin/love.aarch64"
 cp "$LOVE_LIB" "$LUAJIT_LIB" "$MODPLUG_LIB" "$OGG_LIB" \
   "$PORT_ROOT/$PORT_DIR_NAME/libs.aarch64/"
 
+BRIDGE_LIB="liblibrashader_bridge.so"
+BRIDGE_SRC="${SHADERFX_BRIDGE_LINUX_ARM64:-}"
+if [ -z "$BRIDGE_SRC" ] && [ -f "$ROOT/dist/native/linux-arm64/$BRIDGE_LIB" ]; then
+  BRIDGE_SRC="$ROOT/dist/native/linux-arm64/$BRIDGE_LIB"
+fi
+if [ -n "$BRIDGE_SRC" ] && [ -f "$BRIDGE_SRC" ]; then
+  cp "$BRIDGE_SRC" "$PORT_ROOT/$PORT_DIR_NAME/libs.aarch64/$BRIDGE_LIB"
+  say "bundled $BRIDGE_LIB for SHADER FX preset conversion"
+elif [ "${SHADERFX_BRIDGE_REQUIRED:-}" = "1" ]; then
+  fail "$BRIDGE_LIB not found: set SHADERFX_BRIDGE_LINUX_ARM64 or stage it at dist/native/linux-arm64/$BRIDGE_LIB"
+else
+  warn "$BRIDGE_LIB not found: this port can run converted presets but not CONVERT new ones"
+fi
+
 # Drop a short license pointer for the bundled LÖVE bits.
 cat > "$PORT_ROOT/$PORT_DIR_NAME/licenses/LICENSE.love2d.txt" <<'EOF'
 This port bundles the LÖVE 11.5 aarch64 runtime from PortMaster
@@ -190,6 +214,26 @@ get_controls
 [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ] && source "${controlfolder}/mod_${CFW_NAME}.txt"
 
 GAMEDIR="$SHDIR/gen1recomp"
+# Anbernic stock keeps the launcher and the game folder side by side, so the
+# SHDIR-relative path above is correct there and is tried first.
+#
+# Other firmwares (muOS, and PortMaster's layout on several devices) keep
+# launcher scripts and port data in SEPARATE trees -- scripts under roms/ports,
+# data under ports -- so the sibling folder holds no game.
+#
+# Probe for the BINARY, not the directory: on a split layout this script has
+# usually already created "$SHDIR/gen1recomp/conf" and log.txt on an earlier
+# failed run (see mkdir/tee below), so an existence test matches a decoy of our
+# own making. Stock is unaffected -- its sibling holds the real binary and wins
+# on the first test.
+if [ ! -f "$GAMEDIR/bin/love.aarch64" ]; then
+  for candidate in "/$directory/ports/gen1recomp" \
+                   "/mnt/sdcard/ports/gen1recomp" \
+                   "/mnt/mmc/ports/gen1recomp" \
+                   "/roms/ports/gen1recomp"; do
+    if [ -f "$candidate/bin/love.aarch64" ]; then GAMEDIR="$candidate"; break; fi
+  done
+fi
 CONFDIR="$GAMEDIR/conf"
 mkdir -p "$CONFDIR"
 
@@ -198,15 +242,13 @@ cd "$GAMEDIR" || exit 1
 
 export XDG_DATA_HOME="$CONFDIR"
 export XDG_CONFIG_HOME="$CONFDIR"
+# Release-target marker for the self-updater: a full-package fallback here must
+# offer gen1recomp-<v>-rg34xxsp-stockos64-mod.zip, never a desktop package.
+export POKEPORT_RG34XXSP=1
 export LD_LIBRARY_PATH="$GAMEDIR/libs.aarch64:${LD_LIBRARY_PATH:-}"
 export SDL_GAMECONTROLLERCONFIG="${sdl_controllerconfig:-}"
 # Mali / H700: prefer GLES where available
 export LOVE_GRAPHICS_USE_OPENGLES="${LOVE_GRAPHICS_USE_OPENGLES:-1}"
-# Same GPU class as a phone, but getOS() here says "Linux", so the Android
-# gate (issue #136) would not fire on its own: refuse GBC FX explicitly.
-# Hides the OPTIONS row, pins the level to OFF, and heals a level already
-# persisted in options.lua.
-export POKEPORT_GBCFX="${POKEPORT_GBCFX:-0}"
 
 $ESUDO chmod a+x ./bin/love.aarch64 2>/dev/null || chmod a+x ./bin/love.aarch64
 $ESUDO chmod 666 /dev/uinput 2>/dev/null || true
@@ -296,13 +338,6 @@ Native LÖVE 11.5 port of gen1recomp for Anbernic RG34XXSP on
 | Start / Select | Play or Choose ROM |
 
 In-game controls use the normal PortMaster / SDL pad map (rebind under OPTIONS → CONTROLS).
-
-### Display options
-
-GBC FX is disabled on this device (the H700's Mali GPU compiles that present
-pass and then shows a black frame), so the OPTIONS row is hidden. COLORS,
-TILT, ZOOM, VOID FILL and MAX FPS all work. To try it anyway, launch with
-`POKEPORT_GBCFX=1`.
 
 ### First run
 

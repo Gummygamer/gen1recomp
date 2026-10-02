@@ -64,18 +64,14 @@ return function(game)
   local ow = game.overworld
   U.log("start map:", tostring(ow and ow.map and ow.map.id),
         "tileset:", tostring(ow and ow.map and ow.map.def and ow.map.def.tileset))
-  U.shot(game, DIR .. "/dig_00_cave.png")
+  U.still(game, DIR .. "/dig_00_cave.png")
   U.wait(4)
 
   -- open the party menu and pick DIG on slot 1
-  -- (submenu order for a DIG-only mon: STATS / SWITCH / DIG)
+  -- (submenu order for a DIG-only mon: DIG / STATS / SWITCH -- #768)
   Screens.push(game, "PartyMenu")
   U.wait(5)
-  U.tap(game, "a")    -- open the per-mon submenu
-  U.wait(2)
-  U.tap(game, "down") -- STATS -> SWITCH
-  U.wait(2)
-  U.tap(game, "down") -- SWITCH -> DIG
+  U.tap(game, "a")    -- open the per-mon submenu, cursor on DIG
   U.wait(2)
   U.tap(game, "a")    -- choose DIG
   U.wait(2)
@@ -85,19 +81,30 @@ return function(game)
   -- (map.id == MT_MOON_1F). The pre-fix code only spins on arrival, inside the
   -- Center, so this stays false pre-fix.
   local sawDepartureSpin = false
-  local spinShotTaken = false
   local leftCave = false
-  for _ = 1, 240 do
+  local facingRuns, lastFacing, lastTick, maxTick = {}, nil, -1, 0
+  local function sampleSpin()
+    if not ow.player.spinning then return end
+    local tick = ow.player.spinTimer or 0
+    if tick == lastTick then return end
+    lastTick = tick
+    if tick > maxTick then maxTick = tick end
+    local _, _, _, facing = ow.player:pose()
+    if facing ~= lastFacing then
+      lastFacing = facing
+      facingRuns[#facingRuns + 1] = 1
+    else
+      facingRuns[#facingRuns] = facingRuns[#facingRuns] + 1
+    end
+  end
+  for _ = 1, 400 do
     local stillCave = ow.map and ow.map.id == "MT_MOON_1F"
+    if stillCave then sampleSpin() end
     -- departure-only markers: ow.teleportOut is the new pre-warp spin state,
     -- and player.spinRise is the rising spin (the arrival uses spinDrop), so
     -- neither can be confused with the interior arrival spin-down
     if stillCave and (ow.teleportOut ~= nil or ow.player.spinRise) then
       sawDepartureSpin = true
-      if not spinShotTaken then
-        U.shot(game, DIR .. "/dig_01_spin.png")
-        spinShotTaken = true
-      end
     end
     if ow.map and ow.map.id ~= "MT_MOON_1F" then
       leftCave = true
@@ -113,13 +120,13 @@ return function(game)
   for _ = 1, 240 do
     landedMap = ow.map and ow.map.id
     -- wait until the transition settles onto a stable map that isn't the cave
-    if landedMap and landedMap ~= "MT_MOON_1F" and not ow.transitioning then
+    if landedMap and landedMap ~= "MT_MOON_1F" and not ow.transitioning and not ow.player.spinning then
       break
     end
     U.wait(1)
   end
   U.wait(8)
-  U.shot(game, DIR .. "/dig_02_land.png")
+  U.still(game, DIR .. "/dig_02_land.png")
   U.wait(4)
   landedMap = ow.map and ow.map.id
   U.log("DIG landed map:", tostring(landedMap),
@@ -127,12 +134,61 @@ return function(game)
 
   check(sawDepartureSpin,
     "DIG: departure spin appears in the cave before the fade (FIX A)")
+
+  do
+    local runs = {}
+    for i, n in ipairs(facingRuns) do runs[i] = n end
+    U.log("departure fixed steps:", tostring(maxTick),
+          "facing runs:", table.concat(runs, ","))
+    check(maxTick >= 130,
+      "DIG: the departure spin runs the cart's 135 fixed steps -- got "
+      .. tostring(maxTick))
+    check((runs[2] or 0) >= 12,
+      "DIG: the spin starts slow (>=12 frames a facing) -- got "
+      .. tostring(runs[2]))
+    local monotonic, prev = true, math.huge
+    for i = 2, math.min(#runs, 15) do
+      if runs[i] > prev then monotonic = false end
+      prev = runs[i]
+    end
+    check(monotonic,
+      "DIG: PlayerSpinInPlace accelerates (run lengths never grow)")
+    local sawRise = false
+    for i = 12, #runs do if runs[i] == 3 then sawRise = true end end
+    check(sawRise,
+      "DIG: the rise runs at PlayerSpinWhileMovingUp's 3 frames a step")
+  end
   check(landedMap == "VIRIDIAN_CITY",
     "DIG: lands OUTSIDE at VIRIDIAN_CITY, not the interior (FIX B) -- got "
     .. tostring(landedMap))
   check(ow.player.cellX == 23 and ow.player.cellY == 26,
     "DIG: lands at the in-front-of-door fly spot 23,26 -- got "
     .. tostring(ow.player.cellX) .. "," .. tostring(ow.player.cellY))
+
+  U.teleport(game, "MT_MOON_1F", 14, 34, "down")
+  ow = game.overworld
+  Screens.push(game, "PartyMenu")
+  U.wait(5)
+  U.tap(game, "a")
+  U.wait(2)
+  U.tap(game, "a")
+  local capturedDeparture = false
+  for _ = 1, 400 do
+    if ow.map.id ~= "MT_MOON_1F" then break end
+    if ow.teleportOut and ow.player.spinning then
+      capturedDeparture = U.still(game, DIR .. "/dig_01_spin.png")
+      break
+    end
+    U.wait(1)
+  end
+  check(capturedDeparture, "DIG: a separate capture pass freezes the departure spin")
+  for _ = 1, 600 do
+    if ow.map.id ~= "MT_MOON_1F" and not ow.transitioning
+       and not ow.player.spinning then break end
+    U.wait(1)
+  end
+  check(ow.map.id == "VIRIDIAN_CITY" and not ow.transitioning
+    and not ow.player.spinning, "DIG: the capture pass settles outside the Center")
 
   -- ======================= LEG 2: ESCAPE ROPE via the bag =============
   -- Same shared departure path, but driven through BagMenu's escape_rope
@@ -144,7 +200,7 @@ return function(game)
 
   U.teleport(game, "MT_MOON_1F", 14, 34, "down")
   ow = game.overworld
-  U.shot(game, DIR .. "/dig_03_rope_cave.png")
+  U.still(game, DIR .. "/dig_03_rope_cave.png")
   U.wait(4)
 
   Screens.push(game, "BagMenu")
@@ -155,7 +211,7 @@ return function(game)
   U.wait(2)
 
   local ropeSpin = false
-  for _ = 1, 240 do
+  for _ = 1, 400 do
     local stillCave = ow.map and ow.map.id == "MT_MOON_1F"
     if stillCave and (ow.teleportOut ~= nil or ow.player.spinRise) then
       ropeSpin = true
@@ -166,13 +222,13 @@ return function(game)
   local ropeLanded
   for _ = 1, 240 do
     ropeLanded = ow.map and ow.map.id
-    if ropeLanded and ropeLanded ~= "MT_MOON_1F" and not ow.transitioning then
+    if ropeLanded and ropeLanded ~= "MT_MOON_1F" and not ow.transitioning and not ow.player.spinning then
       break
     end
     U.wait(1)
   end
   U.wait(8)
-  U.shot(game, DIR .. "/dig_04_rope_land.png")
+  U.still(game, DIR .. "/dig_04_rope_land.png")
   U.wait(4)
   ropeLanded = ow.map and ow.map.id
   U.log("ESCAPE ROPE landed map:", tostring(ropeLanded),
@@ -190,4 +246,5 @@ return function(game)
     U.log("RESULT bug196 FAIL (" .. #failures .. "):")
     for _, m in ipairs(failures) do U.log("  -", m) end
   end
+  love.event.quit(#failures == 0 and 0 or 1)
 end

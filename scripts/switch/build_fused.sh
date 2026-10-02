@@ -15,7 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOVE_NX_TAG="11.5-nx1"
 LOVE_NX_DIR="$ROOT/.bazinga/love-nx/$LOVE_NX_TAG"
 LOVE_ELF="$LOVE_NX_DIR/love.elf"
-ICON="$ROOT/assets/switch/icon.jpg"
+# Regenerated from assets/logo/gen1recomp_cover.png by tools/brand_platform_icons.py.
+ICON="$ROOT/ports/switch/assets/icon.jpg"
 APP_NAME="gen1recomp"
 APP_AUTHOR="bryanthaboi, port by andrewqsantos"
 DKP_IMAGE_FILE="$ROOT/scripts/switch/dkp-docker.image"
@@ -93,7 +94,7 @@ run_fused_docker() {
       set -euo pipefail
       nacptool --create '$APP_NAME' '$APP_AUTHOR' '$VERSION' /work/control.nacp
       elf2nro /src/.bazinga/love-nx/$LOVE_NX_TAG/love.elf /out/$out_base \
-        --icon=/src/assets/switch/icon.jpg \
+        --icon=/src/ports/switch/assets/icon.jpg \
         --nacp=/work/control.nacp \
         --romfsdir=/work/romfs
     "

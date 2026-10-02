@@ -6,18 +6,30 @@ function love.conf(t)
 
   local editor = os.getenv("POKEPORT_EDITOR") == "1"
   local developer = os.getenv("POKEPORT_DEV") == "1"
+  local companion = nil
   if arg then
     for _, a in ipairs(arg) do
       if a == "--editor" then editor = true end
       if a == "--developer" then developer = true end
+      local port, token = a:match("^%-%-display%-companion=(%d+),([%w]+)$")
+      if port then companion = { port = tonumber(port), token = token } end
     end
   end
   -- main.lua runs in the same Lua state right after conf.lua; stash the
   -- decision in a global so it doesn't need to reparse `arg`.
   _G.POKEPORT_EDITOR_MODE = editor
   _G.POKEPORT_DEV_MODE = developer
+  _G.POKEPORT_DISPLAY_COMPANION = companion
 
-  if editor then
+  if companion then
+    t.identity = "pokemon-love2d-companion"
+    t.window.title = "gen1recomp Secondary Display"
+    t.window.width = 640
+    t.window.height = 576
+    t.window.minwidth = 160
+    t.window.minheight = 144
+    t.window.resizable = true
+  elseif editor then
     -- Same identity as the game, deliberately: the editor edits the game's
     -- saves and reads the game's ROM cache, both of which live under this
     -- folder.  A private editor identity would point love.filesystem at an
@@ -50,9 +62,19 @@ function love.conf(t)
     t.window.minheight = 360
   end
   t.version = love._os == "iOS" and "12.0" or "11.5"
+  -- Driver vsync stays on everywhere (including KMSDRM handhelds) so
+  -- PresentSync can probe cadence and pace via the panel.  Turning it off
+  -- here bypassed that stack and forced the FrameCap 1 ms polling loop.
   t.window.vsync = 1
-  t.modules.joystick = true
+  t.modules.audio = not companion
+  t.modules.joystick = not companion
   t.modules.physics = false
+  -- love.sensor exposes raw accelerometer/gyroscope data (love.sensor.getData),
+  -- independent of t.accelerometerjoystick below (which instead maps the
+  -- accelerometer onto joystick axes and stays off -- see that flag's
+  -- comment for why). Explicit here so a future effect (e.g. a tilt-driven
+  -- reflective-screen look) has sensor data available without reviving #468.
+  t.modules.sensor = true
 
   -- love.system is not loaded during love.conf; love._os is set by the
   -- engine before conf runs (LÖVE 11.x / 11.5).
@@ -110,5 +132,16 @@ function love.conf(t)
     t.accelerometerjoystick = false
   else
     t.window.resizable = true
+    pcall(function() require("src.core.PadHints").apply(osName) end)
+    if os.getenv("POKEPORT_BACKGROUND") == "1" and osName == "OS X" then
+      pcall(function()
+        local ffi = require("ffi")
+        ffi.cdef("int SDL_SetHint(const char *name, const char *value);")
+        ffi.C.SDL_SetHint("SDL_MAC_BACKGROUND_APP", "1")
+      end)
+      t.window.borderless = true
+      t.window.x = -30000
+      t.window.y = -30000
+    end
   end
 end

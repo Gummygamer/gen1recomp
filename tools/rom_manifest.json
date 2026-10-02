@@ -1832,7 +1832,7 @@
     "71": "\u307a",
     "72": "\u307d",
     "73": "\f",
-    "74": "POK\u00e9MON",
+    "74": "<PK><MN>",
     "75": "<_CONT>",
     "76": "<SCROLL>",
     "78": "\n",
@@ -4275,6 +4275,24 @@
             "open": 14
           }
         ],
+        "SILPH_CO_10F": [
+          {
+            "block": 84,
+            "bx": 5,
+            "by": 4,
+            "event": "EVENT_SILPH_CO_10_UNLOCKED_DOOR",
+            "open": 14
+          }
+        ],
+        "SILPH_CO_11F": [
+          {
+            "block": 32,
+            "bx": 3,
+            "by": 6,
+            "event": "EVENT_SILPH_CO_11_UNLOCKED_DOOR",
+            "open": 3
+          }
+        ],
         "SILPH_CO_2F": [
           {
             "block": 84,
@@ -4415,24 +4433,6 @@
             "by": 6,
             "event": "EVENT_SILPH_CO_9_UNLOCKED_DOOR4",
             "open": 14
-          }
-        ],
-        "SILPH_CO_10F": [
-          {
-            "block": 84,
-            "bx": 5,
-            "by": 4,
-            "event": "EVENT_SILPH_CO_10_UNLOCKED_DOOR",
-            "open": 14
-          }
-        ],
-        "SILPH_CO_11F": [
-          {
-            "block": 32,
-            "bx": 3,
-            "by": 6,
-            "event": "EVENT_SILPH_CO_11_UNLOCKED_DOOR",
-            "open": 3
           }
         ]
       },
@@ -20266,6 +20266,10 @@
       12,
       17536
     ],
+    "ED_Tile": [
+      1,
+      26471
+    ],
     "EeveePicBack": [
       11,
       26149
@@ -20325,6 +20329,10 @@
     "ExeggutorPicFront": [
       9,
       20950
+    ],
+    "FallingObjects_DeltaXs": [
+      30,
+      23821
     ],
     "FallingStar": [
       28,
@@ -20441,6 +20449,10 @@
     "GamblerPic": [
       19,
       21537
+    ],
+    "GameBoyTiles": [
+      30,
+      23584
     ],
     "GameCornerPrizeRoom_h": [
       18,
@@ -20818,6 +20830,10 @@
       9,
       21671
     ],
+    "LinkCableTiles": [
+      30,
+      23632
+    ],
     "LoreleiPic": [
       19,
       30585
@@ -20949,6 +20965,10 @@
     "MoltresPicFront": [
       10,
       31660
+    ],
+    "MonNestIcon": [
+      28,
+      22206
     ],
     "MonPartyData": [
       28,
@@ -21750,6 +21770,18 @@
       24,
       22665
     ],
+    "SSAnneKitchenCook7EelsAuBarbecueText": [
+      32,
+      21107
+    ],
+    "SSAnneKitchenCook7PrimeBeefSteakText": [
+      32,
+      21158
+    ],
+    "SSAnneKitchenCook7SalmonDuSaladText": [
+      32,
+      21043
+    ],
     "SSAnneKitchen_h": [
       24,
       22439
@@ -21962,6 +21994,18 @@
       21,
       25848
     ],
+    "SilphCo9FNurseDontGiveUpText": [
+      33,
+      19513
+    ],
+    "SilphCo9FNurseThankYouText": [
+      33,
+      19528
+    ],
+    "SilphCo9FNurseYouLookTiredText": [
+      33,
+      19467
+    ],
     "SilphCo9F_h": [
       23,
       22447
@@ -22066,6 +22110,10 @@
       19,
       20787
     ],
+    "TMNotebookText": [
+      34,
+      19453
+    ],
     "TamerPic": [
       19,
       23374
@@ -22122,9 +22170,25 @@
       28,
       20288
     ],
+    "TownMapUpArrow": [
+      28,
+      20627
+    ],
+    "TradeBubbleIconGFX": [
+      28,
+      23129
+    ],
     "TradeCenter_h": [
       19,
       32004
+    ],
+    "TradingAnimationGraphics": [
+      14,
+      27070
+    ],
+    "TradingAnimationGraphics2": [
+      14,
+      27854
     ],
     "TrainerAI": [
       14,
@@ -22337,6 +22401,18 @@
     "VileplumePicFront": [
       13,
       27425
+    ],
+    "ViridianCityFisherYouCanHaveThisText": [
+      41,
+      17898
+    ],
+    "ViridianCityYoungster2CaterpieAndWeedleDescriptionText": [
+      41,
+      17627
+    ],
+    "ViridianCityYoungster2OkThenText": [
+      41,
+      17613
     ],
     "ViridianCity_h": [
       6,
@@ -34051,7 +34127,17 @@
       ]
     },
     "labels": [
+      "SSAnneKitchenCook7EelsAuBarbecueText",
+      "SSAnneKitchenCook7PrimeBeefSteakText",
+      "SSAnneKitchenCook7SalmonDuSaladText",
       "SilphCo2FSilphWorkerFPleaseTakeThisText",
+      "SilphCo9FNurseDontGiveUpText",
+      "SilphCo9FNurseThankYouText",
+      "SilphCo9FNurseYouLookTiredText",
+      "TMNotebookText",
+      "ViridianCityFisherYouCanHaveThisText",
+      "ViridianCityYoungster2CaterpieAndWeedleDescriptionText",
+      "ViridianCityYoungster2OkThenText",
       "_AIBattleUseItemText",
       "_AIBattleWithdrawText",
       "_AbandonLearningText",
@@ -42444,7 +42530,7 @@
           "after": "_MtMoonB2FSuperNerdTheresAPokemonLabText",
           "battle": "_MtMoonB2FSuperNerdTheyreBothMineText",
           "event": "EVENT_BEAT_MT_MOON_3_SUPER_NERD",
-          "won": "_MtMoonB2fSuperNerdEachTakeOneText"
+          "won": "_MtMoonB2FSuperNerdOkIllShareText"
         },
         "2": {
           "after": "_MtMoonB2FRocket1AfterBattleText",

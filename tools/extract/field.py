@@ -86,6 +86,43 @@ def parse_super_rod(pokered):
     return out
 
 
+def parse_super_rod_yellow(pokeyellow):
+    """pokeyellow data/wild/super_rod.asm: inline species,level rows.
+
+    Yellow stores four (species, level) pairs per map on one `db` line
+    (`db MAP, SPECIES, LEVEL, SPECIES, LEVEL, ...`), unlike Red's
+    `dbw MAP, .Group` + `db level, species` groups.  Slot order is kept
+    so Super Rod weighted rolls and DexNav lists stay faithful (#1074).
+    """
+    out = {}
+    path = os.path.join(pokeyellow, "data/wild/super_rod.asm")
+    for lineno, line in read_asm(path):
+        s = line.strip()
+        if not s.startswith("db ") or s == "db -1" or s.startswith("db -1 ;"):
+            continue
+        # db MAP, SPECIES, LEVEL, SPECIES, LEVEL, SPECIES, LEVEL, SPECIES, LEVEL
+        parts = [p.strip() for p in s[3:].split(",")]
+        if len(parts) < 3 or not re.match(r"^[A-Z][A-Z0-9_]*$", parts[0]):
+            continue
+        map_id = parts[0]
+        slots = []
+        rest = parts[1:]
+        i = 0
+        while i + 1 < len(rest):
+            species, level = rest[i], rest[i + 1]
+            if not re.match(r"^[A-Z][A-Z0-9_]*$", species):
+                break
+            try:
+                level_n = int(level)
+            except ValueError:
+                break
+            slots.append({"level": level_n, "species": species})
+            i += 2
+        if slots:
+            out[map_id] = slots
+    return out
+
+
 def parse_trades(pokered):
     """data/events/trades.asm: npctrade give, get, dialogset, nickname."""
     # TRADE_DIALOGSET_* order (constants/script_constants.asm) indexes
@@ -1471,9 +1508,11 @@ def extract(pokered, out_dir):
         util.die("bike riding tileset extraction sanity check failed")
     if indoor_encounters["firstIndoorMap"] != 0x25:
         util.die("indoor encounter boundary sanity check failed")
-    if len(title) != 5 or any(not v["width"] for v in title.values()) \
+    if len(title) not in (5, 6) or any(not v["width"] for v in title.values()) \
        or (title["gamefreakInc"]["width"],
-           title["gamefreakInc"]["height"]) != (72, 8):
+           title["gamefreakInc"]["height"]) != (72, 8) \
+       or ("nine" in title and (title["nine"]["width"],
+                                title["nine"]["height"]) != (8, 8)):
         util.die("title asset extraction sanity check failed")
     if any((intro["gengar"][f]["width"], intro["gengar"][f]["height"])
            != (56, 56) for f in ("frame1", "frame2", "frame3")) \

@@ -49,7 +49,13 @@ local STATUS_PAGES = {
     image = "assets/generated/battle/battle_hud_2.png", base = 0x78, count = 1 },
 }
 
-local tiles, statusTiles
+-- engine/menus/naming_screen.asm:93
+local NAMING_PAGES = {
+  { id = "font_battle_extra",
+    image = "assets/generated/battle/font_battle_extra.png", base = 0x62 },
+}
+
+local tiles, statusTiles, namingTiles
 
 -- Build one code -> {img, quad} map from a page list.  `count` caps a page
 -- at the number of tiles the asm actually copies (the extracted sheets all
@@ -86,7 +92,11 @@ end
 local function put(t, x, y, tint)
   if not t then return end
   local r, g, b, a = love.graphics.getColor()
-  love.graphics.setColor(tint or { 1, 1, 1, 1 })
+  if tint then
+    love.graphics.setColor(tint)
+  else
+    love.graphics.setColor(1, 1, 1, 1)
+  end
   love.graphics.draw(t.img, t.quad, x, y)
   love.graphics.setColor(r, g, b, a)
 end
@@ -104,10 +114,17 @@ function HudTiles.statusTile(code, x, y, tint)
   put(statusTiles[code], x, y, tint)
 end
 
+-- engine/menus/naming_screen.asm:93
+function HudTiles.namingTile(code, x, y, tint)
+  if not namingTiles then namingTiles = build(NAMING_PAGES, true) end
+  put(namingTiles[code], x, y, tint)
+end
+
 -- lazy: the next tile() rebuilds every page from the search path
 function HudTiles.invalidate()
   tiles = nil
   statusTiles = nil
+  namingTiles = nil
 end
 
 Assets.register(HudTiles.invalidate)
@@ -141,13 +158,33 @@ end
 -- Tinting first would double-apply the color: GREENBAR's fill {0,189,0} has
 -- red channel 0, so the tint zeroes the whole bar's red and the zone's
 -- red-channel-keyed shade shader then maps every pixel to color 3 = black.
-function HudTiles.drawHPBar(data, tx, ty, mon, barType, grayFill, segments)
+--
+-- pixels: an explicit 0..48 bar length on GetHPBarLength's scale, for a
+-- caller that is animating the bar between two HP values
+-- (UpdateHPBar_AnimateHPBar); it scales with `segments` like the color
+-- thresholds do.  Without it the length comes from mon.hp as before.
+-- The fill tint for a bar colour, kept per colour table (the bar palettes
+-- are a handful of fixed tables) and rebuilt if its values ever differ.
+-- put() only reads it.
+local fillTints = setmetatable({}, { __mode = "k" })
+local function fillTint(c)
+  local t = fillTints[c]
+  if t and t.r == c[1] and t.g == c[2] and t.b == c[3] then return t end
+  t = { math.min(1, c[1] / 170), math.min(1, c[2] / 170),
+        math.min(1, c[3] / 170), 1, r = c[1], g = c[2], b = c[3] }
+  fillTints[c] = t
+  return t
+end
+
+function HudTiles.drawHPBar(data, tx, ty, mon, barType, grayFill, segments, pixels)
   local x, y = tx * 8, ty * 8
   segments = math.max(1, math.floor(segments or 6))
   HudTiles.tile(0x71, x, y)
   HudTiles.tile(0x62, x + 8, y)
   local px = 0
-  if mon.stats.hp > 0 and mon.hp > 0 then
+  if pixels then
+    px = math.max(0, math.floor(pixels * segments / 6))
+  elseif mon.stats.hp > 0 and mon.hp > 0 then
     px = math.max(1, math.floor(mon.hp * segments * 8 / mon.stats.hp))
   end
   local tint
@@ -162,8 +199,7 @@ function HudTiles.drawHPBar(data, tx, ty, mon, barType, grayFill, segments)
       local c = colors[3] -- GB color 2 is the fill shade
       -- the fill pixels are the 2/3-gray shade; divide so they land on
       -- the palette color exactly (the black outline stays black)
-      tint = { math.min(1, c[1] / 170), math.min(1, c[2] / 170),
-               math.min(1, c[3] / 170), 1 }
+      tint = fillTint(c)
     end
   end
   for i = 0, segments - 1 do

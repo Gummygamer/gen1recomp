@@ -69,7 +69,8 @@ local SAFARI = {
     "SAFARI_ZONE_NORTH_REST_HOUSE", "SAFARI_ZONE_WEST_REST_HOUSE",
     "SAFARI_ZONE_SECRET_HOUSE",
   },
-  exitWarp = { map = "SAFARI_ZONE_GATE", x = 4, y = 3, facing = "down" },
+  -- wDestinationWarpID $3 = warp_event 4,0 (data/maps/objects/SafariZoneGate.asm:12)
+  exitWarp = { map = "SAFARI_ZONE_GATE", x = 4, y = 0, facing = "down" },
 }
 
 -- home/overworld.asm LoadPlayerSpriteGraphics / LoadSurfingPlayerSprite-
@@ -134,6 +135,12 @@ FieldDefaults.FIELD = {
   lastMapRewrites = LAST_MAP_REWRITES,
   -- CheckIfInOutsideMap: what counts as "outside" for the wLastMap memory
   outsideTilesets = { "OVERWORLD", "PLATEAU" },
+  -- PlayMapChangeSound (home/overworld.asm:689-703)
+  -- of the cell being left; pokeyellow home/overworld.asm:667-671
+  mapChangeSound = {
+    doorTile = 0x0B,
+    exemptTilesets = { "FACILITY", "CEMETERY" },
+  },
   -- the Route 16/18 gate scripts `res BIT_ALWAYS_ON_BIKE` every frame
   forcedMovement = { clearMaps = { "ROUTE_16_GATE_1F", "ROUTE_18_GATE_1F" } },
   -- the one-shot flag the gate's pass text is gated on; a gate a mod adds

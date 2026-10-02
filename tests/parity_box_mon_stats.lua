@@ -24,6 +24,13 @@ local HudTiles = require("src.render.HudTiles")
 local DVS = { hp = 15, attack = 13, defense = 11, speed = 7, special = 5 }
 local STATEXP = { hp = 1200, attack = 900, defense = 400, speed = 0, special = 250 }
 
+-- home/overworld.asm:2016 (#1691)
+local stampMapWindow = loadfile("tests/fixture_data/map_window.lua")()
+local function stampAll(d)
+  for mapId in pairs((d or {}).maps or {}) do stampMapWindow(d, mapId) end
+end
+stampAll(Data)
+
 local function boxShapedMon(species, level, hp)
   return {
     species = species, level = level, exp = 1000,
@@ -259,7 +266,10 @@ do
     withdraw(game)
     check(captured ~= nil, "withdraw opened its box list")
     if captured then
-      eq(#captured.items, 1, "the list has the one box mon in it")
+      -- engine/menus/players_pc.asm: the list ends in CANCEL (#1847)
+      eq(#captured.items, 2, "the list has the one box mon in it, plus CANCEL")
+      check(captured.items[2] and captured.items[2].cancel,
+            "the last row is the CANCEL terminator")
       captured.opts.onChoose(captured.items[1],
                              { index = 1, close = function() end })
       eq(#save.boxes[1], 0, "the mon left the box")

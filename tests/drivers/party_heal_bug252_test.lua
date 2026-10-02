@@ -24,6 +24,10 @@ return function(game)
     return s ~= nil and (s.screenId == "PartyMenu" or getmetatable(s) == PartyMenu)
   end
   local function isBox(s) return getmetatable(s) == TextBox end
+  -- engine/menus/start_sub_menus.asm:414-416
+  local function isFlash(s)
+    return type(s) == "table" and s.t ~= nil and s.frames ~= nil
+  end
   local function inStack(pred)
     for _, s in ipairs(game.stack.states or {}) do
       if pred(s) then return true end
@@ -70,7 +74,7 @@ return function(game)
           type(extra) == "table" and extra.healedFrom == 3)
     check("...with the restored-HP message",
           type(msgs) == "table" and type(msgs[1]) == "string"
-          and msgs[1]:find("restored", 1, true) ~= nil)
+          and msgs[1]:find("recovered", 1, true) ~= nil)
     local _, _, cureExtra = ItemEffects.use(game.data, scratchSave,
                                             "ANTIDOTE", scratch)
     check("ANTIDOTE hands back no healedFrom (no fill)",
@@ -174,6 +178,9 @@ return function(game)
           isPicker(top()))
     check("the fill is running (picker.heal is set)",
           type(picker.heal) == "table")
+    -- engine/items/item_effects.asm:1209
+    check("the cursor is still drawn while the bar fills",
+          picker.cursorsErased ~= true)
     if type(picker.heal) == "table" then
       check("the fill starts from the pre-heal HP (wHPBarOldHP)",
             math.floor(picker.heal.shown + 0.5) == hpBefore)
@@ -224,6 +231,8 @@ return function(game)
     end
     check("the message box opened", isBox(top()))
     check("...over the STILL-drawn party menu", inStack(isPicker))
+    -- engine/items/item_effects.asm:1232 (#2062)
+    check("...with the menu cursor erased", picker.cursorsErased == true)
     U.wait(60) -- let the line type out, so the shot shows the text not an empty box
     U.shot(game, DIR .. "/bug252_message_over_party.png")
 
@@ -235,6 +244,13 @@ return function(game)
       U.wait(8)
     end
     check("the picker is gone once the message is dismissed", not inStack(isPicker))
+    local flashed = isFlash(top())
+    check("the return to the bag whites out (#2125)", flashed)
+    if flashed then U.shot(game, DIR .. "/bug2125_white.png") end
+    for _ = 1, 40 do
+      if not isFlash(top()) then break end
+      U.wait(1)
+    end
     local back = top()
     check("and we are back on the ITEM list", back ~= nil and back.screenId == "BagMenu")
     U.shot(game, DIR .. "/bug252_back_on_bag.png")

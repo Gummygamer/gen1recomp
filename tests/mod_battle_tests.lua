@@ -23,6 +23,7 @@ local MoveEffects = require("src.battle.MoveEffects")
 local Pokemon = require("src.pokemon.Pokemon")
 local Runtime = require("src.mods.Runtime")
 local SaveData = require("src.core.SaveData")
+local Schemas = require("src.mods.Schemas")
 local Status = require("src.battle.Status")
 local TrainerAI = require("src.battle.TrainerAI")
 local TurnOrder = require("src.battle.TurnOrder")
@@ -52,7 +53,8 @@ local function makeGame(party)
   function stack:pop() return table.remove(self.states) end
   function stack:top() return self.states[#self.states] end
   return { data = Data, save = save, stack = stack,
-           input = { wasPressed = function() return true end } }
+           input = { wasPressed = function() return true end,
+                     isDown = function() return true end } }
 end
 
 local function pump(battle, limit)
@@ -291,9 +293,8 @@ do
                  end },
                  stack = { pop = function() end } }
   local menu = OptionsMenu.new(game)
-  for i, row in ipairs(menu.rows) do
-    if row.id == "ruleset" then menu.index = i end
-  end
+  -- RULESET is in no group, so this focuses it on the top level.
+  check(menu:focusRow("ruleset") == menu, "RULESET focuses in place")
   local function press(key)
     pressed = { [key] = true }
     menu:update(1 / 60)
@@ -345,6 +346,35 @@ do
   check(BattleState.trainerPicPath(Data, { basePic = "OPP_ENGINEER" })
         == Data.trainers.OPP_ENGINEER.pic,
         "a custom trainer can reuse a base trainer portrait by id")
+  check(BattleState.trainerTrueColor(Data, { trueColor = true }) == true,
+        "a trainer record's trueColor flag is readable")
+  check(BattleState.trainerTrueColor(Data, { trueColor = false }) == false,
+        "explicit false stays false")
+  check(BattleState.trainerTrueColor(Data, { basePic = "OPP_ENGINEER" })
+        == false,
+        "a vanilla base portrait is not trueColor")
+  check(Schemas.check(Schemas.REGISTRIES.trainers, "trainers", "OPP_BROCK",
+                      { trueColor = true }, "patch"),
+        "a trueColor trainers patch validates against the catalog schema")
+  check(Schemas.check(Schemas.REGISTRIES.trainers, "trainers", "BEAUTY",
+                      { pic = "mods/x/beauty.png", trueColor = true },
+                      "patch", 2),
+        "a Gold trainers patch can carry pic and trueColor")
+  check(Schemas.check(Schemas.REGISTRIES.trainers, "trainers", "OPP_RIVAL1",
+                      { parties = { { { level = 70, species = "MEWTWO",
+                                        moves = { "PSYCHIC_M" } } } } },
+                      "patch"),
+        "a party slot's moves list validates against the catalog schema")
+  check(not Schemas.check(Schemas.REGISTRIES.trainers, "trainers", "OPP_RIVAL1",
+                          { parties = { { { level = 70, species = "MEWTWO",
+                                            moves = "PSYCHIC_M" } } } },
+                          "patch"),
+        "a party slot's moves must still be a list of move ids")
+  check(Schemas.check(Schemas.REGISTRIES.trainers, "trainers", "BEAUTY",
+                      { trainers = { { name = "GRACE", party = {
+                          { level = 20, species = "PIKACHU",
+                            moves = { "THUNDERSHOCK" } } } } } }, "patch", 2),
+        "the Gold party slot keeps its own moves list")
 end
 
 do
@@ -603,20 +633,40 @@ do
     local game = uiGame({ mon })
     Bag.add(game.save, "RARE_CANDY", 1)
     game.stack:push(BagMenu.new(game))
-    for _ = 1, 600 do
+    local pickerMessages = {}
+    for _ = 1, 1000 do
       local top = game.stack:top()
       if not top then break end
+      for _, s in ipairs(game.stack.states) do
+        if s.bottomMessage then
+          pickerMessages[s:bottomMessage()] = true
+        end
+      end
       pressed = { a = true }
       top:update(1)
       pressed = {}
     end
     check(game.stack:top() == nil, "the candy flow runs to completion")
-    return mon
+    return mon, pickerMessages
   end
 
-  local fed = candyFlow()
+  local fed, seenMessages = candyFlow()
   check(fed.level == 16, "the candy levels the mon")
   check(fed.species == "CHARMELEON", "the level evolution fires afterwards")
+
+  -- engine/items/item_effects.asm:1392-1394
+  local sawLevelText, sawMarker = false, false
+  for msg in pairs(seenMessages) do
+    if msg:find("grew", 1, true) and msg:find("level 16", 1, true) then
+      sawLevelText = true
+    end
+    if msg:find("{DONE}", 1, true) or msg:find("{PROMPT}", 1, true) then
+      sawMarker = true
+    end
+  end
+  check(sawLevelText, "the party picker's bottom box holds the level text")
+  check(not sawMarker,
+        "and no bottom message carries a {DONE}/{PROMPT} terminator")
 
   local unsub = hooks:wrap("evolution.check", function() return false end)
   local blocked = candyFlow()
@@ -716,6 +766,38 @@ do
   check(actBattle:enemyAction().hooked == true,
         "battle.enemy_action hook rewrites the choice")
   unsub()
+
+  -- engine/battle/core.asm:416,454
+  unsub = hooks:wrap("battle.enemy_action", function()
+    return { id = "TACKLE", pp = 1, hooked = true }
+  end)
+  local forcedGame = makeGame({ Pokemon.new(Data, "BULBASAUR", 20) })
+  local forcedBattle = BattleState.newTrainer(forcedGame, "OPP_BROCK", 1)
+  forcedBattle.rng = mkseq({})
+  forcedBattle.performMove = function() end
+  forcedBattle.enemy.mon.status = "PSN"
+  local forcedUses = forcedBattle.aiUses
+  check((forcedUses or 0) > 0, "the trainer battle seeds wAICount")
+  local forcedAction = forcedBattle:enemyAction()
+  check(forcedAction.hooked == true,
+        "battle.enemy_action hook rewrites a trainer's choice too")
+  forcedBattle:executeAction(forcedBattle.enemy, forcedBattle.player, forcedAction)
+  check(forcedBattle.enemy.mon.status == "PSN"
+        and forcedBattle.aiUses == forcedUses
+        and not hasText(forcedBattle, "FULL HEAL"),
+        "a hook-forced trainer action suppresses the class item roll")
+  unsub()
+
+  local rollGame = makeGame({ Pokemon.new(Data, "BULBASAUR", 20) })
+  local rollBattle = BattleState.newTrainer(rollGame, "OPP_BROCK", 1)
+  rollBattle.rng = mkseq({})
+  rollBattle.performMove = function() end
+  rollBattle.enemy.mon.status = "PSN"
+  local rollUses = rollBattle.aiUses
+  rollBattle:executeAction(rollBattle.enemy, rollBattle.player,
+                           rollBattle:enemyAction())
+  check(rollBattle.enemy.mon.status == nil and rollBattle.aiUses == rollUses - 1,
+        "with no hook the class item roll still fires at the enemy's slot")
 
   -- battle.catch_exp: vanilla catches never grant exp; a mod can flip that
   unsub = hooks:wrap("battle.catch_exp", function() return true end)

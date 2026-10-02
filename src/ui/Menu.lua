@@ -1,8 +1,8 @@
 -- Generic bordered list menu with the blinking ▶ cursor.
 -- items: { { label=..., onSelect=function }, ... }
--- Pops itself on B (unless cancelable=false); also on START only when
--- opts.startCloses is set -- pokered's wMenuWatchedKeys mask varies per
--- menu and only the start menu's adds PAD_START.
+-- Pops itself on B (unless cancelable=false or opts.keepOnCancel); also on
+-- START only when opts.startCloses is set -- pokered's wMenuWatchedKeys mask
+-- varies per menu and only the start menu's adds PAD_START.
 
 local Font = require("src.render.Font")
 local Theme = require("src.ui.Theme")
@@ -34,6 +34,11 @@ function Menu.new(game, items, opts)
     if self.tx + self.tw > 20 then self.tx = math.max(0, 20 - self.tw) end
   end
   self.rowStep = opts.rowStep or 2
+  -- home/window.asm:56-83
+  self.noWrap = opts.noWrap or false
+  -- engine/movie/oak_speech/oak_speech2.asm:162 (DisplayIntroNameTextBox)
+  self.title = opts.title
+  self.itemY = opts.itemY
   -- maxVisible: cap the box to this many rows and scroll the rest instead
   -- of growing past it (e.g. the start menu, whose row count varies with
   -- save state and mod hooks); nil/unset keeps every caller's old
@@ -54,6 +59,8 @@ function Menu.new(game, items, opts)
   -- classic centred letterbox
   self.anchor = opts.anchor
   self.onCancel = opts.onCancel
+  -- engine/events/cinnabar_lab.asm:70-73
+  self.keepOnCancel = opts.keepOnCancel or false
   -- BIT_NO_MENU_BUTTON_SOUND (wMiscFlags): the PC session runs its
   -- menus silent (home/window.asm HandleMenuInput_)
   self.noSound = opts.noSound or false
@@ -78,10 +85,14 @@ end
 
 function Menu:update(dt)
   local input = self.game.input
+  -- engine/events/cinnabar_lab.asm:29
+  if self.frozen then return end
   if input:wasPressed("up") then
-    self.index = self.index > 1 and self.index - 1 or #self.items
+    self.index = self.index > 1 and self.index - 1
+      or (self.noWrap and 1 or #self.items)
   elseif input:wasPressed("down") then
-    self.index = self.index < #self.items and self.index + 1 or 1
+    self.index = self.index < #self.items and self.index + 1
+      or (self.noWrap and #self.items or 1)
   elseif input:wasPressed("a") then
     -- HandleMenuInput_ (home/window.asm): SFX_PRESS_AB on every A press
     if not self.noSound then
@@ -100,7 +111,7 @@ function Menu:update(dt)
     if input:wasPressed("b") and not self.noSound then
       require("src.core.Sound").play(self.game.data, "Press_AB")
     end
-    self.game.stack:pop()
+    if not self.keepOnCancel then self.game.stack:pop() end
     if self.onCancel then self.onCancel() end
   end
   self:clampScroll()
@@ -116,7 +127,33 @@ function Menu:draw()
                   self.tw * 8, self.th * 8, self.anchor)
   end
   Font.drawBox(self.tx, self.ty, self.tw, self.th)
-  love.graphics.setColor(0, 0, 0, 1)
+  -- PlaceString at hlcoord 3,0 writes over the border row it was just
+  -- drawn on (oak_speech2.asm:162-170)
+  if self.title then
+    -- the title's lines and glyph counts, rebuilt only when it changes
+    -- (this draws every frame the menu is up)
+    local lines, glyphs = self.titleLines, self.titleGlyphs
+    if self.titleLinesFor ~= self.title or not lines then
+      local title = self.title:gsub("{DONE}%s*$", "")
+        :gsub("{PROMPT}%s*$", "")
+      lines, glyphs = {}, {}
+      for line in (title .. "\n"):gmatch("(.-)\n") do
+        lines[#lines + 1] = line
+        glyphs[#lines] = #Font.split(line)
+      end
+      self.titleLinesFor = self.title
+      self.titleLines, self.titleGlyphs = lines, glyphs
+    end
+    love.graphics.setColor(1, 1, 1, 1)
+    for i = 1, #lines do
+      love.graphics.rectangle("fill", (self.tx + 3) * 8,
+        (self.ty + i - 1) * 8, glyphs[i] * 8, 8)
+    end
+    love.graphics.setColor(0, 0, 0, 1)
+    for i, line in ipairs(lines) do
+      Font.draw(line, (self.tx + 3) * 8, (self.ty + i - 1) * 8)
+    end
+  end
   local visible = (self.maxVisible and math.min(self.maxVisible, #self.items))
     or #self.items
   -- Row Y: pokered's boxed menus anchor the choices to the BOTTOM interior
@@ -130,15 +167,21 @@ function Menu:draw()
   -- USE/TOSS is th = 5 for two choices (#284, matching text_boxes.asm's
   -- USE_TOSS_MENU_TEMPLATE rows 10..14), and a top anchor pushed TOSS onto
   -- the bottom border (#564, #572).
+  local function rowY(row)
+    if self.itemY then
+      return (self.ty + self.itemY + (row - 1) * self.rowStep) * 8
+    end
+    return (self.ty + self.th - 2 - (visible - row) * self.rowStep) * 8
+  end
   for row = 1, visible do
     local item = self.items[self.scroll + row]
     if not item then break end
-    Font.draw(item.label, (self.tx + 2) * 8,
-      (self.ty + self.th - 2 - (visible - row) * self.rowStep) * 8)
+    Font.draw(item.label, (self.tx + 2) * 8, rowY(row))
   end
-  local cursorRow = self.index - self.scroll
-  Font.drawCode(Theme.cursor, (self.tx + 1) * 8,
-    (self.ty + self.th - 2 - (visible - cursorRow) * self.rowStep) * 8)
+  -- hollowIndex: home/window.asm:198
+  Font.drawCode(self.hollowIndex == self.index
+                and Theme.cursorHollow or Theme.cursor,
+    (self.tx + 1) * 8, rowY(self.index - self.scroll))
   -- moreArrow ($EE): the same "more below" glyph OptionRows/ManagerState
   -- use, sat on the bottom border like TextBox's page-advance cursor.  It
   -- has to be the border row, not ty + th - 2: that is the last interior

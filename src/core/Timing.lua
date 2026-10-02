@@ -93,11 +93,16 @@ Timing.TRAINER_INTRO_SFX_GAP = 20
 
 Timing.BATTLE_START_SENDOUT = 40 -- engine/battle/core.asm:155-156
 Timing.MOVE_ANIM_PRE        = Timing.DELAY3 -- core.asm:6638 PlayMoveAnimation
+-- animations.asm:431-433 (pokeyellow animations.asm:445-446)
+Timing.MOVE_ANIM_OFF        = 30
 
 -- core.asm:3185-3186 (player) / :5587-5588 (enemy).  Reached when the move
 -- has 0 BP (core.asm:3145 -- every status move) or missed (:3158), so this
 -- beat is paid on a large fraction of all turns.
 Timing.MOVE_STATUS_OR_MISS = 30
+
+-- ../pokered/engine/battle/move_effects/substitute.asm:2-3
+Timing.SUBSTITUTE_ENTRY = 50
 
 -- PlayApplyingAttackAnimation's six types (AnimationTypePointerTable,
 -- engine/battle/animations.asm:490-524).  The two shake families are

@@ -69,6 +69,21 @@ do
   local n2, m2 = SaveData.slotSummary(nil)
   T.eq(n2, nil, "slotSummary of an empty slot has no name")
   T.eq(m2, nil, "slotSummary of an empty slot has no meta")
+
+  -- A Gen 2 (Gold) save stores playTime as a { hours, minutes, seconds,
+  -- frames } table, not a seconds count.  The launcher lists EVERY version's
+  -- slots, so a math.floor on that table crashed the whole launcher the moment
+  -- a Gold save existed -- and dropped its CONTINUE row.  slotSummary reads
+  -- both shapes now.
+  local gName, gMeta = SaveData.slotSummary({
+    player = { name = "GOLD" },
+    playTime = { hours = 3, minutes = 35, seconds = 40, frames = 45 },
+    pokedex = { owned = { CYNDAQUIL = true, PIDGEY = true } },
+  })
+  T.eq(gName, "GOLD", "slotSummary reads a Gen 2 save's name")
+  T.eq(gMeta.dexCount, 2, "and its dex count")
+  T.eq(gMeta.timeText, "3:35",
+    "and formats the Gen 2 { hours, minutes, seconds } playTime without crashing")
 end
 
 -- ---------------------------------------------- legacy migration happy path
@@ -283,6 +298,47 @@ do
 
   T.eq(SaveData.saveFilename("red"), "save.lua",
     "saveFilename still resolves the flat name with no slot in use")
+end
+
+-- ---------------------------------------------- returnToLauncher slot refresh
+-- In-process EXIT GAME (Android/iOS) keeps the process-wide slotsChecked
+-- cache.  Without refreshSlotResolution, a flat SAVE written after the
+-- launcher already resolved "no slots" stays invisible until cold start.
+
+do
+  local files = fresh()
+  T.eq(#SaveData.listSlots("red"), 0, "session starts with no slots resolved")
+
+  local save = SaveData.newGame()
+  save.player.name = "EXIT"
+  T.check(SaveData.save(save), "in-game SAVE writes the flat legacy file")
+  T.check(files["save.lua"] ~= nil, "flat save.lua exists")
+
+  T.eq(#SaveData.listSlots("red"), 0,
+    "without a refresh the cached 'no slots' answer sticks")
+  T.eq(files["saves/red/slot1.lua"], nil, "and migration has not run yet")
+
+  SaveData.setCart("nuzlocke", "abc")
+  SaveData.refreshSlotResolution("red")
+  T.eq(SaveData.getCart(), "nuzlocke",
+    "refreshSlotResolution leaves the active cart alone")
+
+  local slots = SaveData.listSlots("red")
+  T.eq(#slots, 1, "after refresh, listSlots migrates the flat save")
+  T.eq(slots[1].id, "slot1", "into slot1")
+  T.eq(slots[1].name, "EXIT", "with the saved player name")
+  T.eq(files["save.lua"], nil, "and removes the flat legacy file")
+  T.check(files["saves/red/slot1.lua"] ~= nil, "as saves/red/slot1.lua")
+end
+
+do
+  local main = assert(io.open("main.lua")):read("*a")
+  local body = main:match("local function returnToLauncher%(opts%)(.-)\nend\n")
+  T.check(body ~= nil, "main.lua still has returnToLauncher")
+  T.check(body:find("refreshSlotResolution%(currentVersion%)", 1, false) ~= nil,
+    "EXIT GAME refreshes only the version just left")
+  T.check(body:find("resetSlotState", 1, true) == nil,
+    "and does not call resetSlotState (that would clear cart/seal state)")
 end
 
 love.filesystem = realFS

@@ -1,11 +1,21 @@
--- The boot shell: the heart of the self-updater.  A fused build, before it
--- runs the game bundled inside it, looks in its save directory for a newer
--- payload (a downloaded gen1recomp-X.Y.Z.love), and if one is present and
--- runnable, mounts it over the bundled source and chainloads it -- so the
--- binary shipped once can keep updating the Lua it runs without a reinstall.
+-- The boot shell: the heart of the self-updater.  A build that carries a fixed
+-- engine, before it runs the game source it ships, looks in its save directory
+-- for a newer payload (a downloaded gen1recomp-X.Y.Z.love), and if one is
+-- present and runnable, mounts it over the bundled source and chainloads it --
+-- so the binary shipped once can keep updating the Lua it runs without a
+-- reinstall.
 --
--- Only a fused build self-updates.  A dev / source checkout IS the game, so
--- Boot.run is a no-op there.
+-- Two shapes of packaged build carry a fixed engine, and both self-update:
+--   * fused -- the game is an archive inside the executable, so LÖVE reports
+--     isFused() true (an AppImage, or the Flatpak's game.love file).
+--   * unpacked -- the executable is handed a *directory* of game source
+--     (`love <dir>`, which every PortMaster-style port does).  LÖVE reports
+--     isFused() false there, but the handoff below is still sound: the payload
+--     is prepend-mounted over the running source and the source on disk is
+--     never rewritten.
+-- What must not self-update is a dev / source checkout: it IS the game, its
+-- Version.engine is the "0.0.0-dev" placeholder, and its next launch already
+-- runs whatever is on disk.  Boot.run is a no-op there.  See docs/updater.md.
 --
 -- Three pieces, deliberately layered so the risky part is small and the
 -- decision part is testable:
@@ -80,14 +90,99 @@ local function purgeBundledModules()
   end
 end
 
--- Boot.probePayload(rel) -> { engine = string, minShell = number } | nil, err
+function Boot.saveArchivePath(rel)
+  local fs = love and love.filesystem
+  local save = fs and fs.getSaveDirectory and fs.getSaveDirectory()
+  if type(save) ~= "string" or save == "" or type(rel) ~= "string" then
+    return nil
+  end
+  rel = rel:gsub("\\", "/"):gsub("^/+", "")
+  local windows = love.system and love.system.getOS
+    and love.system.getOS() == "Windows"
+  local sep = windows and "\\" or "/"
+  if windows then
+    save = save:gsub("/", "\\")
+    rel = rel:gsub("/", "\\")
+  end
+  if save:sub(-1) ~= sep then save = save .. sep end
+  return save .. rel
+end
+
+local physfsMountFn, physfsUnmountFn
+
+local function resolvePhysfs()
+  if physfsMountFn ~= nil then return physfsMountFn and true or false end
+  physfsMountFn, physfsUnmountFn = false, false
+  local ok, ffi = pcall(require, "ffi")
+  if not ok then return false end
+  pcall(ffi.cdef, [[
+    int PHYSFS_mount(const char *newDir, const char *mountPoint, int appendToPath);
+    int PHYSFS_unmount(const char *oldDir);
+  ]])
+  local libs = {
+    function() return ffi.C end,
+    function() return ffi.load("love") end,
+  }
+  for _, getlib in ipairs(libs) do
+    local okl, lib = pcall(getlib)
+    if okl and lib then
+      local okm, mount = pcall(function() return lib.PHYSFS_mount end)
+      local oku, unmount = pcall(function() return lib.PHYSFS_unmount end)
+      if okm and mount and oku and unmount then
+        physfsMountFn = mount
+        physfsUnmountFn = unmount
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function mountArchive(rel, mountpoint, appendToPath)
+  local fs = love.filesystem
+  if fs.mount(rel, mountpoint, appendToPath) then
+    return { kind = "love", path = rel }
+  end
+  local abs = Boot.saveArchivePath(rel)
+  if not abs then return nil end
+  if type(Boot._directMount) == "function" then
+    if Boot._directMount(abs, mountpoint, appendToPath) then
+      return { kind = "physfs", path = abs }
+    end
+    return nil
+  end
+  if not resolvePhysfs() then return nil end
+  local okr, ret = pcall(physfsMountFn, abs, mountpoint or "/", appendToPath and 1 or 0)
+  if okr and ret ~= 0 then
+    return { kind = "physfs", path = abs }
+  end
+  return nil
+end
+
+local function unmountArchive(mounted)
+  if type(mounted) ~= "table" then return false end
+  if mounted.kind == "love" then
+    return love.filesystem.unmount(mounted.path) and true or false
+  end
+  if mounted.kind ~= "physfs" then return false end
+  if type(Boot._directUnmount) == "function" then
+    return Boot._directUnmount(mounted.path) and true or false
+  end
+  if not physfsUnmountFn then return false end
+  local okr, ret = pcall(physfsUnmountFn, mounted.path)
+  return okr and ret ~= 0
+end
+
+-- Boot.probePayload(rel)
+--   -> { engine = string, minShell = number, payloadHost = string } | nil, err
 --
 -- Mount the archive at rel (a save-directory-relative path) on an isolated
 -- mountpoint, read its src/core/Version.lua by executing the source with
 -- loadstring (NEVER require -- we must not cache or run it as a module), then
 -- unmount.  Version.lua is zero-require, so running its chunk is safe.
 function Boot.probePayload(rel)
-  if not love.filesystem.mount(rel, PROBE_MOUNT) then
+  local mounted = mountArchive(rel, PROBE_MOUNT, false)
+  if not mounted then
     return nil, "could not mount " .. tostring(rel)
   end
   local chunkPath = PROBE_MOUNT .. "/src/core/Version.lua"
@@ -98,30 +193,56 @@ function Boot.probePayload(rel)
     if not chunk then error("Version.lua would not compile", 0) end
     return chunk()
   end)
-  love.filesystem.unmount(rel)
+  unmountArchive(mounted)
   if not ok then return nil, tostring(result) end
   local v = result
   if type(v) ~= "table" or type(v.engine) ~= "string" then
     return nil, "payload has no usable Version table"
   end
-  return { engine = v.engine, minShell = tonumber(v.minShell) or 1 }
+  return {
+    engine = v.engine,
+    minShell = tonumber(v.minShell) or 1,
+    payloadHost = type(v.payloadHost) == "string" and v.payloadHost or "love",
+  }
 end
 
--- Boot.select(candidates, bundledEngine, bundledShell) -> chosen | nil, toDelete
+-- Pure host gate shared by boot selection and the download worker. Missing
+-- payloadHost fields mean "love" so payloads made before this contract remain
+-- compatible with ordinary LOVE packages.
+function Boot.canHost(info, bundledShell, bundledPayloadHost)
+  if type(info) ~= "table" then return false end
+  local payloadHost = type(info.payloadHost) == "string"
+    and info.payloadHost or "love"
+  local host = type(bundledPayloadHost) == "string"
+    and bundledPayloadHost or "love"
+  return payloadHost == host and (tonumber(info.minShell) or 1)
+    <= (tonumber(bundledShell) or 1)
+end
+
+local function samePayloadHost(info, bundledPayloadHost)
+  local payloadHost = type(info.payloadHost) == "string"
+    and info.payloadHost or "love"
+  local host = type(bundledPayloadHost) == "string"
+    and bundledPayloadHost or "love"
+  return payloadHost == host
+end
+
+-- Boot.select(candidates, bundledEngine, bundledShell, bundledPayloadHost)
+--   -> chosen | nil, toDelete
 --
 -- Pure (no love.*): decide which payload to run and which to delete.
--- candidates is a list of { name = , engine = , minShell = }.
+-- candidates is a list of { name = , engine = , minShell = , payloadHost = }.
 --   * chosen: the highest engine that is STRICTLY newer than bundledEngine and
---     whose minShell <= bundledShell (a payload the running shell can host).
+--     whose payloadHost matches and minShell <= bundledShell.
 --   * toDelete: stale payloads -- engine <= bundled (old or the same as what we
 --     already ship), or superseded by the chosen one (not newer than chosen).
---     A payload newer than the chosen one but unrunnable here (minShell too
---     high) is kept: a future shell upgrade may be able to run it.
-function Boot.select(candidates, bundledEngine, bundledShell)
+--     A newer incompatible payload is kept: a matching host or future shell
+--     may be able to run it.
+function Boot.select(candidates, bundledEngine, bundledShell, bundledPayloadHost)
   local chosen
   for _, c in ipairs(candidates) do
     local newer = Semver.compare(c.engine, bundledEngine) > 0
-    local runnable = (c.minShell or 1) <= bundledShell
+    local runnable = Boot.canHost(c, bundledShell, bundledPayloadHost)
     if newer and runnable then
       if not chosen or Semver.compare(c.engine, chosen.engine) > 0 then
         chosen = c
@@ -132,15 +253,34 @@ function Boot.select(candidates, bundledEngine, bundledShell)
   local toDelete = {}
   for _, c in ipairs(candidates) do
     if not (chosen and c.name == chosen.name) then
-      local stale = Semver.compare(c.engine, bundledEngine) <= 0
-      if chosen and Semver.compare(c.engine, chosen.engine) <= 0 then
-        stale = true
+      local stale = false
+      -- Never clean up another host family's payloads. A shared save directory
+      -- may be opened by multiple native packages, and only the matching host
+      -- can decide whether one of its own archives is stale.
+      if samePayloadHost(c, bundledPayloadHost) then
+        stale = Semver.compare(c.engine, bundledEngine) <= 0
+        if chosen and Semver.compare(c.engine, chosen.engine) <= 0 then
+          stale = true
+        end
       end
       if stale then toDelete[#toDelete + 1] = c.name end
     end
   end
 
   return chosen and chosen.name or nil, toDelete
+end
+
+local function badMarker(name)
+  return PAYLOAD_DIR .. "/" .. name .. ".bad"
+end
+
+local function markBad(name, err)
+  love.filesystem.createDirectory(PAYLOAD_DIR)
+  love.filesystem.write(badMarker(name), tostring(err))
+end
+
+function Boot.isBad(name)
+  return love.filesystem.getInfo(badMarker(name)) ~= nil
 end
 
 -- Mount the chosen payload and hand control to it.  Returns true when the
@@ -155,7 +295,8 @@ local function chainload(name, args)
 
   -- Prepend-mount the payload at "/" (appendToPath = false) so its files win
   -- over the fused source for every subsequent require / love.filesystem read.
-  if not love.filesystem.mount(rel, "/", false) then
+  local mounted = mountArchive(rel, "/", false)
+  if not mounted then
     love.filesystem.remove(PENDING)
     return false
   end
@@ -181,11 +322,13 @@ local function chainload(name, args)
     -- Delete the payload too: it failed deterministically once, so leaving it
     -- would re-select and re-fail it on every boot forever.
     print("update: payload handoff failed, reverting to bundled: " .. tostring(err))
+    pcall(love.filesystem.append, PAYLOAD_DIR .. "/handoff.log",
+      name .. ": " .. tostring(err) .. "\n")
     _G.POKEPORT_PAYLOAD_MOUNTED = nil
-    pcall(love.filesystem.unmount, rel)
+    pcall(unmountArchive, mounted)
     purgeBundledModules()
     restoreCallbacks(snapshot)
-    love.filesystem.remove(rel)
+    if not love.filesystem.remove(rel) then markBad(name, err) end
     love.filesystem.remove(PENDING)
     return false
   end
@@ -207,7 +350,9 @@ local function runInner(args)
   if pending then
     pending = pending:gsub("%s+$", "")
     if pending ~= "" then
-      love.filesystem.remove(PAYLOAD_DIR .. "/" .. pending)
+      if not love.filesystem.remove(PAYLOAD_DIR .. "/" .. pending) then
+        markBad(pending, "crash during handoff")
+      end
     end
     love.filesystem.remove(PENDING)
   end
@@ -216,13 +361,14 @@ local function runInner(args)
   local candidates = {}
   if love.filesystem.getInfo(PAYLOAD_DIR, "directory") then
     for _, entry in ipairs(love.filesystem.getDirectoryItems(PAYLOAD_DIR)) do
-      if isPayloadName(entry) then
+      if isPayloadName(entry) and not Boot.isBad(entry) then
         local info = Boot.probePayload(PAYLOAD_DIR .. "/" .. entry)
         if info then
           candidates[#candidates + 1] = {
             name = entry,
             engine = info.engine,
             minShell = info.minShell,
+            payloadHost = info.payloadHost,
           }
         end
       end
@@ -230,7 +376,8 @@ local function runInner(args)
   end
 
   local Version = require("src.core.Version")
-  local chosen, toDelete = Boot.select(candidates, Version.engine, Version.shell)
+  local chosen, toDelete = Boot.select(candidates, Version.engine,
+    Version.shell, Version.payloadHost)
 
   for _, victim in ipairs(toDelete) do
     love.filesystem.remove(PAYLOAD_DIR .. "/" .. victim)
@@ -240,6 +387,24 @@ local function runInner(args)
   return chainload(chosen, args)
 end
 
+-- Boot.canUpdateInPlace() -> boolean
+--
+-- May this build hand off to a downloaded payload?  True for a packaged build
+-- (fused or unpacked -- see the header), false for a dev / source checkout, and
+-- false whenever that cannot be established: the gate must never open by
+-- accident.  Boot.run and Prelaunch.updateAllowed both ask this one function,
+-- so the boot gate and the --update gate cannot disagree.
+function Boot.canUpdateInPlace()
+  local fs = love and love.filesystem
+  if not fs then return false end
+  if fs.isFused and fs.isFused() then return true end
+  local ok, Version = pcall(require, "src.core.Version")
+  if not ok or type(Version) ~= "table" or type(Version.isDev) ~= "function" then
+    return false
+  end
+  return not Version.isDev()
+end
+
 -- Boot.run(args) -> boolean
 --
 -- The first line of love.load.  True means a payload was mounted and
@@ -247,7 +412,7 @@ end
 -- bundled game as normal.
 function Boot.run(args)
   -- Dev / source checkouts never self-update.
-  if not (love.filesystem.isFused and love.filesystem.isFused()) then
+  if not Boot.canUpdateInPlace() then
     return false
   end
   -- Switch (and any host without validated network): never probe payloads.

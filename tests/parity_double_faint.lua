@@ -22,6 +22,7 @@
 package.path = "./?.lua;./?/init.lua;" .. package.path
 if not _G.love then _G.love = require("tests.love_stub") end
 local BattleState = require("src.battle.BattleState")
+local Runtime = require("src.mods.Runtime")
 local S = require("tests.harness").suite("parity double faint")
 local check, eq = S.check, S.eq
 
@@ -33,7 +34,8 @@ local function battleWith(partyHP, result)
   for i, hp in ipairs(partyHP) do
     party[i] = { species = "SQUIRTLE", hp = hp, stats = { hp = 20 } }
   end
-  return {
+  -- the metatable so playerMonFainted can reach playerPartyView
+  return setmetatable({
     kind = "wild",
     result = result,
     afterQueue = nil,
@@ -42,9 +44,17 @@ local function battleWith(partyHP, result)
     data = { text = { _UseNextMonText = "Use next POKéMON?" } },
     game = { save = { party = party, player = { name = "RED" } } },
     sayNext = function(self, m) self.said[#self.said + 1] = m end,
-    say = function(self, m) self.said[#self.said + 1] = m end,
-    ui = function() end,
-  }
+    rows = {},
+    say = function(self, m)
+      self.said[#self.said + 1] = m
+      self.rows[#self.rows + 1] = { kind = "say", text = m }
+    end,
+    sayChoice = function(self, m, fn, opts)
+      self.said[#self.said + 1] = m
+      self.rows[#self.rows + 1] = { kind = "choice", text = m, fn = fn, opts = opts }
+    end,
+    ui = function(self) self.rows[#self.rows + 1] = { kind = "ui" } end,
+  }, BattleState)
 end
 
 local function saidBlackout(b)
@@ -104,6 +114,28 @@ do
   BattleState.playerMonFainted(b)
   eq(b.result, nil, "a faint with reserves left does not decide the battle")
   check(not saidBlackout(b), "and does not black out")
+  eq(#b.rows, 1, "the prompt is a single queue row, no trailing ui row")
+  eq(b.rows[1].kind, "choice", "Use next POKéMON? is a done-tail choice row")
+  eq(b.rows[1].text, "Use next POKéMON?", "the choice row carries the prompt text")
+  eq(b.rows[1].opts.box.tx, 13, "YES/NO sits at hlcoord 13, 9 (x)")
+  eq(b.rows[1].opts.box.ty, 9, "YES/NO sits at hlcoord 13, 9 (y)")
+end
+
+-- enemyMonFainted is also a native authority path used by move effects.  A
+-- field-residual hook must not change what that path does when no hook is
+-- installed, even if both active mons are already at zero HP.
+do
+  Runtime.reset()
+  local b = battleWith({ 0 }, nil)
+  b.player = { mon = b.game.save.party[1] }
+  b.enemy = { mon = { hp = 0 } }
+  b.awards = 0
+  b.awardExp = function(self) self.awards = self.awards + 1 end
+  BattleState.enemyMonFainted(b)
+  eq(b.awards, 1,
+    "no-hook simultaneous faint still enters native enemy EXP authority")
+  eq(b.result, "win",
+    "no-hook simultaneous faint preserves native enemy-faint resolution")
 end
 
 S.finish()

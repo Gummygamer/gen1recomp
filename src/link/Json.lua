@@ -4,6 +4,8 @@
 
 local Json = {}
 
+Json.MAX_DEPTH = 64
+
 local function encodeValue(v, out)
   local t = type(v)
   if v == nil then
@@ -109,7 +111,9 @@ local function decodeString(s, i)
   error("unterminated string")
 end
 
-decodeValue = function(s, i)
+decodeValue = function(s, i, depth)
+  depth = (depth or 0) + 1
+  assert(depth <= Json.MAX_DEPTH, "json nested too deeply")
   i = skipWs(s, i)
   local c = s:sub(i, i)
   if c == '"' then
@@ -124,7 +128,7 @@ decodeValue = function(s, i)
       i = skipWs(s, i)
       assert(s:sub(i, i) == ":", "expected :")
       local val
-      val, i = decodeValue(s, i + 1)
+      val, i = decodeValue(s, i + 1, depth)
       obj[key] = val
       i = skipWs(s, i)
       local d = s:sub(i, i)
@@ -138,7 +142,7 @@ decodeValue = function(s, i)
     if s:sub(i, i) == "]" then return arr, i + 1 end
     while true do
       local val
-      val, i = decodeValue(s, i)
+      val, i = decodeValue(s, i, depth)
       arr[#arr + 1] = val
       i = skipWs(s, i)
       local d = s:sub(i, i)
@@ -162,13 +166,39 @@ decodeValue = function(s, i)
   end
 end
 
-function Json.decode(s)
+function Json.decode(s, maxLength)
+  if type(s) ~= "string" then return nil, "json input is not a string" end
+  if maxLength and #s > maxLength then
+    return nil, ("json input is %d bytes (max %d)"):format(#s, maxLength)
+  end
   local ok, v = pcall(function()
-    local val = select(1, decodeValue(s, 1))
+    local val = select(1, decodeValue(s, 1, 0))
     return val
   end)
   if ok then return v end
   return nil, v
+end
+
+-- For an HTTP response that was meant to carry JSON but did not.  Returns nil
+-- when `s` starts like a JSON object or array (the only shapes the update and
+-- index endpoints publish), otherwise a short message naming what the server
+-- actually sent -- so callers surface "the response was an HTML page/plain
+-- text, not JSON (it starts with ...)" instead of leaking the decoder's
+-- low-level "unexpected character 'E'" assert at the first byte of an error
+-- page or plain-text outage message.
+function Json.describeUnexpected(s)
+  if type(s) ~= "string" then
+    return "the response had no body to decode"
+  end
+  local first = s:match("^%s*(.)")
+  if first == "{" or first == "[" then return nil end
+  local preview = s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  if preview == "" then
+    return "the response was empty, not JSON"
+  end
+  if #preview > 60 then preview = preview:sub(1, 57) .. "..." end
+  local kind = (first == "<") and "an HTML page" or "plain text"
+  return ("the response was %s, not JSON (it starts with %q)"):format(kind, preview)
 end
 
 return Json

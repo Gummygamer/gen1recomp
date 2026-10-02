@@ -26,6 +26,7 @@ function State.new()
     -- App.load's opts; nil in a bare `love . --editor` run.
     version = nil,
     slotId = nil,
+    modRoots = nil,
     -- Hosted inside the launcher process (Edit on a save row) rather than a
     -- standalone `--editor` window: Close returns to the launcher instead of
     -- quitting, and App calls onClose() to do it.
@@ -43,12 +44,25 @@ function State.new()
     partyOffset = 0,       -- roster scroll position (#715)
     inspectorScroll = 0,   -- MonEditor body pixel scroll (#715)
     editingMon = nil,   -- reference into party or a box
+    nicknameDraft = nil,    -- text being typed in the inspector's nickname field
+    nicknameMon = nil,      -- the mon the draft belongs to (nil for none)
     -- species picker overlay: nil when closed, otherwise { query, offset }
     -- plus mode = "box-add" when it is adding to a box instead of changing a
     -- species (Ops.openBoxAddPicker).  Modal in the literal sense -- App
     -- shields every widget under it for the frame -- because Kit hit-tests
     -- without a z-order (#541).
     speciesPicker = nil,
+
+    -- move picker overlay: nil when closed, otherwise
+    -- { query, offset, slot = 1..4 }.  Same modal contract as speciesPicker;
+    -- the inspector opens it instead of cycling the catalog one tap at a time.
+    movePicker = nil,
+
+    -- item picker overlay: nil when closed, otherwise
+    -- { query, offset, dest = "bag"|"pc" }.  Same modal contract as
+    -- speciesPicker above -- adding an item is now a full-screen picker
+    -- rather than a card competing for height inside the Items tab.
+    itemPicker = nil,
 
     -- boxes
     selectedBox = 1,
@@ -63,6 +77,7 @@ function State.new()
     itemPickOffset = 0, -- scroll position in the ADD ITEM list (#595)
     bagOffset = 0,
     pcOffset = 0,
+    pcSort = "index",
     itemsScroll = 0,    -- stacked-layout pixel scroll (#715)
 
     -- events
@@ -71,6 +86,7 @@ function State.new()
     eventsOffset = 0,
 
     -- dex
+    dexSort = "dex",  -- how the DEX grid is ordered: "dex" (by number) | "name" (A-Z)
     dexOffset = 0,
 
     -- map

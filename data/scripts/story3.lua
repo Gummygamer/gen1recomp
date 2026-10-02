@@ -2,6 +2,8 @@
 -- ghost, elevators, the Game Corner coins/prizes, the SS Anne departure
 -- and the Hall of Fame record.  Each cites its pokered source.
 
+local Runtime = require("src.mods.Runtime")
+
 local M = {}
 
 -- -------------------------------------------------------------------
@@ -9,20 +11,31 @@ local M = {}
 -- FuchsiaGoodRodHouse.asm, Route12SuperRodHouse.asm)
 -- -------------------------------------------------------------------
 
-local function rodGiver(askText, receivedText, afterText, rodItem, flag)
-  return {
-    { "face_player" },                -- 1
-    { "check_flag", flag },           -- 2
-    { "jump_if_true", 9 },            -- 3
-    { "ask", askText },               -- 4
-    { "jump_if_false", 10 },          -- 5
+-- refusedText is the .ThatsSoDisappointingText tail on NO; followText is
+-- the second half of the received chain (scripts/VermilionOldRodHouse.asm:45)
+local function rodGiver(askText, receivedText, afterText, rodItem, flag,
+                        refusedText, followText)
+  local rows = {
+    { "face_player" },
+    { "check_flag", flag },
+    { "jump_if_true", "already_got" },
+    { "ask", askText },
+    { "jump_if_false", "refused" },
     -- give-then-print like the three rod-house scripts (GiveItem fills
     -- wStringBuffer; the received texts read OLD/GOOD/SUPER ROD from it)
-    { "give_item", rodItem, 1, false },  -- 6
-    { "show_text", receivedText },       -- 7
-    { "set_flag", flag },             -- 8
-    { "jump", 10 },                   -- 9 is below
+    -- scripts/VermilionOldRodHouse.asm:44
+    { "give_item", rodItem, 1, false, false, "Get_Item1" },
+    { "set_flag", flag },
+    { "show_text", receivedText },
   }
+  if followText then rows[#rows + 1] = { "show_text", followText } end
+  rows[#rows + 1] = { "jump", "end" }
+  rows[#rows + 1] = { "label", "refused" }
+  rows[#rows + 1] = { "show_text", refusedText }
+  rows[#rows + 1] = { "jump", "end" }
+  rows[#rows + 1] = { "label", "already_got" }
+  rows[#rows + 1] = { "show_text", afterText }
+  return rows
 end
 
 M.VERMILION_OLD_ROD_HOUSE = {
@@ -31,11 +44,11 @@ M.VERMILION_OLD_ROD_HOUSE = {
       "_VermilionOldRodHouseFishingGuruDoYouLikeToFishText",
       "_VermilionOldRodHouseFishingGuruTakeThisText",
       "_VermilionOldRodHouseFishingGuruHowAreTheFishBitingText",
-      "OLD_ROD", "EVENT_GOT_OLD_ROD"),
+      "OLD_ROD", "EVENT_GOT_OLD_ROD",
+      "_VermilionOldRodHouseFishingGuruThatsSoDisappointingText",
+      "_VermilionOldRodHouseFishingGuruFishingIsAWayOfLifeText"),
   },
 }
-M.VERMILION_OLD_ROD_HOUSE.talk.TEXT_VERMILIONOLDRODHOUSE_FISHING_GURU[9] =
-  { "show_text", "_VermilionOldRodHouseFishingGuruHowAreTheFishBitingText" }
 
 M.FUCHSIA_GOOD_ROD_HOUSE = {
   talk = {
@@ -43,11 +56,10 @@ M.FUCHSIA_GOOD_ROD_HOUSE = {
       "_FuchsiaGoodRodHouseFishingGuruText",
       "_FuchsiaGoodRodHouseFishingGuruReceivedGoodRodText",
       "_FuchsiaGoodRodHouseFishingGuruHowAreTheFishText",
-      "GOOD_ROD", "EVENT_GOT_GOOD_ROD"),
+      "GOOD_ROD", "EVENT_GOT_GOOD_ROD",
+      "_FuchsiaGoodRodHouseFishingGuruThatsSoDisappointingText"),
   },
 }
-M.FUCHSIA_GOOD_ROD_HOUSE.talk.TEXT_FUCHSIAGOODRODHOUSE_FISHING_GURU[9] =
-  { "show_text", "_FuchsiaGoodRodHouseFishingGuruHowAreTheFishText" }
 
 M.ROUTE_12_SUPER_ROD_HOUSE = {
   talk = {
@@ -55,11 +67,11 @@ M.ROUTE_12_SUPER_ROD_HOUSE = {
       "_Route12SuperRodHouseFishingGuruDoYouLikeToFishText",
       "_Route12SuperRodHouseFishingGuruReceivedSuperRodText",
       "_Route12SuperRodHouseFishingGuruTryFishingText",
-      "SUPER_ROD", "EVENT_GOT_SUPER_ROD"),
+      "SUPER_ROD", "EVENT_GOT_SUPER_ROD",
+      "_Route12SuperRodHouseFishingGuruThatsDisappointingText",
+      "_Route12SuperRodHouseFishingGuruFishingWayOfLifeText"),
   },
 }
-M.ROUTE_12_SUPER_ROD_HOUSE.talk.TEXT_ROUTE12SUPERRODHOUSE_FISHING_GURU[9] =
-  { "show_text", "_Route12SuperRodHouseFishingGuruTryFishingText" }
 
 -- -------------------------------------------------------------------
 -- Pokemon Tower 5F purified zone (scripts/PokemonTower5F.asm
@@ -151,18 +163,35 @@ M.POKEMON_TOWER_6F = {
         -- trick, and the speedrun route this bot follows depends on it.
         if result == "win" or battle.pokeDollEscape then
           game.save.flags.EVENT_BEAT_GHOST_MAROWAK = true
-          game.stack:push(TextBox.new(game,
-            t._PokemonTower6FSoulWasCalmedText
-            or "The mother's soul\nwas calmed.\012It departed to\nthe afterlife!"))
+          -- PokemonTower6FMarowakDepartedText (scripts/PokemonTower6F.asm)
+          -- is two texts, not one: the CUBONE's-mother line first, then
+          -- PlayCry RESTLESS_SOUL (EQU MAROWAK, constants/pokemon_constants
+          -- .asm:209) + WaitForSoundToFinish + DelayFrames 30 before the
+          -- calmed line; the port dropped the first text and the cry
+          -- (#867).  text/PokemonTower6F.asm:1-5 (#1849)
+          local rows = {
+            { "play_cry", "MAROWAK" },
+            { "show_text", t._PokemonTower6FGhostWasCubonesMotherText
+              or "The GHOST was the\nrestless soul of\vCUBONE's mother!" },
+            { "wait", 30 },
+            { "show_text", t._PokemonTower6FSoulWasCalmedText
+              or "The mother's soul\nwas calmed.\012It departed to\nthe afterlife!" },
+          }
+          if ow.runner then
+            ow.runner:run(rows)
+          elseif ow.queueScript then
+            ow:queueScript(rows)
+          end
         elseif result ~= "lose" then
           -- .did_not_defeat: one simulated step right, off the trigger,
           -- so fleeing does not leave you standing on a cell that
           -- immediately re-fires.
-          ow:scriptMove(ow.player, "right", 1)
+          ow:scriptMove(ow.player, "right", 1, nil, { collide = true })
         end
         ow:afterBattle(result, battle)
       end
-      game.stack:push(battle)
+      -- InitWildBattle runs the wipe before the disguise (core.asm:6695-6702)
+      ow:pushBattle(battle)
     end))
     return true
   end,
@@ -278,30 +307,50 @@ local function elevator(elevatorMapId, panelText, keyGate, preFrames)
     for _, f in ipairs(floors) do
       table.insert(items, { label = f.token, value = f })
     end
-    local ListMenu = require("src.ui.ListMenu")
-    game.stack:push(ListMenu.new(game, "WHICH FLOOR?", items, {
-      onChoose = function(item, list)
-        list:close()
-        -- the whole ShakeElevator ride runs in place -- music stop, 100
-        -- collision-thud scroll bounces, the PA chime -- and only then
-        -- does .UpdateWarp's rewrite land, with the player still stood
-        -- at the panel: they walk out to the car door themselves
-        local ElevatorShake = require("src.world.ElevatorShake")
-        game.stack:push(ElevatorShake.new(game, ow, {
-          preFrames = preFrames,
-          onDone = function()
-            elevatorSetExit(ow, item.value)
+    -- (home/list_menu.asm:105-110, 371-372, 524-525)
+    local Strings = require("src.core.Strings")
+    items[#items + 1] = { cancel = true, label = Strings("CANCEL") }
+    -- (engine/events/elevator.asm:2-3, data/text_boxes.asm:13)
+    local prompt
+    local function closePrompt()
+      if prompt and game.stack:top() == prompt then game.stack:pop() end
+      prompt = nil
+    end
+    local function openList()
+      local ListMenu = require("src.ui.ListMenu")
+      game.stack:push(ListMenu.new(game, nil, items, {
+        kind = "elevator_floors",
+        itemBox = true,
+        onChoose = function(item, list)
+          list:close()
+          closePrompt()
+          if item.cancel then
             done()
-          end,
-        }))
-      end,
-      onCancel = function()
-        -- DisplayElevatorFloorMenu: `ret c` on B -- no warp, nothing
-        -- happens, the player just stays in the car (exit warps were
-        -- already seeded on entry)
-        done()
-      end,
-    }))
+            return
+          end
+          local ElevatorShake = require("src.world.ElevatorShake")
+          game.stack:push(ElevatorShake.new(game, ow, {
+            preFrames = preFrames,
+            onDone = function()
+              elevatorSetExit(ow, item.value)
+              done()
+            end,
+          }))
+        end,
+        onCancel = function()
+          closePrompt()
+          done()
+        end,
+      }))
+    end
+    local TextBox = require("src.render.TextBox")
+    prompt = TextBox.new(game,
+      game.data.text._WhichFloorText or "Which floor do\nyou want? ", nil, {
+        -- pokeyellow/engine/events/elevator.asm:1-8 sets BIT_NO_TEXT_DELAY
+        instant = require("src.core.GameVersion").isYellow(),
+        stay = { onShown = openList },
+      })
+    game.stack:push(prompt)
   end
   return {
     -- fromMapId: the floor the player just left (setMap passes it), so a
@@ -334,7 +383,27 @@ M.ROCKET_HIDEOUT_ELEVATOR = elevator("ROCKET_HIDEOUT_ELEVATOR",
 --   after the hope-we-meet-again line (TOGGLE_ROCKET_HIDEOUT_B4F_ITEM_4).
 -- -------------------------------------------------------------------
 
+-- pokeyellow/scripts/RocketHideoutB4F.asm:401
+local function dropLiftKey(game, ow)
+  if game.save.flags.EVENT_ROCKET_DROPPED_LIFT_KEY then return end
+  game.save.flags.EVENT_ROCKET_DROPPED_LIFT_KEY = true
+  require("src.script.Commands").show_object(
+    { game = game, save = game.save, overworld = ow },
+    "ROCKET_HIDEOUT_B4F", "ROCKETHIDEOUTB4F_LIFT_KEY")
+end
+
+-- pokeyellow/scripts/RocketHideoutB4F.asm:308
+local function liftKeyGruntBeaten(save)
+  if save.flags.EVENT_BEAT_ROCKET_HIDEOUT_4_TRAINER_2 then return true end
+  return (save.defeatedTrainers or {})["ROCKET_HIDEOUT_B4F_obj_4"] == true
+end
+
 M.ROCKET_HIDEOUT_B4F = {
+  -- (home/trainers.asm:341, pokeyellow/scripts/RocketHideoutB4F.asm:401)
+  onVictory = function(game, ow)
+    if not require("src.core.GameVersion").isYellow() then return end
+    if liftKeyGruntBeaten(game.save) then dropLiftKey(game, ow) end
+  end,
   talk = {
     TEXT_ROCKETHIDEOUTB4F_ROCKET3 = function(game, ow, npc, done)
       if not ow:trainerDefeated(npc) then
@@ -373,23 +442,17 @@ M.ROCKET_HIDEOUT_B4F = {
         ow:engageTrainer(npc, function()
           -- engageTrainer records the win before it calls back, so this
           -- is the end-battle text's SetEvent + ShowObject
-          if ow:trainerDefeated(npc)
-             and not game.save.flags.EVENT_ROCKET_DROPPED_LIFT_KEY then
-            game.save.flags.EVENT_ROCKET_DROPPED_LIFT_KEY = true
-            local Commands = require("src.script.Commands")
-            Commands.show_object(
-              { game = game, save = game.save, overworld = ow },
-              "ROCKET_HIDEOUT_B4F", "ROCKETHIDEOUTB4F_LIFT_KEY")
-          end
+          if ow:trainerDefeated(npc) then dropLiftKey(game, ow) end
           done()
         end)
         return
       end
-      -- RocketHideoutB4FRocketAfterBattleText: later talks only reprint
+      -- pokered/scripts/RocketHideoutB4F.asm:193 (#2277)
       local TextBox = require("src.render.TextBox")
       game.stack:push(TextBox.new(game,
         game.data.text._RocketHideoutB4FRocketAfterBattleText
-        or "Oh no! I dropped\nthe LIFT KEY!", done))
+        or "Oh no! I dropped\nthe LIFT KEY!",
+        function() dropLiftKey(game, ow); done() end))
     end,
 
     TEXT_ROCKETHIDEOUTB4F_GIOVANNI = function(game, ow, npc, done)
@@ -413,7 +476,12 @@ M.ROCKET_HIDEOUT_B4F = {
       local hope = t._RocketHideoutB4FGiovanniHopeWeMeetAgainText
                    or "I hope we meet\nagain..."
       game.stack:push(TextBox.new(game, impressed, function()
+        -- home/text_script.asm:112-120
+        if npc.origFacing then npc.facing = npc.origFacing end
         local battle = BattleState.newTrainer(game, "OPP_GIOVANNI", 1)
+        -- SaveEndBattleTextPointers (scripts/RocketHideoutB4F.asm:99-120):
+        -- PrintEndBattleText prints it on the battle screen (#1817)
+        battle.endBattleText = TextBox.substitute(game, cannotBe)
         battle.onFinish = function(result)
           if result ~= "win" then
             ow:afterBattle(result, battle)
@@ -422,27 +490,28 @@ M.ROCKET_HIDEOUT_B4F = {
           end
           game.save.defeatedTrainers[npc.id] = true
           game.save.flags.EVENT_BEAT_ROCKET_HIDEOUT_GIOVANNI = true
-          -- End-battle "WHAT!" then BeatGiovanniScript's hope text,
-          -- fade, HideObject Giovanni, ShowObject Silph Scope.
-          game.stack:push(TextBox.new(game, cannotBe, function()
-            game.stack:push(TextBox.new(game, hope, function()
-              local Transition = require("src.render.Transition")
-              game.stack:push(Transition.new(game, function()
-                local Commands = require("src.script.Commands")
-                local ctx = { game = game, save = game.save, overworld = ow }
-                Commands.hide_object(ctx, "ROCKET_HIDEOUT_B4F",
-                  "ROCKETHIDEOUTB4F_GIOVANNI")
-                Commands.show_object(ctx, "ROCKET_HIDEOUT_B4F",
-                  "ROCKETHIDEOUTB4F_SILPH_SCOPE")
-              end, function()
-                ow:afterBattle(result, battle)
-                done()
-              end))
+          -- BeatGiovanniScript (scripts/RocketHideoutB4F.asm)
+          game.stack:push(TextBox.new(game, hope, function()
+            local Transition = require("src.render.Transition")
+            game.stack:push(Transition.new(game, function()
+              local Commands = require("src.script.Commands")
+              local ctx = { game = game, save = game.save, overworld = ow }
+              Commands.hide_object(ctx, "ROCKET_HIDEOUT_B4F",
+                "ROCKETHIDEOUTB4F_GIOVANNI")
+              Commands.show_object(ctx, "ROCKET_HIDEOUT_B4F",
+                "ROCKETHIDEOUTB4F_SILPH_SCOPE")
+            end, function()
+              ow:afterBattle(result, battle)
+              done()
             end))
           end))
         end
-        ow:pushBattle(battle)
-      end))
+        -- engine/battle/battle_transitions.asm:11-46
+        ow:pushBattle(battle, npc)
+      end, TextBox.soundOpts(game, function()
+        -- scripts/RocketHideoutB4F.asm:113; home/trainers.asm:339
+        ow:playTrainerMusic("OPP_GIOVANNI")
+      end)))
     end,
   },
 }
@@ -517,6 +586,14 @@ M.GAME_CORNER = {
         done()
         return
       end
+      -- GameCornerRocketText hands the battle its own loss line through
+      -- SaveEndBattleTextPointers (.BattleEndText ->
+      -- _GameCornerRocketBattleEndText, "Dang!"), and PrintEndBattleText
+      -- prints it ON the battle screen between TrainerDefeatedText and
+      -- MoneyForWinningText (engine/battle/core.asm TrainerBattleVictory).
+      -- He is a text_asm trainer with no def_trainers header, so there is no
+      -- header.won for engageTrainer to find and the line has to be handed
+      -- over here or it never shows at all (#862).
       ow:engageTrainer(npc, function()
         if not ow:trainerDefeated(npc) then
           done()
@@ -527,19 +604,44 @@ M.GAME_CORNER = {
           game.data.text._GameCornerRocketAfterBattleText
           or "Our hideout might\nbe discovered! I\nbetter tell BOSS!",
           function()
-            -- #198: GameCornerRocketExitScript (scripts/GameCorner.asm)
-            -- ApplyMovementData walks the grunt one tile UP into the poster
-            -- (the hideout's secret entrance at 9,4) before HideObject, so
-            -- he leaves the floor rather than popping out of existence on
-            -- (9,5).  scriptMove locks player input (#scriptMoves>0) and
-            -- ignores collision, so we despawn + unfreeze (done) only once
-            -- the step lands.
-            ow:scriptMove(npc, "up", 1, function()
-              hideRocket()
-              done()
-            end)
+            -- #198/#862: GameCornerRocketBattleScript (scripts/GameCorner.asm)
+            -- picks the exit walk from where the player is standing, because
+            -- the grunt on (9,5) has to get past him: wYCoord == 6 (talked to
+            -- from the south) or wXCoord == 8 (from the west) leaves the row
+            -- clear and takes GameCornerMovement_Rocket_WalkDirect, five steps
+            -- RIGHT; otherwise the player is east of him on (10,5) and
+            -- GameCornerMovement_Rocket_WalkAroundPlayer steps DOWN, right, UP
+            -- and right again to go AROUND him.  pokeyellow's copy of the
+            -- around-path takes one extra RIGHT on the lower row before coming
+            -- back up (it also has to clear Pikachu); both versions end on
+            -- (15,5).  He never steps UP: (9,4) is the poster wall, which is
+            -- where the old single UP step sent him.
+            local px = ow.player and ow.player.cellX
+            local py = ow.player and ow.player.cellY
+            local path
+            if py == 6 or px == 8 then
+              path = { { "right", 5 } }
+            elseif require("src.core.GameVersion").isYellow() then
+              path = { { "down", 1 }, { "right", 3 }, { "up", 1 }, { "right", 3 } }
+            else
+              path = { { "down", 1 }, { "right", 2 }, { "up", 1 }, { "right", 4 } }
+            end
+            -- GameCornerRocketExitScript only HideObjects him once
+            -- BIT_SCRIPTED_NPC_MOVEMENT clears, i.e. after the last step.
+            -- scriptMove locks player input (#scriptMoves>0) and ignores
+            -- collision, so the despawn + unfreeze (done) ride the final step.
+            local function step(i)
+              if i > #path then
+                hideRocket()
+                done()
+                return
+              end
+              ow:scriptMove(npc, path[i][1], path[i][2],
+                            function() step(i + 1) end)
+            end
+            step(1)
           end))
-      end)
+      end, game.data.text._GameCornerRocketBattleEndText or "Dang!")
     end,
     -- GameCornerClerk1Text (scripts/GameCorner.asm): the offer, a
     -- YesNoChoice, then ¥1000 for 50 coins.  Yellow drops the "1" from the
@@ -721,8 +823,7 @@ end
 -- buying again means talking to the counter again (#623).
 local function prizeCounter(window)
   return function(game, ow, npc, done)
-    local ListMenu = require("src.ui.ListMenu")
-    local Commands = require("src.script.Commands")
+    local PrizeCounter = require("src.ui.PrizeCounter")
     local TextBox = require("src.render.TextBox")
     local t = game.data.text
     -- IsItemInBag COIN_CASE: without the case, deny and open no window
@@ -732,29 +833,31 @@ local function prizeCounter(window)
         t._RequireCoinCaseText or "A COIN CASE is\nrequired!", done))
       return
     end
-    -- ExchangeCoinsForPrizesText plays before the prize window opens.
     game.stack:push(TextBox.new(game,
       t._ExchangeCoinsForPrizesText or "We exchange your\ncoins for prizes.",
       function()
-        local items = {}
+        local rows = {}
         for _, p in ipairs(prizeWindow(window)) do
-          local label
-          if p.kind == "mon" then
-            label = ("%s L%d"):format(game.data.pokemon[p.species].name, p.level)
-          else
-            label = game.data.items[p.item].name
-          end
-          table.insert(items,
-            { label = label, right = tostring(p.cost), value = p })
+          rows[#rows + 1] = {
+            name = (p.kind == "mon")
+                   and game.data.pokemon[p.species].name
+                   or game.data.items[p.item].name,
+            cost = p.cost,
+            prize = p,
+          }
         end
-        -- NoThanksText (data/events/prizes.asm) sits under the three prizes
-        table.insert(items, { label = "NO THANKS" })
-        local list
-        -- close the window first: every ending in HandlePrizeChoice leaves
-        -- the menu for good, and the closing line belongs over the map
+        local whichBox, menu
+        local function close()
+          local st = game.stack
+          while st:top() == menu or st:top() == whichBox do st:pop() end
+        end
+        -- engine/events/prize_menu.asm:42
+        local function endTalk()
+          if ow then ow.prizeWindow = nil end
+          done()
+        end
         local function finish(msg)
-          list:close()
-          game.stack:push(TextBox.new(game, msg, done))
+          game.stack:push(TextBox.new(game, msg, endTalk))
         end
         local function buy(p)
           if (game.save.coins or 0) < p.cost then
@@ -764,59 +867,67 @@ local function prizeCounter(window)
           -- HasEnoughCoins passed, so hand the prize over first and only
           -- subtract once it landed: the asm rets before .subtractCoins when
           -- the bag is full, or when both the party and every box are full
-          local roomless = t._OopsYouDontHaveEnoughRoomText
-                           or "Oops! You don't\nhave enough room."
           if p.kind == "mon" then
-            -- no runner here, so give_pokemon reports through ctx.lastCheck
-            -- and skips the AskName prompt (Commands.give_pokemon)
-            local ctx = { save = game.save, game = game }
-            Commands.give_pokemon(ctx, p.species, p.level)
-            if not ctx.lastCheck then
-              finish(roomless)
-              return
-            end
-          elseif not require("src.inventory.Bag").add(
+            -- engine/events/prize_menu.asm:217-243
+            ow.runner:run({
+              { "give_pokemon", p.species, p.level, false, true },
+              { "jump_if_false", "boxfull" },
+              { "take_coins", p.cost },
+              { "jump", "out" },
+              { "label", "boxfull" },
+              -- engine/events/give_pokemon.asm:40-42
+              { "show_text", "_BoxIsFullText" },
+              { "label", "out" },
+            }, { onDone = endTalk })
+            return
+          end
+          if not require("src.inventory.Bag").add(
               game.save, p.item, 1, game.data) then
-            finish(roomless)
+            -- engine/events/prize_menu.asm:245-246
+            finish(t._OopsYouDontHaveEnoughRoomText
+                   or "Oops! You don't\nhave enough room.")
             return
           end
           game.save.coins = game.save.coins - p.cost
           -- no thank-you line: HereYouGoText is unreferenced in the asm,
           -- which just redraws the coin box (PrintPrizePrice) and returns
-          list:close()
-          done()
+          endTalk()
         end
-        list = ListMenu.new(game, "PRIZES (COINS)", items, {
-          footer = ("COINS %d"):format(game.save.coins or 0),
-          onChoose = function(item)
-            local p = item.value
-            if not p then -- NO THANKS is the B exit (cp 3 -> .noChoice)
-              list:close()
-              done()
-              return
-            end
-            local name = (p.kind == "mon")
-                         and game.data.pokemon[p.species].name
-                         or game.data.items[p.item].name
-            -- SoYouWantPrizeText names the prize out of wNameBuffer, which
-            -- is not one of TextBox's RAM tokens, so fill it in here
-            local ask = (t._SoYouWantPrizeText
-                         or "So, you want\n{RAM:wNameBuffer}?")
-                        :gsub("{RAM:wNameBuffer}", name)
-            game.stack:push(TextBox.new(game, ask, nil, {
-              choice = function(yes)
-                if not yes then
-                  finish(t._OhFineThenText or "Oh, fine then.")
-                  return
-                end
-                buy(p)
-              end,
-            }))
-          end,
-          onCancel = done,
-        })
-        game.stack:push(list)
-      end))
+        whichBox = TextBox.new(game,
+          t._WhichPrizeText or "Which prize do\nyou want?", nil, {
+            instant = true,
+            stay = { onShown = function()
+              menu = PrizeCounter.new(game, rows, {
+                onCancel = function()
+                  close()
+                  done()
+                end,
+                onPick = function(row, idx)
+                  local p = row.prize
+                  if ow then
+                    ow.prizeWindow = { prizes = rows, index = idx }
+                  end
+                  close()
+                  local ask = (t._SoYouWantPrizeText
+                               or "So, you want\n{RAM:wNameBuffer}?")
+                              :gsub("{RAM:wNameBuffer}", row.name)
+                  game.stack:push(TextBox.new(game, ask, nil, {
+                    instant = true,
+                    choice = function(yes)
+                      if not yes then
+                        finish(t._OhFineThenText or "Oh, fine then.")
+                        return
+                      end
+                      buy(p)
+                    end,
+                  }))
+                end,
+              })
+              game.stack:push(menu)
+            end },
+          })
+        game.stack:push(whichBox)
+      end, { instant = true }))
   end
 end
 
@@ -842,86 +953,65 @@ local DOCK_SHIP_BLOCKS = {
   { bx = 7, by = 2, water = 13 }, { bx = 8, by = 2, water = 13 },
 }
 
--- her four hull columns bow-to-stern (upper-half / lower-half block ids)
--- and the open-water ids of the rows she sits in
-local DOCK_SHIP_COLUMNS = {
-  { bx = 5, top = 4, bottom = 8 },
-  { bx = 6, top = 5, bottom = 9 },
-  { bx = 7, top = 6, bottom = 10 },
-  { bx = 8, top = 7, bottom = 11 },
-}
-local DOCK_WATER_TOP, DOCK_WATER_BOTTOM = 1, 13
-
 M.VERMILION_DOCK = {
   onEnter = function(game, ow)
     local Flags = require("src.script.Flags")
     local f = game.save.flags
     if Flags.get(game.save, "EVENT_SS_ANNE_LEFT") then
       -- the ship is long gone: erase her right away, and anyone who
-      -- still lands here is sent back out past the guard
+      -- still lands here is sent back out past the guard unless a mod
+      -- explicitly permits this occupied map state.  This hook surrounds
+      -- only the ejection decision; map-script registration and dispatch
+      -- stay unchanged, and the departed ship remains erased.
       for _, b in ipairs(DOCK_SHIP_BLOCKS) do
         ow.map:setBlock(b.bx, b.by, b.water)
       end
       ow.map.renderer:rebuild()
-      local TextBox = require("src.render.TextBox")
-      game.stack:push(TextBox.new(game,
-        game.data.text._VermilionCitySailor1ShipSetSailText
-        or "The ship set sail.", function()
-        ow:startWarpTo("VERMILION_CITY", 18, 29, "up")
-      end))
+      local occupancyAllowed = false
+      if Runtime.wantsHook("map.occupancy_allowed") then
+        local player = ow.player or {}
+        occupancyAllowed = Runtime.call("map.occupancy_allowed",
+          function() return false end, game, {
+            mapId = "VERMILION_DOCK",
+            reason = "ss_anne_departed",
+            gameVersion = game.save and game.save.version,
+            x = player.cellX,
+            y = player.cellY,
+          }) == true
+      end
+      if not occupancyAllowed then
+        local TextBox = require("src.render.TextBox")
+        game.stack:push(TextBox.new(game,
+          game.data.text._VermilionCitySailor1ShipSetSailText
+          or "The ship set sail.", function()
+          ow:startWarpTo("VERMILION_CITY", 18, 29, "up")
+        end))
+      end
     elseif f.EVENT_GOT_HM01 and ow.player.cellY == 2 then
       -- VermilionDockSSAnneLeavesScript: only stepping OFF the ship
-      -- triggers the departure (wDestinationWarpID == 1 in pokered) --
-      -- Music_Surfing plays for the sail-away cutscene, smoke puffs
-      -- drift off the funnel, the horn blows, the ship is erased to
-      -- open water, and the player is walked off the dock into the
-      -- city past the guard (VermilionCity's
-      -- SCRIPT_VERMILIONCITY_PLAYER_EXIT_SHIP walk)
+      -- triggers the departure (wDestinationWarpID == 1 in pokered)
       Flags.set(game.save, "EVENT_SS_ANNE_LEFT")
       local Music = require("src.core.Music")
       Music.stop()
       Music.play(game.data, "Music_Surfing")
-      local function puff(n, cx)
-        if n <= 0 then return end
-        ow:startDustAnim(cx, 1, function() puff(n - 1, cx + 2) end)
-      end
-      puff(3, 15)
-      -- VermilionDock_EraseSSAnne deliberately leaves the blocks under the
-      -- player alone ("south of the player and won't be redrawn"), so skip
-      -- his own block: he must not spend the walk-out standing on water
-      local pbx = math.floor(ow.player.cellX / 2)
-      local pby = math.floor(ow.player.cellY / 2)
-      local rows = {}
-      local function setBlock(bx, by, block)
-        if bx < 1 or bx > 8 then return end
-        if bx == pbx and by == pby then return end
-        rows[#rows + 1] = { "replace_block", bx, by, block }
-      end
-      rows[#rows + 1] = { "wait", 120 }
-      rows[#rows + 1] = { "play_sound", "SS_Anne_Horn" }
-      -- .shift_columns_up slides her tile columns west behind a mid-frame
-      -- rSCX split; with no split scroll here she sails one block per beat
-      -- and the water closes in astern (#360)
-      for step = 1, 8 do
-        for _, col in ipairs(DOCK_SHIP_COLUMNS) do
-          setBlock(col.bx - step, 1, col.top)
-          setBlock(col.bx - step, 2, col.bottom)
-        end
-        setBlock(9 - step, 1, DOCK_WATER_TOP)
-        setBlock(9 - step, 2, DOCK_WATER_BOTTOM)
-        rows[#rows + 1] = { "wait", 20 }
-      end
-      -- the second horn as she clears the dock, then EraseSSAnne's 120
-      -- frames before the walk out
-      rows[#rows + 1] = { "play_sound", "SS_Anne_Horn" }
-      rows[#rows + 1] = { "wait", 120 }
-      rows[#rows + 1] = { "move_player", "up", 2 }
-      -- no keepMusic on this warp: Music_Surfing belongs to the dock's
-      -- cutscene, and VERMILION_CITY's own theme has to take over as the
-      -- player crosses in (EnterMap's PlayDefaultMusic)
-      rows[#rows + 1] = { "warp", "VERMILION_CITY", 18, 31, "up" }
-      rows[#rows + 1] = { "move_player", "up", 2 }
-      ow:queueScript(rows)
+      ow:queueScript({
+        -- scripts/VermilionDock.asm:50 zeroes the player image index and
+        -- :77 freezes sprite updates, so he faces DOWN throughout (#1689)
+        { "face_player_dir", "down" },
+        { "wait", 120 },
+        { "play_sound", "SS_Anne_Horn" },
+        -- scripts/VermilionDock.asm:80 .shift_columns_up
+        { "ss_anne_departs" },
+        -- scripts/VermilionDock.asm:205 VermilionDock_EraseSSAnne
+        { "play_sound", "SS_Anne_Horn" },
+        { "wait", 120 },
+        { "move_player", "up", 2 },
+        -- no keepMusic on this warp: Music_Surfing belongs to the dock's
+        -- cutscene, and VERMILION_CITY's own theme has to take over as the
+        -- player crosses in (EnterMap's PlayDefaultMusic)
+        { "warp", "VERMILION_CITY", 18, 31, "up" },
+        { "move_player", "up", 2 },
+      })
     end
   end,
 }

@@ -131,7 +131,13 @@ package.loaded["src.import.CacheFs"] = fakeCache
 
 local SaveConvert = require("src.save_convert.SaveConvert")
 
-local GENERATED = { "pokemon", "moves", "items", "maps" }
+-- tilesets/audio joined the set with the #889 map-context rebuild, which
+-- reads the current map's tileset row and song out of the same cache.
+-- The audio entry is single-quoted on purpose: gate_meta_coverage.lua treats a
+-- double-quoted registry name anywhere in the test corpus as that registry's
+-- unit test, and this suite is not the mod audio registry's.
+local GENERATED = { "pokemon", "moves", "items", "maps", "tilesets", 'audio', 'encounters',
+  'field', 'trainerHeaders' }
 
 local function prefixes()
   local seen = {}
@@ -148,7 +154,7 @@ do
       name .. " comes out of Blue's cache, not the un-prefixed read path")
   end
   eq(prefixes()[GameVersion.VERSIONS.blue.cachePrefix], #GENERATED,
-    "all four generated tables are read under Blue's cache prefix")
+    "every generated table is read under Blue's cache prefix")
   eq(fakeCache.prefix, SENTINEL,
     "CacheFs.prefix is launcher-owned state and is put back after the read")
   check(data and data.eventFlags ~= nil,
@@ -194,18 +200,16 @@ do
   eq(#reads, 0, "and shares the set exportSav already warmed")
 end
 
--- The require path still has to carry SaveConvert under plain luajit, where
--- there is no cache to read from.
 do
   reads = {}
   cacheFails = true
+  SaveConvert.setGen1DataStub(nil)
   local ok, data, err = pcall(SaveConvert.loadData, "red")
   cacheFails = false
-  check(ok, "an unreadable cache falls back instead of raising: " .. tostring(data))
-  if loadfile("data/generated/maps.lua") then
-    check(type(data) == "table",
-      "the require path still resolves the tables headless: " .. tostring(err))
-  end
+  check(ok, "an unreadable cache returns instead of raising: " .. tostring(data))
+  eq(data, nil, "an unreadable edition cache never falls back to mounted data")
+  check(err and err:find("Red", 1, true), "the refusal names the unreadable Red cache")
+  eq(fakeCache.prefix, SENTINEL, "a failed cache read restores launcher state")
 end
 
 -- ------------------------------------------------------------------
@@ -216,6 +220,13 @@ do
   local seen = {}
   package.loaded["src.save_convert.SaveConvert"] = {
     SAVE_SIZE = 32768,
+    -- importToSlot asks this before it measures the bytes, so a save for a
+    -- game with no codec is refused as that rather than as a bad checksum.
+    -- The double has to answer it; "yes" is what keeps this case about the
+    -- cache-name contract below and nothing else.
+    importSupported = function() return true end,
+    -- Red is not a Gen 2 cart, which is what this case uses.
+    isGen2Cart = function() return false end,
     importSav = function(_, version, gameVersion)
       seen.import = { version = version, gameVersion = gameVersion }
       return nil, "stub"

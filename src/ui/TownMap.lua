@@ -14,11 +14,19 @@
 -- This is what the party-menu FLY field move opens (#195).
 
 local Font = require("src.render.Font")
+local GameVersion = require("src.core.GameVersion")
+local PaletteFX = require("src.render.PaletteFX")
 local Sound = require("src.core.Sound")
+local SpriteRenderer = require("src.render.SpriteRenderer")
+local Strings = require("src.core.Strings")
+local Theme = require("src.ui.Theme")
 
-local TownMap = {}
+local TownMap = { isMenu = true }
 TownMap.__index = TownMap
 TownMap.isOpaque = true
+
+-- engine/items/town_map.asm:183
+local ARROW_DELAY = 15
 
 -- SGB: PalPacket_TownMap, whole screen
 function TownMap:sgbPalettes(game)
@@ -44,12 +52,27 @@ local function isRoute(loc)
   return loc.name:find("ROUTE", 1, true) ~= nil
 end
 
+-- data/maps/town_map_order.asm:1
+local function orderByCursorOrder(byMap, order)
+  if type(order) ~= "table" then return nil end
+  local out, seen = {}, {}
+  for _, mapId in ipairs(order) do
+    local loc = byMap[mapId]
+    if loc and not seen[loc] then
+      seen[loc] = true
+      out[#out + 1] = loc
+    end
+  end
+  return #out >= 2 and out or nil
+end
+
 -- Build the ordered location list.  Grid mode dedupes shared entries
 -- (interior maps point at their town's square); list mode falls back to
 -- the fly towns so the screen still works without townMap data.
 local function buildLocations(game)
   local field = game.data.field or {}
   local townMap = field.townMap
+  local cursorOrder = type(townMap) == "table" and townMap.cursorOrder or nil
   -- the extractor nests the per-map entries under .locations
   if type(townMap) == "table" and type(townMap.locations) == "table" then
     townMap = townMap.locations
@@ -77,7 +100,7 @@ local function buildLocations(game)
         if a.x ~= b.x then return a.x < b.x end
         return a.name < b.name
       end)
-      return locs, byMap, "grid"
+      return orderByCursorOrder(byMap, cursorOrder) or locs, byMap, "grid", locs
     end
   end
   -- fallback: towns from the fly order (deduped, outdoor maps only)
@@ -127,10 +150,44 @@ local function markerXY(loc)
   return loc.x * 8 + 16, loc.y * 8 + 8
 end
 
+-- the marker wears its own sheet's OBJ palette and shade-0 keying
+-- engine/items/town_map.asm:342
+local function markerSheet(def, seed)
+  local colors, group
+  if PaletteFX.usesGbcPack() then
+    colors, group = PaletteFX.spriteObp(def, seed)
+  end
+  if not colors then
+    if PaletteFX.usesSpriteObp() then
+      colors, group = PaletteFX.ogObjLit() -- engine/items/town_map.asm:325
+    else
+      colors, group = PaletteFX.dmgObjLit()
+    end
+  end
+  local ok, img = pcall(SpriteRenderer.obpImage, def and def.image, colors, group)
+  if not (ok and img) then return nil, nil end
+  return img, love.graphics.newQuad(0, 0, 16, 16, img:getDimensions())
+end
+
 -- the row-0 name banner; fly mode prefixes "To " like LoadTownMap_Fly
 -- (engine/menus/town_map.asm prints the destination as "To <NAME>")
 function TownMap:bannerText(loc)
-  return (self.fly and "To " or "") .. loc.name
+  local name = Strings(loc.name)
+  return self.fly and Strings("To %s", name) or name
+end
+
+-- The fly strip reserves its last two tiles for the up/down arrows.  Fit the
+-- composed translation as one unit so a wider/reordered prefix cannot collide
+-- with the destination or draw under those controls.
+local function fitFlyBanner(text)
+  local spans = Font.split(text)
+  local n = Font.spansFitting(spans, 144)
+  if n >= #spans then return text end
+  local out = {}
+  for i = 1, math.max(0, n - 1) do
+    out[#out + 1] = text:sub(spans[i].from, spans[i].to)
+  end
+  return table.concat(out) .. "."
 end
 
 -- Fly mode selection set (engine/menus/town_map.asm LoadTownMap_Fly): the
@@ -147,13 +204,14 @@ local function buildFlyList(game, byMap)
   for _, mapId in ipairs(field.flyOrder or {}) do
     local def = game.data.maps and game.data.maps[mapId]
     -- INDIGO_PLATEAU is a normal Fly spot (engine/menus/town_map.asm
-    -- LoadTownMap_Fly cycles it like any town), but its map uses tileset
-    -- "PLATEAU" not OVERWORLD, so Map.isOutdoor() alone dropped it from the
-    -- cursor even though it is visited and has a fly warp.  Allow PLATEAU here
-    -- while the CAVERN/FACILITY dungeon escape spots that share flyOrder still
-    -- fail the gate and stay out (#203).
+    -- LoadTownMap_Fly cycles it like any town): its map id sits inside
+    -- BuildFlyLocationsList's 0..NUM_CITY_MAPS-1 walk, which is what
+    -- Map.isFlyTown checks, so it passes even though its tileset is
+    -- "PLATEAU" not OVERWORLD (#203).  The ROUTE_4/ROUTE_10 Pokemon Centers
+    -- carry fly warps but are not towns, so they stay out (#788), as do the
+    -- CAVERN/FACILITY dungeon escape spots that share flyOrder.
     if not seen[mapId] and visited[mapId] and flyWarps[mapId]
-       and def and (Map.isOutdoor(def) or def.tileset == "PLATEAU") then
+       and def and Map.isFlyTown(def) then
       seen[mapId] = true
       local loc = byMap[mapId] or { name = mapId:gsub("_", " ") }
       table.insert(flyLocs, loc)
@@ -170,7 +228,7 @@ function TownMap.new(game, opts)
   local self = setmetatable({}, TownMap)
   self.game = game
   self.bg = loadBackground(game)
-  self.locs, self.byMap, self.mode = buildLocations(game)
+  self.locs, self.byMap, self.mode, self.allLocs = buildLocations(game)
   if opts.nestSpecies then
     self.nestSpecies = opts.nestSpecies
     self.nests = {}
@@ -184,7 +242,8 @@ function TownMap.new(game, opts)
         if found then break end
       end
       local loc = found and self.byMap[mapId]
-      if loc and not seen[loc] then
+      -- engine/items/town_map.asm:388
+      if loc and not seen[loc] and not (loc.x == 9 and loc.y == 1) then
         seen[loc] = true
         table.insert(self.nests, loc)
       end
@@ -219,33 +278,45 @@ function TownMap.new(game, opts)
   -- the player's current location (guard: overworld may not be running)
   local mapId = game.overworld and game.overworld.map and game.overworld.map.id
   self.playerLoc = mapId and self.byMap[mapId] or nil
+  -- engine/items/town_map.asm:347
+  local playerSprites = (game.data.field and game.data.field.playerSprites)
+                        or {}
+  local sprites = game.data.sprites or {}
+  self.playerSheet, self.playerQuad =
+    markerSheet(sprites[playerSprites.walk or "SPRITE_RED"] or sprites.SPRITE_RED,
+                "player")
+  -- LoadTownMap_Fly overwrites the cursor tiles with BirdSprite and marks
+  -- the destination with it -- engine/items/town_map.asm:146-149, 177-179
+  if self.fly then
+    self.birdSheet, self.birdQuad =
+      markerSheet(sprites[playerSprites.fly or "SPRITE_BIRD"]
+                  or sprites.SPRITE_BIRD, "bird")
+    -- engine/items/town_map.asm:150
+    local art = ((game.data.field or {}).townMap or {}).upArrow
+    local okArrow, arrow = pcall(love.graphics.newImage,
+                                 (art and art.path)
+                                 or "assets/generated/townmap/up_arrow.png")
+    self.upArrow = okArrow and arrow or nil
+    -- engine/items/town_map.asm:170, 183
+    self.arrowHide, self.arrowDelay = "up", ARROW_DELAY
+  end
   self.sel = 1
-  for i, loc in ipairs(self.locs) do
-    if loc == self.playerLoc then self.sel = i break end
+  -- LoadTownMap_Fly always opens with hl on wFlyLocationsList[0], the FIRST
+  -- fly destination (PALLET_TOWN), never the player's current town (#795).
+  -- Only the plain viewer snaps the cursor to where the player stands.
+  if not self.fly then
+    local found = false
+    for i, loc in ipairs(self.locs) do
+      if loc == self.playerLoc then self.sel = i found = true break end
+    end
+    -- engine/items/town_map.asm:29
+    if self.playerLoc and not found then
+      table.insert(self.locs, self.playerLoc)
+      self.sel = #self.locs
+    end
   end
   self.blink = 0
   return self
-end
-
--- snap the cursor to the nearest location in the pressed direction
-function TownMap:moveGrid(dx, dy)
-  local cur = self.locs[self.sel]
-  local best, bestScore
-  for i, loc in ipairs(self.locs) do
-    if i ~= self.sel then
-      local ddx, ddy = loc.x - cur.x, loc.y - cur.y
-      local fwd = ddx * dx + ddy * dy       -- progress along the d-pad axis
-      local side = math.abs(ddx * dy) + math.abs(ddy * dx)
-      if fwd > 0 then
-        local score = fwd + side * 3        -- prefer staying on-axis
-        if not best or score < bestScore then best, bestScore = i, score end
-      end
-    end
-  end
-  if best then
-    self.sel = best
-    Sound.play(self.game.data, "Tink")
-  end
 end
 
 function TownMap:moveList(step)
@@ -256,7 +327,12 @@ function TownMap:moveList(step)
 end
 
 function TownMap:update(dt)
-  self.blink = (self.blink + 1) % 32
+  local cycle = GameVersion.generation() == 2 and 32 or 50
+  self.blink = (self.blink + 1) % cycle
+  if self.arrowDelay and self.arrowDelay > 0 then
+    self.arrowDelay = self.arrowDelay - 1
+    if self.arrowDelay == 0 then self.arrowHide = nil end
+  end
   local input = self.game.input
   if input:wasPressed("b") then
     Sound.play(self.game.data, "Press_AB")
@@ -266,14 +342,21 @@ function TownMap:update(dt)
   if self.fly then
     -- LoadTownMap_Fly: Up/Down cycle the visited destinations, A flies there,
     -- B cancels (handled above).  moveList walks self.locs, now the fly list.
+    -- Up steps FORWARD through the towns (.pressedUp does inc hl: PALLET ->
+    -- VIRIDIAN -> PEWTER -> ...), Down steps back and wraps to the last
+    -- visited town from the top; the port had the two swapped (#795).
     if input:wasPressed("a") then
       Sound.play(self.game.data, "Press_AB")
       local mapId = self.flyMapIds[self.sel]
       self.game.stack:pop()
       if mapId and self.onFly then self.onFly(mapId) end
       return
-    elseif input:wasPressed("up") then self:moveList(-1)
-    elseif input:wasPressed("down") then self:moveList(1)
+    elseif input:wasPressed("up") then
+      self:moveList(1)
+      self.arrowHide, self.arrowDelay = "up", ARROW_DELAY
+    elseif input:wasPressed("down") then
+      self:moveList(-1)
+      self.arrowHide, self.arrowDelay = "down", ARROW_DELAY
     end
   elseif self.nestSpecies then
     if input:wasPressed("a") then
@@ -281,15 +364,36 @@ function TownMap:update(dt)
       self.game.stack:pop()
     end
   elseif self.mode == "grid" then
-    if input:wasPressed("up") then self:moveGrid(0, -1)
-    elseif input:wasPressed("down") then self:moveGrid(0, 1)
-    elseif input:wasPressed("left") then self:moveGrid(-1, 0)
-    elseif input:wasPressed("right") then self:moveGrid(1, 0)
+    -- engine/items/town_map.asm:74
+    if input:wasPressed("up") then self:moveList(1)
+    elseif input:wasPressed("down") then self:moveList(-1)
     end
   else
     if input:wasPressed("up") then self:moveList(-1)
     elseif input:wasPressed("down") then self:moveList(1)
     end
+  end
+end
+
+-- OG RED and ADVANCED bake an OBJ palette in, so the marker replays over the TOWNMAP zone pass (#301)
+function TownMap:markPlayerRedraw(x, y)
+  if not (PaletteFX.usesSpriteObp() or PaletteFX.usesGbcPack()) then return end
+  PaletteFX.markUiSpriteRedraw(self.playerSheet, self.playerQuad, x, y)
+end
+
+-- engine/items/town_map.asm:170, 185
+function TownMap:drawFlyArrows()
+  if self.arrowHide ~= "up" then
+    if self.upArrow then
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.draw(self.upArrow, 144, 0)
+      love.graphics.setColor(0, 0, 0, 1)
+    else
+      love.graphics.polygon("fill", 148, 1, 152, 7, 144, 7)
+    end
+  end
+  if self.arrowHide ~= "down" then
+    Font.drawCode(Theme.moreArrow, 152, 0)
   end
 end
 
@@ -315,7 +419,13 @@ function TownMap:draw()
     end
     if self.nestSpecies then
       -- AREA mode: blinking nests, the species name up top
-      if self.blink % 16 < 10 then
+      local showNest = true
+      if GameVersion.generation() == 1 then
+        showNest = self.blink < 25
+      else
+        showNest = self.blink % 16 < 10
+      end
+      if showNest then
         for _, loc in ipairs(self.nests) do
           local x, y = markerXY(loc)
           if self.nestIcon then
@@ -327,37 +437,63 @@ function TownMap:draw()
           end
         end
       end
+      if #self.nests > 0 then
+        -- engine/items/town_map.asm:399
+        if self.playerLoc and self.playerSheet then
+          local x, y = markerXY(self.playerLoc)
+          love.graphics.draw(self.playerSheet, self.playerQuad, x - 4, y - 3)
+          self:markPlayerRedraw(x - 4, y - 3)
+        end
+      else
+        -- engine/items/town_map.asm:403
+        Font.drawBox(1, 7, 17, 4)
+        love.graphics.setColor(0, 0, 0, 1)
+        Font.draw(" " .. Strings("AREA UNKNOWN"), 16, 72)
+        love.graphics.setColor(1, 1, 1, 1)
+      end
       love.graphics.rectangle("fill", 0, 0, 160, 8)
       love.graphics.setColor(0, 0, 0, 1)
       local def = self.game.data.pokemon[self.nestSpecies]
       local name = def and def.name or self.nestSpecies
-      Font.draw(#self.nests > 0 and (name .. "'s NEST")
-                or (name .. " AREA UNKNOWN"), 8, 0)
+      -- engine/items/town_map.asm:124
+      Font.draw(Strings("%s's NEST", name), 8, 0)
       love.graphics.setColor(1, 1, 1, 1)
       return
     end
-    -- the player's current location blinks (slow phase).  Paint it with a
-    -- palette-safe DARK shade (red 0), not red: this screen composites through
-    -- the TOWNMAP SGB shade-remap shader (PaletteFX.shader), which keys ONLY on
-    -- the red channel, and a red-0.75 dot lands in the c1 bucket = TOWNMAP
-    -- {165,214,255}, the exact light-blue used for the water and the town-square
-    -- fill, so the marker was drawn but recolored invisible (#152).  Red 0 -> c3
-    -- {25,16,16} = a solid dark "you are here" dot, visible on land and water.
-    if self.playerLoc and self.blink < 20 then
+    -- engine/items/town_map.asm:347; player marker is static in both Gen 1 and 2
+    if self.playerLoc then
       local x, y = markerXY(self.playerLoc)
-      love.graphics.setColor(0, 0, 0, 1)
-      love.graphics.rectangle("fill", x + 2, y + 2, 4, 4)
-      love.graphics.setColor(1, 1, 1, 1)
+      if self.playerSheet then
+        love.graphics.draw(self.playerSheet, self.playerQuad, x - 4, y - 3)
+        self:markPlayerRedraw(x - 4, y - 3)
+      else
+        love.graphics.setColor(0, 0, 0, 1)
+        love.graphics.rectangle("fill", x + 2, y + 2, 4, 4)
+        love.graphics.setColor(1, 1, 1, 1)
+      end
     end
-    -- blinking cursor on the selected location.  markerXY is the 8x8 cell's
-    -- top-left; the cursor asset is a 16x16 hollow frame centered on its own
-    -- (8,8), so draw it -4,-4 to enclose the cell (engine/menus/town_map.asm
-    -- draws the box cursor CENTERED on the selected location).  Drawing it at
-    -- the cell top-left put the square in the frame's top-left quadrant (#152).
-    if selected and self.blink % 16 < 10 then
+    -- WriteTownMapSpriteOAM carry quirk: -4 X, -3 Y for cursor and player alike -- engine/items/town_map.asm:454
+    -- LoadTownMap_Fly's .inputLoop has no blinking animation
+    -- engine/items/town_map.asm:190-198
+    local showCursor = true
+    if self.fly and self.birdSheet then
+      if selected then
+        local x, y = markerXY(selected)
+        love.graphics.draw(self.birdSheet, self.birdQuad, x - 4, y - 3)
+        if PaletteFX.usesSpriteObp() or PaletteFX.usesGbcPack() then
+          PaletteFX.markUiSpriteRedraw(self.birdSheet, self.birdQuad, x - 4, y - 3)
+        end
+      end
+      showCursor = false
+    elseif GameVersion.generation() == 1 then
+      showCursor = self.blink < 25
+    else
+      showCursor = self.blink % 16 < 10
+    end
+    if selected and showCursor then
       local x, y = markerXY(selected)
       if self.bg.cursor then
-        love.graphics.draw(self.bg.cursor, x - 4, y - 4)
+        love.graphics.draw(self.bg.cursor, x - 4, y - 3)
       else
         love.graphics.setColor(0, 0, 0, 1)
         love.graphics.rectangle("line", x + 0.5, y + 0.5, 7, 7)
@@ -367,7 +503,15 @@ function TownMap:draw()
     -- the name strip on row 0 (DisplayTownMap: ClearScreenArea + name)
     love.graphics.rectangle("fill", 0, 0, 160, 8)
     love.graphics.setColor(0, 0, 0, 1)
-    if selected then Font.draw(self:bannerText(selected), 8, 0) end
+    if self.fly then
+      -- engine/items/town_map.asm:167, 176, 185
+      if selected then
+        Font.draw(fitFlyBanner(self:bannerText(selected)), 0, 0)
+      end
+      self:drawFlyArrows()
+    elseif selected then
+      Font.draw(self:bannerText(selected), 8, 0)
+    end
     love.graphics.setColor(1, 1, 1, 1)
     return
   end
@@ -376,17 +520,31 @@ function TownMap:draw()
   Font.drawBox(0, 0, 20, 18)
   if self.mode == "grid" then
     -- stale assets (no background art): the old abstract squares
-    for _, loc in ipairs(self.locs) do
+    for _, loc in ipairs(self.allLocs or self.locs) do
       drawSquare(loc)
     end
-    if self.playerLoc and self.blink < 20 then
-      -- palette-safe dark, same red-channel shade-remap reason as the primary
-      -- grid path above (#152); stale-asset builds hit this fallback square
-      love.graphics.setColor(0, 0, 0, 1)
-      love.graphics.rectangle("fill", self.playerLoc.x * 8 + 2,
-                              self.playerLoc.y * 8 + 2, 4, 4)
+    -- player marker is static in both Gen 1 and 2
+    if self.playerLoc then
+      -- engine/items/town_map.asm:347; fallback dot stays red 0 for PaletteFX (#152)
+      if self.playerSheet then
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.draw(self.playerSheet, self.playerQuad,
+                           self.playerLoc.x * 8 - 4, self.playerLoc.y * 8 - 3)
+        self:markPlayerRedraw(self.playerLoc.x * 8 - 4,
+                              self.playerLoc.y * 8 - 3)
+      else
+        love.graphics.setColor(0, 0, 0, 1)
+        love.graphics.rectangle("fill", self.playerLoc.x * 8 + 2,
+                                self.playerLoc.y * 8 + 2, 4, 4)
+      end
     end
-    if selected and self.blink % 16 < 10 then
+    local showCursor = true
+    if GameVersion.generation() == 1 then
+      showCursor = self.blink < 25
+    else
+      showCursor = self.blink % 16 < 10
+    end
+    if selected and showCursor then
       love.graphics.setColor(0, 0, 0, 1)
       love.graphics.rectangle("line", selected.x * 8 + 0.5,
                               selected.y * 8 + 0.5, 7, 7)
@@ -400,16 +558,20 @@ function TownMap:draw()
       local loc = self.locs[first + i]
       if loc then
         local y = 40 + i * 16
-        if first + i == self.sel and self.blink % 16 < 10 then
+        local name = Strings(loc.name)
+        -- cursor in list mode (Fly mode) is static in RBY (LoadTownMap_Fly)
+        if first + i == self.sel then
           Font.drawCode(0xED, 8, y)  -- the "▶" cursor glyph
         end
-        Font.draw(loc.name, 24, y)
-        if loc == self.playerLoc and self.blink < 20 then
-          -- blinking marker on the player's current town; force the palette-safe
+        Font.draw(name, 24, y)
+        -- player marker is static
+        if loc == self.playerLoc then
+          -- marker on the player's current town; force the palette-safe
           -- dark shade explicitly so the red-channel shade-remap keeps it
           -- visible regardless of Font.draw's leftover color (#152)
           love.graphics.setColor(0, 0, 0, 1)
-          love.graphics.rectangle("fill", 24 + #loc.name * 8 + 6, y + 2, 4, 4)
+          love.graphics.rectangle("fill", 24 + Font.width(name) + 6,
+                                  y + 2, 4, 4)
         end
       end
     end
@@ -418,7 +580,10 @@ function TownMap:draw()
   -- name banner across the top
   Font.drawBox(0, 0, 20, 3)
   love.graphics.setColor(0, 0, 0, 1)
-  if selected then Font.draw(self:bannerText(selected), 8, 8) end
+  if selected then
+    local text = self:bannerText(selected)
+    Font.draw(self.fly and fitFlyBanner(text) or text, 8, 8)
+  end
   love.graphics.setColor(1, 1, 1, 1)
 end
 

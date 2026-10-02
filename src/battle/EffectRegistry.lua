@@ -29,7 +29,7 @@ end
 -- pokered's <USER>/<TARGET> text macros print "Enemy " before the enemy
 -- mon's nickname (home/text.asm PlaceMoveUsersName)
 local function displayName(b)
-  return b.isPlayer and b.name or ("Enemy " .. b.name)
+  return b.isPlayer and b.name or Strings("Enemy %s", b.name)  -- #779
 end
 EffectRegistry.displayName = displayName
 
@@ -92,14 +92,32 @@ local function hitCount(ctx, record)
   return dist[r + 1]
 end
 
+-- engine/battle/effects.asm:119-151 (poison), :194-255 (burn/freeze/paralyze)
+local FBP_SIDE_STATUS = { BRN = true, FRZ = true, PAR = true }
+
+local function secondaryStatusFx(battle, user, status)
+  if status == "PSN" then
+    local row = battle:animNext(user.isPlayer and "ENEMY_HUD_SHAKE_ANIM"
+                                or "SHAKE_SCREEN_ANIM", user.isPlayer)
+    row.animDelayed = true
+    row.hit = { animType = user.isPlayer and 6 or 3 }
+  elseif FBP_SIDE_STATUS[status] and user.isPlayer then
+    battle:animNext("ENEMY_HUD_SHAKE_ANIM", true).animDelayed = true
+  end
+end
+
 -- The damaging pipeline, extracted from the performMove monolith: every
 -- stage keeps the original's exact check order and rng consumption
--- (invulnerability -> gate -> hit count -> pre-accuracy -> accuracy ->
+-- (pre-accuracy -> invulnerability -> gate -> hit count -> accuracy ->
 -- damage choice -> hits -> messages -> after-damage -> secondary run).
 function EffectRegistry.runDamaging(battle, ctx, record)
   local user, target = ctx.user, ctx.target
   local move, moveInst = ctx.move, ctx.moveInst
   local neverMiss = record and record.neverMiss
+
+  -- SpecialEffectsCont's JumpMoveEffect (core.asm:3129-3133) runs before
+  -- MoveHitTest's INVULNERABLE test (:3150), mid-Fly/Dig included (#1565)
+  if record and record.beforeAccuracy then record.beforeAccuracy(ctx) end
 
   -- Swift ignores semi-invulnerability (MoveHitTest returns hit for
   -- SWIFT_EFFECT before the INVULNERABLE check)
@@ -128,8 +146,6 @@ function EffectRegistry.runDamaging(battle, ctx, record)
   end
 
   local hits = hitCount(ctx, record)
-
-  if record and record.beforeAccuracy then record.beforeAccuracy(ctx) end
 
   if not neverMiss then
     if not battle:accuracyRoll(move, user, target) then
@@ -207,23 +223,44 @@ function EffectRegistry.runDamaging(battle, ctx, record)
   -- replay PlayMoveAnimation per strike (pokered: GetPlayerAnimationType
   -- / GetEnemyAnimationType loop on wNumAttacksLeft); hit 1 reuses the
   -- announcement-time moveAnimRow, later hits queue fresh anim rows.
-  -- Thrash/rage continuations have no announcement anim -- a bare
+  -- Mimic queues no announcement anim (announceAnim = false) -- a bare
   -- hitRow carries the blink instead.
-  local hitSfx = info.typeMult > 10 and "Super_Effective"
-                 or info.typeMult < 10 and "Not_Very_Effective" or "Damage"
+  -- PlayApplyingAttackSound (engine/battle/animations.asm, the routine after
+  -- PlayApplyingAttackAnimation) picks the sound off wDamageMultipliers -- 10
+  -- is neutral, above it super effective, below it not very -- and sets
+  -- wFrequencyModifier/wTempoModifier alongside it: $20/$30 damage, $e0/$ff
+  -- super effective, $50/$01 not very.  All three programs live on the noise
+  -- channel (audio/sfx/{damage,super_effective,not_very_effective}.asm,
+  -- `channel 8`), where the frequency modifier is added to the polynomial
+  -- counter and so IS the pitch of the hit, while the tempo modifier is
+  -- skipped outright (audio/engine_2.asm Audio2_note_length: `cp CHAN8 /
+  -- jr z, .skip` keeps the noise channel at the default $100).  Playing them
+  -- bare made the super effective hit a dull thud and the not very effective
+  -- one a bright crack, which is why they sounded swapped (#826); the tempo
+  -- byte is deliberately not carried, since applying it would stretch notes
+  -- the hardware never stretches.
+  local hitSfx
+  if info.typeMult > 10 then
+    hitSfx = { sound = "Super_Effective", pitch = 0xe0 }
+  elseif info.typeMult < 10 then
+    hitSfx = { sound = "Not_Very_Effective", pitch = 0x50 }
+  else
+    hitSfx = { sound = "Damage", pitch = 0x20 }
+  end
   -- GetPlayerAnimationType / GetEnemyAnimationType (engine/battle/core.asm
-  -- :3159 / :5555): wAnimationType is 4 (blink the enemy pic) or 1 (shake
-  -- the screen vertically) for a damaging move with no added effect, and
-  -- 5 / 2 (a horizontal shake) as soon as the move HAS one -- which is why
-  -- Bubblebeam and Confusion shake instead of blinking (#354)
+  -- :3159 / :5555): 4 blinks the enemy pic, 1 shakes vertically, 5 / 2 once
+  -- the move has an added effect (#354)
   local added = move.effect ~= nil and move.effect ~= "NO_ADDITIONAL_EFFECT"
+  -- PlayApplyingAttackAnimation runs on both arms of the wOptions check
+  -- (engine/battle/animations.asm:424-437), so the blink is not gated (#1384)
   local hitFx = { sfx = hitSfx,
                   animType = user.isPlayer and (added and 5 or 4)
                              or (added and 2 or 1),
-                  blink = battle:animationsOn() and target or nil }
+                  blink = target }
 
   local totalDealt = 0
   local landed, brokeSub = 0, false
+  local critPending, ohkoPending = info.crit, info.ohko
   for h = 1, hits do
     if target.mon.hp <= 0 then break end
     local hitRow
@@ -244,12 +281,16 @@ function EffectRegistry.runDamaging(battle, ctx, record)
     totalDealt = totalDealt + dealt
     landed = h
     if dealt > 0 then hitRow.hit = hitFx end
-    -- PrintCriticalOHKOText + DisplayEffectiveness run inside the
-    -- multi-hit loop (core.asm .moveDidNotMiss before the jump back
-    -- to GetPlayerAnimationType), so crit/effectiveness reprint on
-    -- every strike -- damage was only rolled once
-    if info.crit then battle:sayNext(romText(battle.data, "_CriticalHitText", "Critical hit!")) end
-    if info.ohko then battle:sayNext(romText(battle.data, "_OHKOText", "One-hit KO!")) end
+    -- PrintCriticalOHKOText zeroes wCriticalHitOrOHKO after printing
+    -- (core.asm:3809-3811); DisplayEffectiveness re-reads its own flag (#1720)
+    if critPending then
+      battle:sayNext(romText(battle.data, "_CriticalHitText", "Critical hit!"))
+      critPending = false
+    end
+    if ohkoPending then
+      battle:sayNext(romText(battle.data, "_OHKOText", "One-hit KO!"))
+      ohkoPending = false
+    end
     -- PrintCriticalOHKOText closes with `ld c, 20 / jp DelayFrames` at its
     -- .done label (core.asm:3812-3814) -- and the no-crit path jumps to that
     -- same label (:3799), so this hold is paid on EVERY landed hit, not just
@@ -257,6 +298,7 @@ function EffectRegistry.runDamaging(battle, ctx, record)
     -- (:3228-3229), which is where the beat before "It's super effective!"
     -- comes from.
     battle:waitNext(Timing.CRIT_OHKO_TEXT)
+    -- engine/battle/display_effectiveness.asm:1
     if info.typeMult > 10 then
       battle:sayNext(romText(battle.data, "_SuperEffectiveText", "It's super\neffective!"))
     elseif info.typeMult < 10 then
@@ -287,11 +329,11 @@ function EffectRegistry.runDamaging(battle, ctx, record)
   -- post-damage effect bookkeeping (recoil/drain/trap/thrash/...)
   ctx.rawDamage, ctx.totalDealt = dmg, totalDealt
   ctx.brokeSub, ctx.hits = brokeSub, hits
+  ctx.hitSfx = hitSfx
   if record and record.afterDamage then
     record.afterDamage(ctx, totalDealt)
   elseif moveInst.struggle then
-    -- struggle recoils even when its effect id resolves to no record
-    local recoil = math.max(1, math.floor(dmg / 2))
+    local recoil = math.max(1, math.floor(totalDealt / 2))
     battle:sayNext(romText(battle.data, "_HitWithRecoilText", "%s's\nhit with recoil!", displayName(user)))
     battle:applyDamage(user, recoil)
   end
@@ -299,7 +341,12 @@ function EffectRegistry.runDamaging(battle, ctx, record)
   -- secondary side effects (blocked by fainting)
   if record and record.run and record.kind ~= "primary"
      and target.mon.hp > 0 and totalDealt > 0 then
-    for _, m in ipairs(record.run(ctx)) do
+    local hadStatus = target.mon.status
+    local msgs = record.run(ctx)
+    if target.mon.status and target.mon.status ~= hadStatus then
+      secondaryStatusFx(battle, user, target.mon.status)
+    end
+    for _, m in ipairs(msgs) do
       battle:sayNext(m)
     end
   end

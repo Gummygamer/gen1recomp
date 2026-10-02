@@ -26,12 +26,11 @@ end
 -- Also gates the NX runtime modules and the NX engine suites so an NX
 -- runtime regression cannot slip past switch-selftest / switch-build.
 local SWITCH_PATH_REGEX =
-  [[^(scripts/build_switch\.sh$|scripts/switch/|docs/switch-.*\.md$|tests/switch_ci_workflows_test\.lua$|tests/switch_transfer_docs_test\.lua$|\.github/workflows/(ci|release|switch-artifact-comment)\.yml$|src/core/(NxAssetOverlay|Platform|GameVersion)\.lua$|src/import/CacheFs\.lua$|tests/engine/(assets_version_fallback|nx_generated_guard|nx_yellow_boot|switch_diagnostics)_test\.lua$|tests/engine/platform_nx)]]
+  [[^(scripts/build_switch\.sh$|scripts/switch/|docs/switch-.*\.md$|tests/switch_ci_workflows_test\.lua$|tests/switch_transfer_docs_test\.lua$|\.github/workflows/(ci|release|platform-artifact-comment)\.yml$|src/core/(NxAssetOverlay|Platform|GameVersion)\.lua$|src/import/CacheFs\.lua$|tests/engine/(assets_version_fallback|nx_generated_guard|nx_yellow_boot|switch_diagnostics|cache_fs_gold_nx_load)_test\.lua$|tests/engine/platform_nx)]]
 
 local ci = read(".github/workflows/ci.yml")
 local release = read(".github/workflows/release.yml")
-local comment_wf = read(".github/workflows/switch-artifact-comment.yml")
-local ios_comment_wf = read(".github/workflows/ios-artifact-comment.yml")
+local comment_wf = read(".github/workflows/platform-artifact-comment.yml")
 
 -- --- SWCI-01: path detector ---
 mustContain(ci, "switch-changes:", "ci.yml")
@@ -50,6 +49,7 @@ for _, fragment in ipairs({
   "nx_generated_guard",
   "nx_yellow_boot",
   "switch_diagnostics",
+  "cache_fs_gold_nx_load",
   "tests/engine/platform_nx",
 }) do
   mustContain(ci, fragment, "ci.yml path regex NX fragment")
@@ -79,6 +79,7 @@ do
   mustContain(block, "luajit tests/engine/assets_version_fallback_test.lua", "switch-selftest")
   mustContain(block, "luajit tests/engine/nx_generated_guard_test.lua", "switch-selftest")
   mustContain(block, "luajit tests/engine/nx_yellow_boot_test.lua", "switch-selftest")
+  mustContain(block, "luajit tests/engine/cache_fs_gold_nx_load_test.lua", "switch-selftest")
   mustNotContain(block, "continue-on-error:", "switch-selftest")
 end
 
@@ -127,52 +128,49 @@ do
 end
 
 -- --- SWCI-06 / SWCI-07 / SWFIX-01: PR artifact comment (no delete-all clobber) ---
-mustContain(comment_wf, "workflows: [ci]", "switch-artifact-comment")
-mustContain(comment_wf, "gen1recomp-switch-nro", "switch-artifact-comment")
-mustContain(comment_wf, "comment-tag: switch-build-result", "switch-artifact-comment")
-mustContain(comment_wf, "pull_request", "switch-artifact-comment")
-mustContain(comment_wf, "conclusion == 'success'", "switch-artifact-comment")
-mustContain(comment_wf, 'exit 0', "switch-artifact-comment no-op")
-mustContain(comment_wf, "**Commit**:", "switch-artifact-comment")
-mustContain(comment_wf, "**Build Time**:", "switch-artifact-comment")
-mustContain(comment_wf, "View workflow run", "switch-artifact-comment")
-mustContain(comment_wf, "thollander/actions-comment-pull-request@v3", "switch-artifact-comment")
-mustNotContain(comment_wf, "delete-comment", "switch-artifact-comment")
-mustNotContain(comment_wf, "izhangzhihao/delete-comment", "switch-artifact-comment")
-
-mustContain(ios_comment_wf, "comment-tag: ios-build-result", "ios-artifact-comment")
-mustContain(ios_comment_wf, "thollander/actions-comment-pull-request@v3", "ios-artifact-comment")
-mustNotContain(ios_comment_wf, "delete-comment", "ios-artifact-comment")
-mustNotContain(ios_comment_wf, "izhangzhihao/delete-comment", "ios-artifact-comment")
--- Distinct tags so both commenters can coexist on the same PR
-check(comment_wf:find("comment-tag: switch-build-result", 1, true)
-    and ios_comment_wf:find("comment-tag: ios-build-result", 1, true)
-    and comment_wf:find("comment-tag: ios-build-result", 1, true) == nil,
-  "iOS and Switch comment-tags must be distinct and present")
+mustContain(comment_wf, "workflows: [ci]", "platform-artifact-comment")
+for _, artifact in ipairs({
+  "gen1recomp++-macos",
+  "gen1recomp++-ios-ipa",
+  "gen1recomp-switch-nro",
+  "gen1recomp-xbox-uwp",
+  "gen1recomp-linux-arm64",
+}) do
+  mustContain(comment_wf, artifact, "platform-artifact-comment")
+end
+mustContain(comment_wf, "comment-tag: platform-build-result", "platform-artifact-comment")
+mustContain(comment_wf, "pull_request", "platform-artifact-comment")
+mustContain(comment_wf, "conclusion == 'success'", "platform-artifact-comment")
+mustContain(comment_wf, 'exit 0', "platform-artifact-comment no-op")
+mustContain(comment_wf, "**Commit**:", "platform-artifact-comment")
+mustContain(comment_wf, "**Build Time**:", "platform-artifact-comment")
+mustContain(comment_wf, "View workflow run", "platform-artifact-comment")
+mustContain(comment_wf, "thollander/actions-comment-pull-request@v3", "platform-artifact-comment")
+mustNotContain(comment_wf, "delete-comment", "platform-artifact-comment")
+mustNotContain(comment_wf, "izhangzhihao/delete-comment", "platform-artifact-comment")
 
 -- --- SWCI-08 / SWCI-09: docs CI vs release ---
 local build_doc = read("docs/switch-build.md")
-local development = read("docs/switch-development.md")
 local readme = read("README.md")
 
 mustContain(build_doc, "Path-gated", "switch-build.md")
 mustContain(build_doc, "ubuntu-latest", "switch-build.md")
 mustContain(build_doc, "selftest_build_switch.sh", "switch-build.md")
-mustContain(build_doc, "canonical", "switch-build.md")
+mustContain(build_doc, "main repo", "switch-build.md")
 mustContain(build_doc, "gen1recomp-switch-nro", "switch-build.md")
-mustContain(build_doc, "switch-build-result", "switch-build.md")
+mustContain(build_doc, "platform-build-result", "switch-build.md")
 mustContain(build_doc, "hard gate", "switch-build.md")
 mustContain(build_doc, "continue-on-error", "switch-build.md")
 mustContain(build_doc, "nacptool", "switch-build.md")
 mustContain(build_doc, "Docker", "switch-build.md")
-mustContain(build_doc, "Fork → canonical", "switch-build.md")
+mustContain(build_doc, "Fork PRs into the main repo", "switch-build.md")
 mustContain(build_doc, "skip Switch fused", "switch-build.md")
+mustContain(build_doc, "CI and release", "switch-build.md")
+mustNotContain(build_doc, "switch-development", "switch-build.md")
+mustNotContain(build_doc, "switch-hardware-evidence", "switch-build.md")
 
-mustContain(development, "Switch CI", "switch-development.md")
-mustContain(development, "selftest_build_switch.sh", "switch-development.md")
-
-mustContain(readme, "CI vs release", "README.md")
-mustContain(readme, "switch-build.md", "README.md")
+mustNotContain(readme, "switch-development", "README.md")
+mustNotContain(readme, "switch-hardware-evidence", "README.md")
 
 -- --- SWFIX-03: headless suite also runs the content gates ---
 local test_sh = read("scripts/test.sh")
@@ -184,6 +182,7 @@ mustContain(test_sh, "T0 switch transfer docs gate", "scripts/test.sh")
 mustContain(test_sh, "tests/engine/assets_version_fallback_test.lua", "scripts/test.sh")
 mustContain(test_sh, "tests/engine/nx_generated_guard_test.lua", "scripts/test.sh")
 mustContain(test_sh, "tests/engine/nx_yellow_boot_test.lua", "scripts/test.sh")
+mustContain(test_sh, "tests/engine/cache_fs_gold_nx_load_test.lua", "scripts/test.sh")
 mustContain(build_doc, "tests/switch_ci_workflows_test.lua", "switch-build.md path list")
 mustContain(build_doc, "tests/switch_transfer_docs_test.lua", "switch-build.md path list")
 
@@ -196,6 +195,7 @@ for _, path in ipairs({
   "tests/engine/assets_version_fallback_test.lua",
   "tests/engine/nx_generated_guard_test.lua",
   "tests/engine/nx_yellow_boot_test.lua",
+  "tests/engine/cache_fs_gold_nx_load_test.lua",
   "tests/engine/switch_diagnostics_test.lua",
   "tests/engine/platform_nx_*",
 }) do

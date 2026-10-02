@@ -20,9 +20,9 @@
 #   - macOS + Xcode (xcodebuild)
 #   - mobile/ios/love-src/ (see --fetch / mobile/ios/README.md)
 #
-# Output: dist/ios/<Config>-<sdk>/gen1recomp.app (convenience copy)
-#         dist/ios/gen1recomp.ipa                 (device builds only)
-#         mobile/ios/build/Build/Products/<Config>-<sdk>/gen1recomp.app
+# Output: dist/ios/<Config>-<sdk>/gen1recomp++.app (convenience copy)
+#         dist/ios/gen1recomp++.ipa                 (device builds only)
+#         mobile/ios/build/Build/Products/<Config>-<sdk>/gen1recomp++.app
 
 set -euo pipefail
 
@@ -39,8 +39,9 @@ RESOURCES_DIR="$XCODE_DIR/ios/resources"
 LOVE_FILE="$RESOURCES_DIR/game.love"
 LIBS_DIR="$XCODE_DIR/ios/libraries"
 
-APP_NAME="gen1recomp"
-DISPLAY_NAME="gen1recomp"
+APP_NAME="gen1recomp++"
+DISPLAY_NAME="gen1recomp++"
+PRODUCT_NAME="gen1recomp++"
 # Bundle ID resolution, most specific wins:
 #   1. GEN1_BUNDLE_ID env var
 #   2. mobile/ios/bundle_id.local (one line, gitignored — pins YOUR install
@@ -50,7 +51,7 @@ DISPLAY_NAME="gen1recomp"
 #      capabilities like HealthKit are involved), so a per-team default
 #      lets anyone build without colliding with someone else's app
 #   4. simulator: the project default (no App ID registration involved)
-BUNDLE_ID="${GEN1_BUNDLE_ID:-com.theboisclub.gen1recomp}"
+BUNDLE_ID="${GEN1_BUNDLE_ID:-}"
 if [ -z "$BUNDLE_ID" ] && [ -f "$IOS_DIR/bundle_id.local" ]; then
   BUNDLE_ID="$(tr -d '[:space:]' < "$IOS_DIR/bundle_id.local")"
 fi
@@ -138,11 +139,7 @@ if $DEVICE && [ -z "${DEVELOPMENT_TEAM:-}" ]; then
   fi
 fi
 if [ -z "$BUNDLE_ID" ]; then
-  if $DEVICE; then
-    BUNDLE_ID="com.gen1recomp.t$(printf '%s' "$DEVELOPMENT_TEAM" | tr '[:upper:]' '[:lower:]')"
-  else
-    BUNDLE_ID="com.theboisclub.pokemonred"
-  fi
+  BUNDLE_ID="com.theboisclub.gen1recompplusplus"
 fi
 
 # --------------------------------------------------------------- host checks
@@ -158,15 +155,29 @@ if ! $PACKAGE_ONLY; then
 fi
 
 # --------------------------------------------------------------- fetch love-src
+clone_shallow() {
+  local ref="$1" repo="$2" dest="$3" attempt
+  for attempt in 1 2 3 4; do
+    rm -rf "$dest"
+    if git -c http.version=HTTP/1.1 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=120 \
+        clone --depth 1 --branch "$ref" "$repo" "$dest"; then
+      return 0
+    fi
+    say "clone of $repo failed (attempt $attempt), retrying"
+    sleep $((attempt * 10))
+  done
+  return 1
+}
+
 fetch_love_ios() {
   mkdir -p "$CACHE"
   local tmp
   tmp="$(mktemp -d "$CACHE/extract.XXXXXX")"
   say "fetching LÖVE $LOVE_VERSION sources ($LOVE_SOURCE_REF)"
-  git clone --depth 1 --branch "$LOVE_SOURCE_REF" "$LOVE_SOURCE_REPO" "$tmp/love" \
+  clone_shallow "$LOVE_SOURCE_REF" "$LOVE_SOURCE_REPO" "$tmp/love" \
     || fail "failed to fetch LÖVE sources from $LOVE_SOURCE_REPO"
   say "fetching Apple dependencies ($APPLE_DEPENDENCIES_REF)"
-  git clone --depth 1 --branch "$APPLE_DEPENDENCIES_REF" "$APPLE_DEPENDENCIES_REPO" "$tmp/dependencies" \
+  clone_shallow "$APPLE_DEPENDENCIES_REF" "$APPLE_DEPENDENCIES_REPO" "$tmp/dependencies" \
     || fail "failed to fetch Apple dependencies from $APPLE_DEPENDENCIES_REPO"
   rm -rf "$LOVE_SRC"
   mv "$tmp/love" "$LOVE_SRC"
@@ -217,14 +228,33 @@ apply_ios_branding() {
   cp "$OVERLAY_PLIST" "$dest"
 }
 
+verify_documents_overlay() {
+  local sharing in_place
+  sharing="$(/usr/libexec/PlistBuddy -c 'Print :UIFileSharingEnabled' "$OVERLAY_PLIST" 2>/dev/null || true)"
+  in_place="$(/usr/libexec/PlistBuddy -c 'Print :LSSupportsOpeningDocumentsInPlace' "$OVERLAY_PLIST" 2>/dev/null || true)"
+  [ "$sharing" = "true" ] && [ "$in_place" = "true" ] \
+    || fail "iOS plist overlay must enable UIFileSharingEnabled and LSSupportsOpeningDocumentsInPlace"
+}
+
 apply_ios_icon() {
   local source="$ROOT/assets/logo/gen1recomp_cover.png"
   local target="$XCODE_DIR/Images.xcassets/iOS AppIcon.appiconset"
   [ -f "$source" ] || fail "missing iOS icon source: $source"
   [ -d "$target" ] || fail "missing iOS app icon set: $target"
+  local icon="$BUILD_DIR/gen1recomp-ios-icon.png"
+  mkdir -p "$BUILD_DIR"
+  # The cover is already a square launcher image. Apple rejects alpha on the
+  # 1024 marketing icon, so flatten it before the per-size copies.
+  if command -v magick >/dev/null 2>&1; then
+    magick "$source" -resize 1024x1024! -alpha off "$icon" \
+      || fail "could not create iOS app icon: $source"
+  else
+    sips -z 1024 1024 "$source" --out "$icon" >/dev/null \
+      || fail "could not resize iOS app icon source: $source"
+  fi
   local entry name size
   while IFS=: read -r name size; do
-    sips -z "$size" "$size" "$source" --out "$target/$name" >/dev/null
+    sips -z "$size" "$size" "$icon" --out "$target/$name" >/dev/null
   done <<'EOF'
 icon-1024pt@1x.png:1024
 icon-29pt@1x.png:29
@@ -315,13 +345,11 @@ pack_game_love() {
   # it reappears every launch.  Mods install as .zips at runtime instead
   # (launcher -> MODS -> Import mod .zip), the same lifecycle as every
   # other platform.
-  # libs/ carries the vendored FlexLove toolkit the launcher UI is built on
-  # (src/import/LauncherView.lua requires it at the top level, and RomImporter
-  # calls into that view from both update and draw), so an archive without it
-  # dies on the first frame with nothing left to fall back to.
+  # The launcher UI kit lives at src/ui/kit (inside src/, packed wholesale);
+  # the vendored libs/flexlove tree it replaced is gone.
   # shellcheck disable=SC2086  # MANIFESTS is a deliberate word list
   (cd "$ROOT" && zip -q -9 -r "$LOVE_FILE" \
-    main.lua conf.lua src libs data assets tools/save-editor \
+    main.lua conf.lua src data assets tools/save-editor \
     $MANIFESTS \
     -x '*.DS_Store' -x '*/.git/*' -x '*/.DS_Store' \
     -x 'data/generated/*' -x 'assets/generated/*')
@@ -337,16 +365,17 @@ pack_game_love() {
   # in 0.1.45 through 0.1.47: decodeManifest (src/import/RomImporter.lua) errors
   # outright when a version's manifest is absent, so Import ROM on Yellow died
   # in the built app while dev, which reads the source tree, stayed green.
-  # libs/flexlove/FlexLove.lua is on the list for the same reason: it was added
-  # to build.sh's payload and to no other packager, so the mobile builds shipped
-  # a launcher that threw before drawing its first frame.
+  # src/ui/kit/Kit.lua is on the list for the same reason: the launcher's UI
+  # toolkit once lived outside src/ (libs/flexlove) and shipped missing from
+  # the mobile packagers, so the launcher threw before drawing its first
+  # frame.  The kit is inside src/ now; the gate stays to catch a repeat.
   archive_entries="$(unzip -Z1 "$LOVE_FILE")"
   # shellcheck disable=SC2086  # MANIFESTS is a deliberate word list
   for required in src/update/Boot.lua tools/save-editor/App.lua \
                   tools/save-editor/Kit.lua tools/save-editor/panels/Party.lua \
-                  libs/flexlove/FlexLove.lua \
+                  src/ui/kit/Kit.lua \
                   $MANIFESTS; do
-    printf '%s\n' "$archive_entries" | grep -qx "$required" \
+    grep -qx "$required" <<< "$archive_entries" \
       || fail "game.love is missing $required"
   done
   say "game.love: $(du -h "$LOVE_FILE" | cut -f1) -> $LOVE_FILE"
@@ -579,6 +608,157 @@ verify_native_bridge() {
   say "native bridge present (pickFile, createFile)"
 }
 
+verify_documents_configuration() {
+  local app="$1"
+  local plist="$app/Info.plist"
+  local sharing in_place
+  [ -f "$plist" ] || fail "built iOS app is missing Info.plist: $plist"
+  sharing="$(/usr/libexec/PlistBuddy -c 'Print :UIFileSharingEnabled' "$plist" 2>/dev/null || true)"
+  in_place="$(/usr/libexec/PlistBuddy -c 'Print :LSSupportsOpeningDocumentsInPlace' "$plist" 2>/dev/null || true)"
+  [ "$sharing" = "true" ] && [ "$in_place" = "true" ] \
+    || fail "built iOS app does not expose its Documents folder in $(basename "$app")"
+  say "public Documents exposure present (file sharing + in-place access)"
+}
+
+verify_game_payload() {
+  local app="$1"
+  [ -s "$app/game.love" ] \
+    || fail "built iOS app is missing game.love: $app"
+  say "game.love present ($(du -h "$app/game.love" | cut -f1))"
+}
+
+SHADER_BRIDGE_LIB=""
+SHADER_BRIDGE_NAME="liblibrashader_bridge.a"
+SHADER_BRIDGE_OBJ="librashader_bridge.o"
+
+SHADER_BRIDGE_ARCHS=""
+
+rust_targets_for_sdk() {
+  if [ "$1" = "iphoneos" ]; then
+    printf 'aarch64-apple-ios'
+  else
+    printf 'aarch64-apple-ios-sim x86_64-apple-ios'
+  fi
+}
+
+build_shader_bridge_slice() {
+  local rust_target="$1"
+  local crate="$ROOT/tools/shaderfx-bridge"
+  local built="$crate/target/$rust_target/release/$SHADER_BRIDGE_NAME"
+  if [ -f "$built" ]; then
+    printf '%s' "$built"
+    return 0
+  fi
+  if command -v cargo >/dev/null 2>&1 \
+      && rustup target list --installed 2>/dev/null \
+         | grep -x "$rust_target" >/dev/null; then
+    say "building the ShaderFX bridge with cargo ($rust_target)" >&2
+    if (cd "$crate" && IPHONEOS_DEPLOYMENT_TARGET=15.0 \
+        cargo build --release --target "$rust_target" >/dev/null 2>&1); then
+      printf '%s' "$built"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+prelink_shader_bridge_slice() {
+  local archive="$1" sdk="$2" out="$3"
+  local arch platform sdk_version syms objcopy tmp
+  arch="$(lipo -archs "$archive" 2>/dev/null | awk '{print $1}')"
+  [ -n "$arch" ] || return 1
+  if [ "$sdk" = "iphoneos" ]; then platform="ios"; else platform="ios-simulator"; fi
+  sdk_version="$(xcrun --sdk "$sdk" --show-sdk-version 2>/dev/null)"
+  [ -n "$sdk_version" ] || return 1
+  syms="$LIBS_DIR/librashader_bridge.exports"
+  printf '_librashader_translate_preset\n_librashader_free_string\n' > "$syms"
+  tmp="$out.tmp"
+  xcrun ld -r -arch "$arch" -platform_version "$platform" 15.0 "$sdk_version" \
+    -all_load -exported_symbols_list "$syms" -o "$tmp" "$archive" || return 1
+  objcopy="$(ls "$(rustc --print sysroot 2>/dev/null)"/lib/rustlib/*/bin/rust-objcopy 2>/dev/null | head -1)"
+  if [ -n "$objcopy" ] && "$objcopy" --remove-section __LLVM,__bitcode \
+       --remove-section __LLVM,__cmdline "$tmp" "$out" 2>/dev/null; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$out"
+  fi
+}
+
+bundle_shader_bridge_ios() {
+  local rust_targets="$1" sdk="$2"
+  local src="${SHADERFX_BRIDGE_IOS:-}"
+  local slices=() objs=() target slice obj i
+  SHADER_BRIDGE_LIB=""
+  SHADER_BRIDGE_ARCHS=""
+  rm -f "$LIBS_DIR/$SHADER_BRIDGE_NAME" "$LIBS_DIR/$SHADER_BRIDGE_OBJ" "$LIBS_DIR"/librashader_bridge.*.o
+  if [ -n "$src" ]; then
+    if [ -f "$src" ]; then
+      slices+=("$src")
+    else
+      warn "SHADERFX_BRIDGE_IOS=$src does not exist"
+    fi
+  else
+    for target in $rust_targets; do
+      if slice="$(build_shader_bridge_slice "$target")"; then
+        slices+=("$slice")
+      fi
+    done
+  fi
+  if [ "${#slices[@]}" -gt 0 ]; then
+    mkdir -p "$LIBS_DIR"
+    i=0
+    for slice in "${slices[@]}"; do
+      i=$((i + 1))
+      obj="$LIBS_DIR/librashader_bridge.$i.o"
+      if prelink_shader_bridge_slice "$slice" "$sdk" "$obj"; then
+        objs+=("$obj")
+      else
+        warn "could not prelink $(basename "$slice") for $sdk"
+      fi
+    done
+  fi
+  if [ "${#objs[@]}" -eq 1 ]; then
+    mv "${objs[0]}" "$LIBS_DIR/$SHADER_BRIDGE_OBJ"
+  elif [ "${#objs[@]}" -gt 1 ]; then
+    lipo -create "${objs[@]}" -output "$LIBS_DIR/$SHADER_BRIDGE_OBJ"
+    rm -f "${objs[@]}"
+  fi
+  if [ -f "$LIBS_DIR/$SHADER_BRIDGE_OBJ" ]; then
+    SHADER_BRIDGE_LIB="$LIBS_DIR/$SHADER_BRIDGE_OBJ"
+    SHADER_BRIDGE_ARCHS="$(lipo -archs "$SHADER_BRIDGE_LIB" 2>/dev/null || true)"
+    say "linking $SHADER_BRIDGE_OBJ for SHADER FX preset conversion (${SHADER_BRIDGE_ARCHS:-unknown arch})"
+  else
+    warn "$SHADER_BRIDGE_NAME not found: this build can run converted presets but not CONVERT new ones (set SHADERFX_BRIDGE_IOS, or install cargo plus one of: rustup target add $rust_targets)"
+  fi
+}
+
+verify_shader_bridge() {
+  local app="$1"
+  local exe bin
+  if [ -z "$SHADER_BRIDGE_LIB" ]; then
+    warn "no SHADER FX bridge in this build: CONVERT stays unavailable, converted presets still run"
+    return 0
+  fi
+  exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
+         "$app/Info.plist" 2>/dev/null || true)"
+  bin="$app/${exe:-love}"
+  [ -f "$bin" ] || bin="$app/love"
+  if [ ! -f "$bin" ]; then
+    warn "no executable inside $(basename "$app"); skipping SHADER FX bridge check"
+    return 0
+  fi
+  if nm "$bin" 2>/dev/null | grep -E ' _librashader_translate_preset$' >/dev/null \
+     || xcrun dyld_info -exports "$bin" 2>/dev/null \
+        | grep -E ' _librashader_translate_preset$' >/dev/null; then
+    say "SHADER FX bridge present (librashader_translate_preset)"
+    return 0
+  fi
+  fail "built app does not carry the SHADER FX bridge symbols.
+  $SHADER_BRIDGE_OBJ was linked but librashader_translate_preset is absent,
+  so SHADER FX CONVERT would fail at runtime.
+  Rebuild after: rm -rf tools/shaderfx-bridge/target"
+}
+
 run_xcodebuild() {
   local config sdk destination
   if $RELEASE; then
@@ -596,6 +776,8 @@ run_xcodebuild() {
   fi
 
   mkdir -p "$BUILD_DIR"
+
+  bundle_shader_bridge_ios "$(rust_targets_for_sdk "$sdk")" "$sdk"
 
   # Prefer -target + SYMROOT over -derivedDataPath: modern Xcode requires
   # -scheme whenever -derivedDataPath is set, and love-ios ships no shared schemes.
@@ -619,9 +801,19 @@ run_xcodebuild() {
     PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID"
     MARKETING_VERSION="$marketing_version"
     CURRENT_PROJECT_VERSION="$project_version"
+    INFOPLIST_KEY_UIFileSharingEnabled=YES
+    INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace=YES
+    IPHONEOS_DEPLOYMENT_TARGET=15.0
     ONLY_ACTIVE_ARCH=NO
     DISABLE_MANUAL_TARGET_ORDER_BUILD_WARNING=YES
   )
+  if [ -n "$SHADER_BRIDGE_LIB" ]; then
+    args+=(OTHER_LDFLAGS="-Wl,-u,_librashader_translate_preset -Wl,-u,_librashader_free_string \"$SHADER_BRIDGE_LIB\" -lc++")
+    if [ -n "$SHADER_BRIDGE_ARCHS" ]; then
+      args+=(ARCHS="$SHADER_BRIDGE_ARCHS")
+    fi
+  fi
+
   if ! $DEVICE; then
     # Simulator: ad-hoc signing (no certificate needed). A plain unsigned
     # build would drop the entitlements file, and HealthKit refuses to run
@@ -637,6 +829,9 @@ run_xcodebuild() {
     fi
     if [ -n "${CODE_SIGN_IDENTITY:-}" ]; then
       args+=(CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY")
+    fi
+    if [ "${GEN1_DISABLE_HEALTHKIT:-0}" = "1" ]; then
+      args+=(CODE_SIGN_ENTITLEMENTS=)
     fi
   fi
 
@@ -680,27 +875,43 @@ run_xcodebuild() {
   fi
 
   local products="$BUILD_DIR/Build/Products/${config}-${sdk}"
-  local app="$products/$APP_NAME.app"
-  if [ ! -d "$app" ]; then
-    # PRODUCT_NAME override can still leave love.app on older projects
-    if [ -d "$products/love.app" ]; then
-      app="$products/$APP_NAME.app"
-      mv "$products/love.app" "$app"
-      warn "renamed love.app to $APP_NAME.app"
-    else
-      warn "xcodebuild finished but no .app under $products"
-      find "$BUILD_DIR/Build/Products" -name '*.app' 2>/dev/null | head -20 || true
-      return 0
+  local app=""
+  local candidate newest=0 mtime
+  for candidate in "$products/$PRODUCT_NAME.app" "$products/$APP_NAME.app" "$products/love.app"; do
+    if [ -d "$candidate" ]; then
+      mtime="$(stat -f %m "$candidate" 2>/dev/null || echo 0)"
+      if [ "$mtime" -gt "$newest" ]; then
+        newest="$mtime"
+        app="$candidate"
+      fi
     fi
+  done
+  if [ -z "$app" ]; then
+    warn "xcodebuild finished but no .app under $products"
+    find "$BUILD_DIR/Build/Products" -name '*.app' 2>/dev/null | head -20 || true
+    return 0
+  fi
+  if [ "$app" != "$products/$APP_NAME.app" ]; then
+    rm -rf "$products/$APP_NAME.app"
+    mv "$app" "$products/$APP_NAME.app"
+    app="$products/$APP_NAME.app"
   fi
 
+  verify_documents_configuration "$app"
+
   # Fuse even if the pbxproj wire-up failed,  LÖVE runs any bundled *.love.
-  if [ ! -f "$app/game.love" ]; then
+  # Byte-compare, never just existence: xcodebuild's incremental Copy Bundle
+  # Resources can leave a previous build's game.love in a surviving .app, and
+  # an existence check shipped that stale payload in the .ipa (today's Lua
+  # fixes present in ios/resources/ but absent from the installed app).
+  if ! cmp -s "$LOVE_FILE" "$app/game.love"; then
     say "fusing game.love into $(basename "$app")"
     cp "$LOVE_FILE" "$app/game.love"
   fi
 
+  verify_game_payload "$app"
   verify_native_bridge "$app"
+  verify_shader_bridge "$app"
 
   local dist_dir="$DIST/${config}-${sdk}"
   rm -rf "$dist_dir"
@@ -725,7 +936,7 @@ run_xcodebuild() {
   fi
 }
 
-# Pack Payload/<app>.app into dist/ios/gen1recomp.ipa for release / sideload tools.
+# Pack Payload/<app>.app into dist/ios/gen1recomp++.ipa for release / sideload tools.
 package_ipa() {
   local app="$1"
   local ipa="$DIST/$APP_NAME.ipa"
@@ -771,6 +982,7 @@ install_to_device() {
 
 # --------------------------------------------------------------- main
 apply_ios_branding
+verify_documents_overlay
 apply_ios_icon
 say "applying iOS native bridge patches (picker/Files support)"
 python3 "$IOS_DIR/patch_love_src.py" || fail "patch_love_src.py failed"

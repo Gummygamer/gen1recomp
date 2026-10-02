@@ -13,13 +13,44 @@
 
 local FrameCap = {}
 
+local function isHandheldEnv()
+  return os.getenv("HANDHELD") == "1" or os.getenv("PORTMASTER") == "1"
+    or os.getenv("POKEPORT_HANDHELD") == "1" or os.getenv("TRIMUI") == "1"
+    or os.getenv("MUOS") == "1" or os.getenv("KNULLI") == "1"
+end
+
+-- Platforms where PresentSync should pace via the panel (DISPLAY), not a
+-- numeric FrameCap default.  Android/iOS/UWP need uncapped probe isolation
+-- so composed GLES swapchains can lock; PortMaster handhelds likewise
+-- follow KMSDRM through PresentSync.
+function FrameCap.loopSupportsPanelSync()
+  return rawget(_G, "POKEPORT_LOOP_PANEL_SYNC") == true
+end
+
+function FrameCap.prefersPanelSync()
+  if not FrameCap.loopSupportsPanelSync() then return false end
+  if isHandheldEnv() then return true end
+  if love and love.system and love.system.getOS then
+    local osName = love.system.getOS()
+    if osName == "Android" or osName == "iOS" or osName == "UWP" then
+      return true
+    end
+  end
+  return false
+end
+
 -- Selectable steps: the normal framerate stops between the floor and the
 -- ceiling.  STEPS[1] == MIN and STEPS[#STEPS] == MAX, so the nearest-step
--- snap in normalize doubles as the clamp.  Cycling past the last wraps.
 FrameCap.STEPS = { 30, 40, 50, 60, 75, 90, 100, 120, 144, 160 }
 FrameCap.MIN = 30
 FrameCap.MAX = 160
 FrameCap.DEFAULT = 60
+
+FrameCap.DISPLAY = 0
+
+FrameCap.CYCLE = {}
+for i, step in ipairs(FrameCap.STEPS) do FrameCap.CYCLE[i] = step end
+FrameCap.CYCLE[#FrameCap.CYCLE + 1] = FrameCap.DISPLAY
 
 -- The live cap the run loop paces to.  Defaults so the launcher and the
 -- save editor are paced before any save applies its stored option.
@@ -27,11 +58,13 @@ FrameCap.current = FrameCap.DEFAULT
 
 -- Nearest valid step for an arbitrary value (a hand-edited options.lua or
 -- an old save with no fpsCap key), so a bad number degrades to something
--- sane; nil / non-numbers fall back to the default.  A value below MIN or
--- above MAX snaps to that end, since MIN/MAX are the first/last steps.
 function FrameCap.normalize(value)
   value = tonumber(value)
   if not value then return FrameCap.DEFAULT end
+  if value <= 0 then
+    if FrameCap.loopSupportsPanelSync() then return FrameCap.DISPLAY end
+    return FrameCap.DEFAULT
+  end
   local best, bestDiff = FrameCap.DEFAULT, math.huge
   for _, step in ipairs(FrameCap.STEPS) do
     local diff = math.abs(step - value)
@@ -40,21 +73,25 @@ function FrameCap.normalize(value)
   return best
 end
 
--- plain numeric text for the options row (e.g. "60")
 function FrameCap.label(value)
-  return tostring(FrameCap.normalize(value))
+  local cap = FrameCap.normalize(value)
+  local text = cap == FrameCap.DISPLAY and "DISPLAY" or tostring(cap)
+  local ok, hz = pcall(function()
+    return require("src.core.RefreshRate").mismatch()
+  end)
+  if ok and hz then text = string.format("%s (%dHZ)", text, math.floor(hz + 0.5)) end
+  return text
 end
 
--- cycle to the next/previous step, wrapping (the options row idiom)
 function FrameCap.cycle(value, dir)
-  local steps = FrameCap.STEPS
+  local ring = FrameCap.CYCLE
   local snapped = FrameCap.normalize(value)
   local cur = 1
-  for i, step in ipairs(steps) do
+  for i, step in ipairs(ring) do
     if step == snapped then cur = i break end
   end
-  local nextIdx = (cur - 1 + (dir or 1)) % #steps + 1
-  return steps[nextIdx]
+  local nextIdx = (cur - 1 + (dir or 1)) % #ring + 1
+  return ring[nextIdx]
 end
 
 -- Store the chosen cap as the live value the run loop paces to.  Never
@@ -66,7 +103,43 @@ function FrameCap.apply(value)
 end
 
 function FrameCap.applyOptions(opts)
-  FrameCap.apply(opts and opts.fpsCap)
+  local cap = opts and opts.fpsCap
+  -- Handheld / Android / iOS / UWP follow the panel through PresentSync; the
+  -- stored default 60 would bypass DISPLAY pacing and force the software
+  -- limiter (and on composed GLES nests that also prevents vsync locking).
+  if (cap == nil or cap == FrameCap.DEFAULT) and FrameCap.prefersPanelSync() then
+    cap = FrameCap.DISPLAY
+  end
+  return FrameCap.apply(cap)
+end
+
+-- Launcher / pre-save boot: same DISPLAY default before any save applies.
+function FrameCap.bootPanelSync()
+  if FrameCap.prefersPanelSync() and FrameCap.current == FrameCap.DEFAULT then
+    return FrameCap.apply(FrameCap.DISPLAY)
+  end
+  return FrameCap.current
+end
+
+-- Alias kept for existing call sites / docs.
+FrameCap.bootHandheld = FrameCap.bootPanelSync
+
+-- Performance LOW tier caps extras; do not rewrite DISPLAY to numeric 60 when
+-- the panel is already at or below the ceiling (that bypasses PresentSync).
+function FrameCap.clampToPerformance(fpsMax)
+  fpsMax = tonumber(fpsMax)
+  if not fpsMax then return FrameCap.current end
+  if FrameCap.current > fpsMax then
+    return FrameCap.apply(fpsMax)
+  end
+  if FrameCap.current == FrameCap.DISPLAY then
+    local ok, RR = pcall(require, "src.core.RefreshRate")
+    local hz = ok and RR.hz()
+    if hz and hz > fpsMax then
+      return FrameCap.apply(fpsMax)
+    end
+  end
+  return FrameCap.current
 end
 
 return FrameCap

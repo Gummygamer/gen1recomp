@@ -15,9 +15,7 @@ BindingsMenu.__index = BindingsMenu
 
 -- Input.lua's map, primary key first where several keys share a button.
 -- `pad` mirrors DEFAULT_GAMEPAD_BINDINGS in src/core/Input.lua row for
--- row; keep the two in sync.  Every row shows its key and pad so the
--- controller side is discoverable (#73, #589), and the swap in
--- storeBinding leans on each row holding a value in both slots.
+-- row, so the controller side is discoverable (#73, #589).
 local BUTTONS = {
   { id = "up", label = "UP", key = "up", pad = "dpup" },
   { id = "down", label = "DOWN", key = "down", pad = "dpdown" },
@@ -27,6 +25,18 @@ local BUTTONS = {
   { id = "b", label = "B", key = "x", pad = "b" },
   { id = "start", label = "START", key = "escape", pad = "start" },
   { id = "select", label = "SELECT", key = "tab", pad = "back" },
+  { id = "speedDown", label = "SPEED -", pad = "leftshoulder", action = true },
+  { id = "speedUp", label = "SPEED +", pad = "rightshoulder", action = true },
+}
+BindingsMenu.BUTTONS = BUTTONS
+
+BindingsMenu.GEN3_BUTTONS = {
+  BUTTONS[1], BUTTONS[2], BUTTONS[3], BUTTONS[4],
+  BUTTONS[5], BUTTONS[6], BUTTONS[7], BUTTONS[8],
+  { id = "l", label = "L", key = "q", pad = "leftshoulder" },
+  { id = "r", label = "R", key = "e", pad = "rightshoulder" },
+  { id = "speedDown", label = "SPEED -", pad = "triggerleft", action = true },
+  { id = "speedUp", label = "SPEED +", pad = "triggerright", action = true },
 }
 
 -- a binding is a plain key string or { key, pad }; absent = the fixed
@@ -41,6 +51,7 @@ end
 local function boundPad(overlay, def)
   local b = overlay and overlay[def.id]
   if type(b) == "table" and b.pad then return b.pad end
+  if b == false then return nil end
   return def.pad
 end
 
@@ -55,11 +66,15 @@ local KEY_SHORT = {
 local PAD_SHORT = {
   dpup = "D-UP", dpdown = "D-DN", dpleft = "D-LT", dpright = "D-RT",
   leftshoulder = "LB", rightshoulder = "RB",
+  triggerleft = "L2", triggerright = "R2",
+  lefttrigger = "L2", righttrigger = "R2",
   leftstick = "LS", rightstick = "RS", guide = "GUIDE",
 }
 local function shortName(name, shorts)
   local s = shorts[name]
   if s then return s end
+  local n = name:match("^joy(%d+)$")
+  if n and #n > 2 then return "J" .. n end
   s = name:upper()
   return #s > 5 and s:sub(1, 5) or s
 end
@@ -67,17 +82,20 @@ end
 -- Right column for every row: effective key and pad together, so a
 -- controller player can read the whole map without a second legend (#589).
 local function boundRight(overlay, def)
-  local key = shortName(boundKey(overlay, def), KEY_SHORT)
   local pad = boundPad(overlay, def)
+  if def.action then
+    return pad and shortName(pad, PAD_SHORT) or Strings("OFF")
+  end
+  local key = shortName(boundKey(overlay, def), KEY_SHORT)
   if pad then return key .. "/" .. shortName(pad, PAD_SHORT) end
   return key
 end
 
-function BindingsMenu.new(game)
+function BindingsMenu.new(game, opts)
   local overlay = game.save and game.save.options
                   and game.save.options.bindings
   local items = {}
-  for i, def in ipairs(BUTTONS) do
+  for i, def in ipairs(opts and opts.buttons or BUTTONS) do
     -- translated here, not in ROWS: that table is built at require
     -- time, before Strings.load has a catalog to look in
     items[i] = { label = Strings(def.label),
@@ -127,6 +145,7 @@ function BindingsMenu:beginCapture(item)
   self.onKeyReleased = BindingsMenu.captureKeyRelease
   self.onGamepadReleased = BindingsMenu.capturePadRelease
   self.onJoystickReleased = BindingsMenu.captureJoyRelease
+  if Input.armCapture then Input:armCapture() end
 end
 
 function BindingsMenu:endCapture()
@@ -138,6 +157,7 @@ function BindingsMenu:endCapture()
   self.onKeyReleased = nil
   self.onGamepadReleased = nil
   self.onJoystickReleased = nil
+  if Input.disarmCapture then Input:disarmCapture() end
 end
 
 -- Escape is the capture's way out, so it is never captured: every other
@@ -146,6 +166,9 @@ end
 -- which no rebind removes, so reserving it costs the player nothing.
 function BindingsMenu:captureKey(key)
   if key == "escape" or self.pending then return self:endCapture() end
+  if self.capture and self.capture.button.action then
+    return self:endCapture()
+  end
   self.pending = { slot = "key", value = key }
 end
 
@@ -203,22 +226,26 @@ function BindingsMenu:storeBinding(slot, value)
   opts.bindings = opts.bindings or {}
   -- Swap, never steal (#589): when the captured input is another row's
   -- effective binding in this slot, that row inherits this row's previous
-  -- binding.  Every BUTTONS row has a default in both slots, so `prev`
-  -- always exists: no row goes empty and no input serves two rows.
-  -- Default key ALIASES (W beside Up, Space beside Z; DEFAULT_BINDINGS in
-  -- Input.lua) are not effective bindings, so capturing one costs the
-  -- other row a spare alias, never its shown key.
+  -- binding.  Default key ALIASES (W beside Up, Space beside Z;
+  -- DEFAULT_BINDINGS in Input.lua) are not effective bindings, so capturing
+  -- one costs the other row a spare alias, never its shown key.
   local effective = (slot == "key") and boundKey or boundPad
   local prev = effective(opts.bindings, item.button)
+  local handover = prev
+  if handover == nil and item.button.action then handover = item.button.pad end
   if value ~= prev then
     for _, other in ipairs(self.items) do
       if other ~= item and effective(opts.bindings, other.button) == value then
-        local ob = opts.bindings[other.button.id]
-        if type(ob) ~= "table" then
-          ob = { key = type(ob) == "string" and ob or nil }
+        if other.button.action then
+          opts.bindings[other.button.id] = false
+        else
+          local ob = opts.bindings[other.button.id]
+          if type(ob) ~= "table" then
+            ob = { key = type(ob) == "string" and ob or nil }
+          end
+          ob[slot] = handover
+          opts.bindings[other.button.id] = ob
         end
-        ob[slot] = prev
-        opts.bindings[other.button.id] = ob
         other.right = boundRight(opts.bindings, other.button)
         break
       end
@@ -232,7 +259,11 @@ function BindingsMenu:storeBinding(slot, value)
   b[slot] = value
   opts.bindings[item.button.id] = b
   item.right = boundRight(opts.bindings, item.button)
-  if game.writeOptions then game:writeOptions() end
+  if game.writeOptions then
+    game:writeOptions()
+  elseif game.persistOptions then
+    game:persistOptions()
+  end
 end
 
 -- SELECT: forget one row's rebind and fall back to the defaults.  #510's
@@ -241,12 +272,23 @@ end
 function BindingsMenu:clearBinding(item)
   local game = self.game
   local opts = game and game.save and game.save.options
-  if not (opts and opts.bindings and opts.bindings[item.button.id]) then
-    return
+  local def = item.button
+  if def.action then
+    if not opts or (opts.bindings and opts.bindings[def.id] == false) then
+      return
+    end
+    opts.bindings = opts.bindings or {}
+    opts.bindings[def.id] = false
+  else
+    if not (opts and opts.bindings and opts.bindings[def.id]) then return end
+    opts.bindings[def.id] = nil
   end
-  opts.bindings[item.button.id] = nil
-  item.right = boundRight(opts.bindings, item.button)
-  if game.writeOptions then game:writeOptions() end
+  item.right = boundRight(opts.bindings, def)
+  if game.writeOptions then
+    game:writeOptions()
+  elseif game.persistOptions then
+    game:persistOptions()
+  end
 end
 
 -- START: confirm, then drop the whole overlay (#589).  The footer doubles
@@ -264,12 +306,39 @@ function BindingsMenu:confirmReset()
     for _, it in ipairs(self.items) do
       it.right = boundRight(nil, it.button)
     end
-    if game.writeOptions then game:writeOptions() end
+    if game.writeOptions then
+      game:writeOptions()
+    elseif game.persistOptions then
+      game:persistOptions()
+    end
   end, { defaultNo = true }))
 end
 
+function BindingsMenu:drainCapture()
+  local events = Input.takeCaptureEvents and Input:takeCaptureEvents()
+  if not events then return end
+  for i = 1, #events do
+    local ev = events[i]
+    if ev.phase == "pressed" then
+      if ev.kind == "key" then self:captureKey(ev.value)
+      elseif ev.kind == "pad" then self:capturePad(ev.value)
+      elseif ev.kind == "joy" then self:captureJoy(ev.value)
+      end
+    else
+      if ev.kind == "key" then self:captureKeyRelease(ev.value)
+      elseif ev.kind == "pad" then self:capturePadRelease(ev.value)
+      elseif ev.kind == "joy" then self:captureJoyRelease(ev.value)
+      end
+    end
+    if not self.capture then return end
+  end
+end
+
 function BindingsMenu:update(dt)
-  if self.capture then return end -- the raw capture owns the input
+  if self.capture then
+    self:drainCapture()
+    return
+  end
   if self.game.input:wasPressed("start") then
     return self:confirmReset()
   end

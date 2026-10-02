@@ -33,14 +33,27 @@ local function mkseq(vals)
 end
 
 -- (1) TRANSFORM: user.sprite morphs into the target species pic AND the
--- target's stat stages are copied (not cleared).  transform.asm:31-53
+-- target's stat stages are copied (not cleared).  transform.asm:37-45
 -- (AnimationTransformMon) + :57-132 (copies wEnemyMonStatMods).
+local function seenRows(tb)
+  local seen = {}
+  for _, item in ipairs(tb.queue) do seen[item] = true end
+  return seen
+end
+local function runNewFns(tb, seen)
+  for _, item in ipairs(tb.queue) do
+    if item.fn and not seen[item] then item.fn() end
+  end
+end
 do
   local tb = freshBattle()
+  local seen = seenRows(tb)
   local preSprite = tb.player.sprite
   tb.enemy.stages.attack = 2
   tb.enemy.stages.speed = -1
   MoveEffects.primary.TRANSFORM_EFFECT(tb, tb.player, tb.enemy)
+  eq(tb.player.sprite, preSprite, "transform does not swap the pic eagerly")
+  runNewFns(tb, seen)
   check(tb.player.sprite ~= preSprite, "transform swaps the user's sprite")
   eq(tb.player.sprite.path, Data.pokemon.PIDGEY.spriteBack,
      "player-side transform uses the target species BACK pic")
@@ -51,7 +64,9 @@ do
   eq(tb.player.stages.attack, 2, "transform stages are a deep copy")
   -- enemy-side transform uses the FRONT pic
   local tb2 = freshBattle()
+  local seen2 = seenRows(tb2)
   MoveEffects.primary.TRANSFORM_EFFECT(tb2, tb2.enemy, tb2.player)
+  runNewFns(tb2, seen2)
   eq(tb2.enemy.sprite.path, Data.pokemon.BULBASAUR.spriteFront,
      "enemy-side transform uses the target species FRONT pic")
 end
@@ -125,6 +140,7 @@ do
   function tb:enemyAction() return { special = "bound" } end
   tb:resolveSwitch(Game.save.party[2])
   acts[1]() -- send-out clears foe trap
+  acts[#acts]()
   eq(tb.enemy.trappingTurns, nil, "player switch clears foe Wrap/Bind/etc.")
   eq(tb.enemy.trapMove, nil, "player switch clears trapMove")
   check(tb:fightLockedAction(tb.player) == nil,
@@ -283,7 +299,8 @@ end
 do
   local pressed = {}
   local tb = freshBattle()
-  tb.game = { input = { wasPressed = function(_, k) return pressed[k] or false end },
+  tb.game = { input = { wasPressed = function(_, k) return pressed[k] or false end,
+                        isDown = function(_, k) return pressed[k] or false end },
               stack = { top = function() return tb end },
               save = Game.save }
   tb.kind = "wild"
@@ -359,7 +376,8 @@ do
   local fg = {
     data = Data,
     save = require("src.core.SaveData").newGame(),
-    input = { wasPressed = function(_, k) return pressed[k] or false end },
+    input = { wasPressed = function(_, k) return pressed[k] or false end,
+              isDown = function(_, k) return pressed[k] or false end },
     stack = stack,
   }
   fg.save.party = { Pokemon.new(Data, "BULBASAUR", 20) }
@@ -369,9 +387,13 @@ do
   local finished = false
   demo.onFinish = function() finished = true end
   local origStart = demo.startMessage
+  local caughtCont = false
   demo.startMessage = function(self, item)
     table.insert(seen, item.text)
     origStart(self, item)
+    if (item.text or ""):find("caught!", 1, true) then
+      caughtCont = self.lines[#self.lines].cont == true
+    end
   end
   stack:push(demo)
   demo:enter()
@@ -399,7 +421,7 @@ do
   local bag = stack:top()
   eq(bag.items and #bag.items, 1, "the old man's bag lists exactly one item")
   eq(bag.items[1].label, "POKé BALL", "the item is a POKé BALL")
-  eq(bag.items[1].right, "x50", "with quantity x50 (OldManItemList)")
+  eq(bag.items[1].count, 50, "with quantity x50 (OldManItemList)")
   -- the list script (home/list_menu.asm:65-80): input is never read --
   -- B can't back out -- and the '▶' hovers POKé BALL for 80 frames
   local enemyHP = demo.enemy.mon.hp
@@ -426,10 +448,15 @@ do
     bag:update(1 / 60)
   end
   check(stack:top() ~= bag, "the ball is thrown without input")
+  -- Battle exit now rides Transition.battleReturn (MapEntryAfterBattle's
+  -- GBFadeInFromWhite, home/overworld.asm:749-753): the battle pops itself
+  -- and pushes the fade, which fires onFinish only once ITS update counts
+  -- down -- so pump whatever sits on top of the stack, not the demo state.
   for _ = 1, 2000 do
     if finished then break end
     pressed.a = true
-    demo:update(1 / 60)
+    local top = stack:top()
+    if top then top:update(1 / 60) else break end
   end
   pressed.a = false
   check(finished, "the throw ends the demo battle")
@@ -438,11 +465,59 @@ do
     return false
   end
   check(sawText("OLD MAN used\nPOKé BALL!"), "the throw is credited to OLD MAN")
-  check(sawText("All right!\nWEEDLE was\ncaught!"), "the ball always catches (_ItemUseBallText05)")
+  check(sawText("All right!\nWEEDLE was\vcaught!"), "the ball always catches (_ItemUseBallText05)")
+  -- data/text/text_6.asm:29-35
+  check(caughtCont, "the 'caught!' line holds on CONT (ManualTextScroll)")
   eq(demo.enemy.mon.hp, enemyHP, "the old man never attacks (Weedle at full HP)")
   eq(#fg.save.party, 1, "the caught Weedle is NOT added to the party")
   check(not (fg.save.pokedex and fg.save.pokedex.owned and fg.save.pokedex.owned.WEEDLE),
         "the caught Weedle is NOT added to the dex")
+end
+
+-- (5b) Yellow's SimulatedInputBattleItemList (core.asm:2316-2319) drops
+-- the same canned bag to a single POKé BALL, x1 -- pokered's
+-- OldManItemList (core.asm:2212-2214, checked above) stays x50.  Only
+-- the item count changes; the scripted no-input menu flow is identical
+-- and already covered above, so this jumps straight to the bag.
+do
+  local GameVersion = require("src.core.GameVersion")
+  local oldVersion = GameVersion.get()
+  GameVersion.set("yellow")
+  local ok, err = pcall(function()
+    local pressed = {}
+    local stack = { states = {} }
+    function stack:push(s) table.insert(self.states, s) end
+    function stack:pop() return table.remove(self.states) end
+    function stack:top() return self.states[#self.states] end
+    local fg = {
+      data = Data,
+      save = require("src.core.SaveData").newGame(),
+      input = { wasPressed = function(_, k) return pressed[k] or false end,
+                isDown = function(_, k) return pressed[k] or false end },
+      stack = stack,
+    }
+    fg.save.party = { Pokemon.new(Data, "BULBASAUR", 20) }
+    local demo = BattleState.newWild(fg, "PIKACHU", 5)
+    demo:makeOldManDemo("PROF.OAK")
+    stack:push(demo)
+    demo:enter()
+    for _ = 1, 300 do
+      if demo.phase == "menu" then break end
+      pressed.a = true
+      demo:update(1 / 60)
+    end
+    pressed.a = false
+    eq(demo.phase, "menu", "Yellow: the demo reaches the battle menu")
+    for _ = 1, 200 do
+      if stack:top() ~= demo then break end
+      demo:update(1 / 60)
+    end
+    local bag = stack:top()
+    eq(bag.items and bag.items[1] and bag.items[1].count, 1,
+       "Yellow's old-man-style bag lists x1 (SimulatedInputBattleItemList)")
+  end)
+  GameVersion.set(oldVersion)
+  if not ok then error(err, 0) end
 end
 
 S.finish()

@@ -5,14 +5,17 @@
 // without updating that patch (see mobile/ios/patch_love_src.py).
 //
 // Contract (mirrors love-android's GameActivity.showFilePicker):
-//   love.system.pickFile("rom"|"mod"|"sav") -> copies the user's pick into
+//   love.system.pickFile("rom"|"mod"|"sav"|"cart"|"required_import") -> copies the user's pick into
 //   the LÖVE save directory as picked_rom.gb / picked_mod.zip /
-//   picked_save.sav; RomImporter's pending-file scan consumes it.
+//   picked_save.sav / picked_cart.g1rcart; RomImporter's pending-file scan consumes it.
 //   love.system.createFile(name) -> exports save dir's pending_export.sav
 //   through the system picker, then writes export_done.flag.
 
 import UIKit
 import UniformTypeIdentifiers
+import CryptoKit
+import Network
+import SafariServices
 
 @objc(GRPickerBridge)
 public final class GRPickerBridge: NSObject {
@@ -26,9 +29,8 @@ public final class GRPickerBridge: NSObject {
     // silently doing nothing.
     private static var liveDelegates: [PickerDelegate] = []
 
-    // conf.lua t.identity — where LÖVE puts the fused save directory on iOS
-    // (<sandbox>/Library/Application Support/<identity>).
     private static let loveIdentity = "pokemon-love2d"
+    private static var profileServer: NWListener?
 
     @objc(httpDownloadWithUrl:destination:userAgent:accept:)
     public static func httpDownload(url: UnsafePointer<CChar>?,
@@ -69,14 +71,257 @@ public final class GRPickerBridge: NSObject {
         return succeeded
     }
 
+    // MARK: - General HTTP request (love.system.httpRequest)
+
+    private static let httpMaxResponse = 4 * 1024 * 1024
+
+    // URLSession turns a 301/302/303 POST into a GET on its own. Save sync
+    // signs a method and a body, so every hop re-sends the original request
+    // against the new URL instead, and only over https.
+    private final class GRRedirectKeeper: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            guard let original = task.originalRequest,
+                  let target = request.url,
+                  target.scheme?.lowercased() == "https" else {
+                completionHandler(nil)
+                return
+            }
+            var next = original
+            next.url = target
+            completionHandler(next)
+        }
+    }
+
+    private static let httpSession = URLSession(configuration: .ephemeral,
+                                                delegate: GRRedirectKeeper(),
+                                                delegateQueue: nil)
+
+    private static func httpEnvelope(_ head: String, _ payload: Data?) -> NSData {
+        var out = Data((head + "\n").utf8)
+        if let payload { out.append(payload) }
+        return out as NSData
+    }
+
+    private static func httpErrorText(_ error: Error) -> String {
+        var text = error.localizedDescription
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+        if text.isEmpty { text = "the request failed" }
+        if text.count > 160 { text = String(text.prefix(160)) }
+        return text
+    }
+
+    /// Blocking HTTPS request with a chosen method, headers and byte body, the
+    /// iOS half of love.system.httpRequest (see the Android GameActivity one).
+    /// Headers arrive as "name: value" lines joined by newlines. The reply is
+    /// an envelope: a head line of "STATUS <code>" or "ERROR <text>", a
+    /// newline, then the raw response bytes -- read for 4xx and 5xx as well,
+    /// because a sync conflict answers 409 with the save that won.
+    @objc(httpRequestWithUrl:method:headers:body:bodyLength:userAgent:)
+    public static func httpRequest(url: UnsafePointer<CChar>?,
+                                   method: UnsafePointer<CChar>?,
+                                   headers: UnsafePointer<CChar>?,
+                                   body: UnsafePointer<UInt8>?,
+                                   bodyLength: Int32,
+                                   userAgent: UnsafePointer<CChar>?) -> NSData? {
+        guard let url, let requestURL = URL(string: String(cString: url)) else {
+            return httpEnvelope("ERROR missing url", nil)
+        }
+        guard requestURL.scheme?.lowercased() == "https" else {
+            return httpEnvelope("ERROR https only", nil)
+        }
+        let verb = (method.map { String(cString: $0) } ?? "GET").uppercased()
+        guard ["GET", "POST", "PUT", "DELETE"].contains(verb) else {
+            return httpEnvelope("ERROR unsupported request method", nil)
+        }
+
+        var request = URLRequest(url: requestURL)
+        request.httpMethod = verb
+        request.timeoutInterval = 60
+        request.setValue(userAgent.map { String(cString: $0) } ?? "gen1recomp",
+                         forHTTPHeaderField: "User-Agent")
+        if let headers, headers.pointee != 0 {
+            for line in String(cString: headers).split(separator: "\n") {
+                guard let colon = line.firstIndex(of: ":") else {
+                    return httpEnvelope("ERROR bad request header", nil)
+                }
+                let name = line[line.startIndex..<colon]
+                    .trimmingCharacters(in: .whitespaces)
+                let value = line[line.index(after: colon)...]
+                    .trimmingCharacters(in: .whitespaces)
+                if name.isEmpty {
+                    return httpEnvelope("ERROR bad request header", nil)
+                }
+                request.setValue(value, forHTTPHeaderField: name)
+            }
+        }
+        if verb != "GET", let body, bodyLength > 0 {
+            request.httpBody = Data(bytes: body, count: Int(bodyLength))
+        }
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var envelope = httpEnvelope("ERROR no response", nil)
+        let task = httpSession.dataTask(with: request) { data, response, error in
+            defer { semaphore.signal() }
+            if let error {
+                envelope = httpEnvelope("ERROR " + httpErrorText(error), nil)
+                return
+            }
+            guard let http = response as? HTTPURLResponse else {
+                envelope = httpEnvelope("ERROR no response", nil)
+                return
+            }
+            let payload = data ?? Data()
+            if payload.count > httpMaxResponse {
+                envelope = httpEnvelope("ERROR the reply was too large", nil)
+                return
+            }
+            envelope = httpEnvelope("STATUS \(http.statusCode)", payload)
+        }
+        task.resume()
+        guard semaphore.wait(timeout: .now() + 65) == .success else {
+            task.cancel()
+            return httpEnvelope("ERROR the request timed out", nil)
+        }
+        return envelope
+    }
+
+    @objc(installWebClipWithLabel:url:icon:iconLength:)
+    public static func installWebClip(label: UnsafePointer<CChar>?,
+                                       url: UnsafePointer<CChar>?,
+                                       icon: UnsafePointer<UInt8>?,
+                                       iconLength: Int32) -> Bool {
+        guard let url, let icon, iconLength > 0,
+              let launchURL = URL(string: String(cString: url)),
+              launchURL.scheme?.lowercased() == "gen1recomp++",
+              launchURL.host?.lowercased() == "launch" else { return false }
+
+        let rawLabel = label.map { String(cString: $0) } ?? "gen1recomp++"
+        let displayName = String(rawLabel.replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ").prefix(48))
+        guard let source = UIImage(data: Data(bytes: icon, count: Int(iconLength))) else {
+            return false
+        }
+        guard source.size.width > 0, source.size.height > 0 else { return false }
+
+        let iconSize = CGSize(width: 180, height: 180)
+        let renderer = UIGraphicsImageRenderer(size: iconSize)
+        let iconData = renderer.pngData(actions: { context in
+            context.cgContext.setFillColor(UIColor.black.cgColor)
+            context.cgContext.fill(CGRect(origin: .zero, size: iconSize))
+            let scale = min(160 / source.size.width, 160 / source.size.height)
+            let size = CGSize(width: source.size.width * scale,
+                              height: source.size.height * scale)
+            let rect = CGRect(x: (iconSize.width - size.width) / 2,
+                              y: (iconSize.height - size.height) / 2,
+                              width: size.width, height: size.height)
+            source.draw(in: rect)
+        })
+
+        let uuid = UUID().uuidString
+        let payloadIdentifier = "com.theboisclub.gen1recompplusplus.webclip.\(uuid)"
+        let description = "Web Clip for launching \(displayName) in gen1recomp++"
+        let webClip: [String: Any] = [
+            "FullScreen": true,
+            "Icon": iconData,
+            "IsRemovable": true,
+            "Label": displayName,
+            "Precomposed": false,
+            "PayloadDescription": description,
+            "PayloadDisplayName": displayName,
+            "PayloadIdentifier": payloadIdentifier,
+            "PayloadOrganization": "gen1recomp++",
+            "PayloadType": "com.apple.webClip.managed",
+            "PayloadUUID": uuid,
+            "PayloadVersion": 1,
+            "TargetApplicationBundleIdentifier": "com.theboisclub.gen1recompplusplus",
+            "URL": launchURL.absoluteString,
+        ]
+        let profile: [String: Any] = [
+            "ConsentText": [
+                "default": "This profile installs a Home Screen entry for \(displayName)"
+            ],
+            "PayloadContent": [webClip],
+            "PayloadDescription": description,
+            "PayloadDisplayName": displayName,
+            "PayloadIdentifier": payloadIdentifier,
+            "PayloadOrganization": "gen1recomp++",
+            "PayloadRemovalDisallowed": false,
+            "PayloadType": "Configuration",
+            "PayloadUUID": UUID().uuidString,
+            "PayloadVersion": 1,
+        ]
+        guard let profileData = try? PropertyListSerialization.data(
+            fromPropertyList: profile, format: .xml, options: 0) else {
+            return false
+        }
+
+        guard let server = try? NWListener(using: .tcp, on: .any) else {
+            return false
+        }
+        profileServer?.cancel()
+        let serverQueue = DispatchQueue(label: "com.theboisclub.gen1recompplusplus.webclip")
+        server.newConnectionHandler = { connection in
+            connection.stateUpdateHandler = { state in
+                guard case .ready = state else {
+                    if case .failed = state { connection.cancel() }
+                    return
+                }
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { _, _, _, _ in
+                    var response = Data("HTTP/1.1 200 OK\r\nContent-Type: application/x-apple-aspen-config\r\nContent-Disposition: attachment; filename=gen1recomp.mobileconfig\r\nContent-Length: \(profileData.count)\r\nConnection: close\r\n\r\n".utf8)
+                    response.append(profileData)
+                    connection.send(content: response, completion: .contentProcessed { _ in
+                        connection.cancel()
+                    })
+                }
+            }
+            connection.start(queue: serverQueue)
+        }
+        server.stateUpdateHandler = { state in
+            guard case .ready = state, let port = server.port?.rawValue else {
+                if case .failed = state { server.cancel() }
+                return
+            }
+            DispatchQueue.main.async {
+                guard let scene = UIApplication.shared.connectedScenes
+                    .compactMap({ $0 as? UIWindowScene })
+                    .first(where: { $0.activationState == .foregroundActive }),
+                      let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController,
+                      let profileURL = URL(string: "http://127.0.0.1:\(port)/gen1recomp.mobileconfig") else {
+                    server.cancel()
+                    return
+                }
+                var presenter = root
+                while let presented = presenter.presentedViewController {
+                    presenter = presented
+                }
+                presenter.present(SFSafariViewController(url: profileURL), animated: true)
+            }
+        }
+        profileServer = server
+        server.start(queue: serverQueue)
+        return true
+    }
+
     // MARK: - Entry points called from liblove (C strings on purpose)
 
     @objc(presentPickerWithKind:saveDir:)
     public static func presentPicker(kind: UnsafePointer<CChar>?,
                                      saveDir: UnsafePointer<CChar>?) -> Bool {
+        return presentPicker(kind: kind, saveDir: saveDir, destination: nil)
+    }
+
+    @objc(presentPickerWithKind:saveDir:destination:)
+    public static func presentPicker(kind: UnsafePointer<CChar>?,
+                                     saveDir: UnsafePointer<CChar>?,
+                                     destination: UnsafePointer<CChar>?) -> Bool {
         let kindStr = kind.map { String(cString: $0) } ?? "rom"
         guard let dir = resolvedSaveDir(saveDir) else { return false }
 
+        let requestedDestination = destination.map { String(cString: $0) }
         let destName: String
         var types: [UTType] = []
         switch kindStr {
@@ -85,11 +330,41 @@ public final class GRPickerBridge: NSObject {
             types = [.zip]
         case "sav":
             destName = "picked_save.sav"
-        default:
+        case "cart":
+            destName = "picked_cart.g1rcart"
+            if let t = UTType(filenameExtension: "g1rcart") { types.append(t) }
+        case "required_import":
+            if let requestedDestination,
+               isDirectRequiredDestination(requestedDestination),
+               safeDestination(in: dir, relative: requestedDestination) != nil {
+                destName = requestedDestination
+            } else {
+                destName = "picked_required_import.bin"
+            }
+        // A Nintendo 64 cartridge, for mods that build assets out of one --
+        // the voxel mod's Pokemon Stadium battle models are the caller this
+        // was added for. Its own filename on purpose: an N64 ROM landing on
+        // picked_rom.gb is swept up by the Game Boy importer, deleted, and
+        // reported to the player as a broken cartridge.
+        case "stadium":
+            destName = "picked_stadium.z64"
+            for ext in ["z64", "n64", "v64"] {
+                if let t = UTType(filenameExtension: ext) { types.append(t) }
+            }
+        case "rom", "":
             destName = "picked_rom.gb"
             for ext in ["gb", "gbc"] {
                 if let t = UTType(filenameExtension: ext) { types.append(t) }
             }
+        // An unknown kind is REFUSED rather than treated as a Game Boy ROM.
+        //
+        // It used to fall through to picked_rom.gb, so a caller asking for a
+        // kind this build had never heard of got its file deleted and
+        // reported as a broken cartridge -- the worst possible answer to
+        // "I do not know that one". Returning false lets the caller find out
+        // and offer its own fallback.
+        default:
+            return false
         }
         // .gb/.gbc/.sav resolve to dynamic UTTypes on most devices; offering
         // .data as well keeps every real file selectable. The importer
@@ -97,14 +372,34 @@ public final class GRPickerBridge: NSObject {
         types.append(.data)
         if !types.contains(.item) { types.append(.item) }
 
+        let directRequired = kindStr == "required_import"
+            && destName != "picked_required_import.bin"
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: types,
-                                                    asCopy: true)
+                                                    asCopy: !directRequired)
         picker.allowsMultipleSelection = false
         let delegate = PickerDelegate { urls in
             guard let src = urls.first else { return }
-            copyItem(at: src, into: dir, named: destName)
+            if directRequired {
+                copyRequiredItemAsync(at: src, into: dir, relative: destName)
+            } else {
+                copyItem(at: src, into: dir, named: destName)
+            }
         }
         return present(picker, with: delegate)
+    }
+
+    // Which kinds presentPicker understands, comma separated.
+    //
+    // So a CALLER can ask before it calls. A mod that wants a kind this build
+    // predates cannot otherwise tell "refused" from "the picker would not
+    // open", and guessing wrong used to cost the player their ROM (see the
+    // default case above). Asking first turns that into a fallback the caller
+    // chooses rather than a file it loses.
+    //
+    // Kept beside the switch it describes, because the two drifting apart is
+    // the only way this can lie.
+    @objc public static func supportedPickerKinds() -> NSString {
+        return "rom,mod,sav,cart,stadium,required_import" as NSString
     }
 
     @objc(presentExportWithName:saveDir:)
@@ -144,10 +439,10 @@ public final class GRPickerBridge: NSObject {
     // UIApplicationDidBecomeActive (see GRBootstrap.m).
     @objc public static func sweepInbox() {
         let fm = FileManager.default
-        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first,
-              let appSupport = fm.urls(for: .applicationSupportDirectory,
-                                       in: .userDomainMask).first else { return }
-        let saveDir = appSupport.appendingPathComponent(loveIdentity, isDirectory: true)
+        migrateLegacySaveDirectory()
+        guard let docs = documentsDirectory(),
+              let saveDir = publicSaveDirectory() else { return }
+        guard docs.standardizedFileURL != saveDir.standardizedFileURL else { return }
         let wanted: Set<String> = ["gb", "gbc", "zip", "sav"]
         guard let items = try? fm.contentsOfDirectory(at: docs,
                                                       includingPropertiesForKeys: nil) else { return }
@@ -164,15 +459,21 @@ public final class GRPickerBridge: NSObject {
         }
     }
 
+    @objc public static func preparePublicDocuments() {
+        migrateLegacySaveDirectory()
+        if let saveDir = publicSaveDirectory() {
+            ensureDirectory(saveDir)
+        }
+    }
+
     // MARK: - Helpers
 
     private static func resolvedSaveDir(_ cstr: UnsafePointer<CChar>?) -> URL? {
         var dir = cstr.map { String(cString: $0) } ?? ""
         if dir.isEmpty {
-            guard let appSupport = FileManager.default
-                .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            else { return nil }
-            dir = appSupport.appendingPathComponent(loveIdentity).path
+            migrateLegacySaveDirectory()
+            guard let saveDir = publicSaveDirectory() else { return nil }
+            dir = saveDir.path
         }
         let url = URL(fileURLWithPath: dir, isDirectory: true)
         ensureDirectory(url)
@@ -182,6 +483,151 @@ public final class GRPickerBridge: NSObject {
     private static func ensureDirectory(_ url: URL) {
         try? FileManager.default.createDirectory(at: url,
                                                  withIntermediateDirectories: true)
+    }
+
+    private static func documentsDirectory() -> URL? {
+        FileManager.default.urls(for: .documentDirectory,
+                                 in: .userDomainMask).first
+    }
+
+    private static func publicSaveDirectory() -> URL? {
+        documentsDirectory()
+    }
+
+    private static func legacySaveDirectory() -> URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory,
+                                 in: .userDomainMask).first?
+            .appendingPathComponent(loveIdentity, isDirectory: true)
+    }
+
+    private static func migrateLegacySaveDirectory() {
+        let fm = FileManager.default
+        guard let destination = publicSaveDirectory(),
+              let legacy = legacySaveDirectory(),
+              fm.fileExists(atPath: legacy.path) else {
+            return
+        }
+        ensureDirectory(destination)
+        mergeDirectory(from: legacy, to: destination)
+        try? fm.removeItem(at: legacy)
+    }
+
+    private static func mergeDirectory(from source: URL, to destination: URL) {
+        let fm = FileManager.default
+        ensureDirectory(destination)
+        guard let items = try? fm.contentsOfDirectory(at: source,
+                                                       includingPropertiesForKeys: nil)
+        else { return }
+        for item in items {
+            let target = destination.appendingPathComponent(item.lastPathComponent)
+            var sourceIsDirectory = ObjCBool(false)
+            fm.fileExists(atPath: item.path, isDirectory: &sourceIsDirectory)
+            var targetIsDirectory = ObjCBool(false)
+            let targetExists = fm.fileExists(atPath: target.path,
+                                              isDirectory: &targetIsDirectory)
+            if sourceIsDirectory.boolValue && targetExists && targetIsDirectory.boolValue {
+                mergeDirectory(from: item, to: target)
+                continue
+            }
+            if targetExists {
+                if !sourceIsDirectory.boolValue && !targetIsDirectory.boolValue &&
+                    fm.contentsEqual(atPath: item.path, andPath: target.path) {
+                    try? fm.removeItem(at: item)
+                } else {
+                    moveToLegacyName(item, in: destination)
+                }
+                continue
+            }
+            try? fm.moveItem(at: item, to: target)
+        }
+    }
+
+    private static func moveToLegacyName(_ item: URL, in destination: URL) {
+        let fm = FileManager.default
+        let base = item.lastPathComponent + ".legacy"
+        var target = destination.appendingPathComponent(base)
+        var suffix = 2
+        while fm.fileExists(atPath: target.path) {
+            target = destination.appendingPathComponent("\(base).\(suffix)")
+            suffix += 1
+        }
+        try? fm.moveItem(at: item, to: target)
+    }
+
+    private static func isDirectRequiredDestination(_ relative: String) -> Bool {
+        let normalized = relative.replacingOccurrences(of: "\\", with: "/")
+        guard normalized.hasPrefix("mods/"),
+              let range = normalized.range(of: "/baseroms/"),
+              range.lowerBound > normalized.index(normalized.startIndex, offsetBy: 5),
+              range.upperBound < normalized.endIndex else { return false }
+        return !normalized.hasPrefix("/")
+            && !normalized.contains("//")
+            && !normalized.contains("/../")
+            && !normalized.hasSuffix("/..")
+    }
+
+    private static func safeDestination(in root: URL, relative: String) -> URL? {
+        guard isDirectRequiredDestination(relative) else { return nil }
+        let rootURL = root.standardizedFileURL
+        let candidate = rootURL.appendingPathComponent(relative).standardizedFileURL
+        let rootPath = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
+        guard candidate.path.hasPrefix(rootPath) else { return nil }
+        return candidate
+    }
+
+    private static func writeFlag(in dir: URL, name: String, body: String) {
+        try? body.data(using: .utf8)?.write(to: dir.appendingPathComponent(name),
+                                           options: .atomic)
+    }
+
+    private static func copyRequiredItemAsync(at src: URL, into dir: URL,
+                                              relative: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let scoped = src.startAccessingSecurityScopedResource()
+            defer { if scoped { src.stopAccessingSecurityScopedResource() } }
+            guard let dest = safeDestination(in: dir, relative: relative) else {
+                writeFlag(in: dir, name: "pick_error.flag", body: relative)
+                return
+            }
+            let fm = FileManager.default
+            ensureDirectory(dest.deletingLastPathComponent())
+            let partial = URL(fileURLWithPath: dest.path + ".part")
+            try? fm.removeItem(at: partial)
+            guard fm.createFile(atPath: partial.path, contents: nil) else {
+                writeFlag(in: dir, name: "pick_error.flag", body: relative)
+                return
+            }
+
+            var hasher = Insecure.MD5()
+            var total: UInt64 = 0
+            do {
+                let input = try FileHandle(forReadingFrom: src)
+                let output = try FileHandle(forWritingTo: partial)
+                defer {
+                    try? input.close()
+                    try? output.close()
+                }
+                while true {
+                    let data = input.readData(ofLength: 1024 * 1024)
+                    if data.isEmpty { break }
+                    hasher.update(data: data)
+                    output.write(data)
+                    total += UInt64(data.count)
+                }
+                output.synchronizeFile()
+                try? fm.removeItem(at: dest)
+                try fm.moveItem(at: partial, to: dest)
+                let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+                let marker = "v1\n" + relative + "\n" + digest + "\n"
+                    + String(total) + "\n"
+                writeFlag(in: dir, name: "pick_complete.flag", body: marker)
+                NSLog("GRPickerBridge: direct required import delivered %llu bytes", total)
+            } catch {
+                try? fm.removeItem(at: partial)
+                NSLog("GRPickerBridge: direct required import failed: \(error)")
+                writeFlag(in: dir, name: "pick_error.flag", body: relative)
+            }
+        }
     }
 
     private static func copyItem(at src: URL, into dir: URL, named name: String) {
@@ -200,7 +646,7 @@ public final class GRPickerBridge: NSObject {
             let report = "Could not copy \(src.lastPathComponent): " +
                 error.localizedDescription
             try? report.data(using: .utf8)?
-                .write(to: dir.appendingPathComponent("pick_error.txt"))
+                .write(to: dir.appendingPathComponent("pick_error.flag"))
         }
     }
 

@@ -23,9 +23,13 @@ local function push(game, s, done)
   game.stack:push(TextBox.new(game, s, done))
 end
 
+-- PrintText on a text_end string returns with the box still drawn and
+-- YesNoChoice then draws the menu above it (InitYesNoTextBoxParameters,
+-- engine/menus/text_box.asm); no A press clears the question first.  Ride
+-- TextBox's opts.choice, the same as Commands.ask (#854).
 local function ask(game, s, cb)
-  local ChoiceBox = require("src.ui.ChoiceBox")
-  push(game, s, function() game.stack:push(ChoiceBox.new(game, cb)) end)
+  local TextBox = require("src.render.TextBox")
+  game.stack:push(TextBox.new(game, s, nil, { choice = cb }))
 end
 
 M.VIRIDIAN_CITY = {
@@ -56,22 +60,23 @@ M.VIRIDIAN_CITY = {
     -- you want to know about the two kinds of caterpillar Pokemon;
     -- YES -> CATERPIE/WEEDLE description, NO -> "Oh, OK then!".
     -- ViridianCityYoungster2OkThenText and
-    -- ViridianCityYoungster2CaterpieAndWeedleDescriptionText are
-    -- defined without a leading underscore in pokered/text/ViridianCity.asm
-    -- and aren't present in data/generated/text.lua, so we fall back to
-    -- the literal strings from pokered.  Those fallbacks have to carry the
-    -- extractor's markers, not plain newlines: line -> \n, cont -> \v,
-    -- para -> \f.  Spelling cont/para as \n and \n\n put all six lines on
-    -- one page with nothing to wait on, so the whole speech scrolled past
-    -- without a button press (#250).
+    -- ViridianCityYoungster2CaterpieAndWeedleDescriptionText are defined
+    -- without a leading underscore in pokered/text/ViridianCity.asm, but
+    -- tools/extract/text.py now collects them regardless -- the literal
+    -- strings below are only the fallback for a catalog without them.
+    -- Those fallbacks have to carry the extractor's markers, not plain
+    -- newlines: line -> \n, cont -> \v, para -> \f.  Spelling cont/para as
+    -- \n and \n\n put all six lines on one page with nothing to wait on,
+    -- so the whole speech scrolled past without a button press (#250).
     TEXT_VIRIDIANCITY_YOUNGSTER2 = function(game, ow, npc, done)
       local t = text(game)
       ask(game, t._ViridianCityYoungster2YouWantToKnowAboutText
         or "You want to know\nabout the 2 kinds\vof caterpillar\vPOKéMON?", function(yes)
         if yes then
-          push(game, "CATERPIE has no\npoison, but\vWEEDLE does.\fWatch out for its\nPOISON STING!", done)
+          push(game, t.ViridianCityYoungster2CaterpieAndWeedleDescriptionText
+            or "CATERPIE has no\npoison, but\vWEEDLE does.\fWatch out for its\nPOISON STING!", done)
         else
-          push(game, "Oh, OK then!", done)
+          push(game, t.ViridianCityYoungster2OkThenText or "Oh, OK then!", done)
         end
       end)
     end,

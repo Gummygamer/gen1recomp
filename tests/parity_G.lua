@@ -44,11 +44,15 @@ end
 TileRenderer.setSpinning(false)
 check(not TileRenderer.spinBlurActive(), "no arrow blur frame outside a spin")
 
-TileRenderer.setSpinning(true)
+-- home/overworld.asm:1844-1846, engine/overworld/spinners.asm:17-19
+TileRenderer.setSpinning(true, 9)
 local a = TileRenderer.spinBlurActive()
-for i = 1, 8 do TileRenderer.tick() end
+for i = 1, 48 do TileRenderer.tick() end
+check(TileRenderer.spinBlurActive() == a, "arrow blur holds for the whole spinner tile")
+TileRenderer.setSpinning(true, 8)
 local b = TileRenderer.spinBlurActive()
-check(a ~= b, "arrow blur frame toggles every ~8 ticks while spinning")
+check(a ~= b, "arrow blur toggles once per spinner tile")
+check(a, "odd wSimulatedJoypadStatesIndex shows the blur graphic")
 
 TileRenderer.setSpinning(false)
 check(not TileRenderer.spinBlurActive(), "blur frame turns off once the spin ends")

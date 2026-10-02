@@ -198,6 +198,12 @@ function RomExtractor:extractTilesets()
     out[constName] = {
       id = constName,
       source = ("ROM:Tilesets[%d]"):format(index - 1),
+      -- The raw Tilesets row, verbatim.  A .sav export has to reproduce what
+      -- LoadTilesetHeader (engine/overworld/tilesets.asm) would have left in
+      -- wTilesetBank..wGrassTile, because a Continue never re-runs it -- see
+      -- src/save_convert/MapContext.lua (#889).  Byte 12 is the tile
+      -- animation id, which rides in sTileAnimations.
+      header = self.rom:bytes(headers.bank, rowAddress, 12),
       image = "assets/generated/tilesets/" .. base .. ".png",
       imageWidth = spec.imageWidth,
       imageHeight = spec.imageHeight,
@@ -268,6 +274,11 @@ function RomExtractor:extractMaps()
     assert(tilesetId < #tilesets, constName .. ": unknown tileset id")
     local blockPointer = self.rom:word(header.bank, address + 3)
     local connectionFlags = self.rom:byte(header.bank, address + 9)
+    -- wCurMapHeader verbatim (tileset, height, width, data/text/script
+    -- pointers, connection flags).  A save restores this window instead of
+    -- rebuilding it, so an export has to carry the real bytes (#889).
+    local headerBytes = self.rom:bytes(header.bank, address, 10)
+    local connectionStart = address + 10
     address = address + 10
 
     local connections = {}
@@ -289,6 +300,8 @@ function RomExtractor:extractMaps()
     end
     assert(bit.band(connectionFlags, 0xF0) == 0,
       constName .. ": unknown connection flags")
+    local connectionBytes = self.rom:bytes(
+      header.bank, connectionStart, address - connectionStart)
     local objectPointer = self.rom:word(header.bank, address)
     local objectAddress = objectPointer
     local borderBlock = self.rom:byte(header.bank, objectAddress)
@@ -376,6 +389,17 @@ function RomExtractor:extractMaps()
       width = width, height = height, blocks = blocks,
       borderBlock = borderBlock, connections = connections,
       warps = warps, signs = signs, objects = objects,
+      -- Raw ROM bytes a .sav export replays through LoadMapHeader's WRAM
+      -- writes (src/save_convert/MapContext.lua, #889).  Kept as the original
+      -- bytes rather than re-encoded from the decoded tables above: the
+      -- pointers in them (wCurMapDataPtr, the connection strip src/dest
+      -- addresses, sign text ids) have no equivalent in the port's own model.
+      sram = {
+        header = headerBytes,
+        connections = connectionBytes,
+        objects = self.rom:bytes(
+          header.bank, objectPointer, objectAddress - objectPointer),
+      },
     }
     self:tick("Maps", mapIndex, #keys)
   end
@@ -432,9 +456,42 @@ function RomExtractor:extractFont()
     mainBase = 0x80, extraBase = 0x60, glyphsPerRow = 16,
     charmap = self.manifest.fontCharmap,
   }
+  -- engine/menus/naming_screen.asm:326
+  local edSymbol = self.symbols["ED_Tile"]
+  if edSymbol then
+    local edRaw = self.rom:bytes(edSymbol[1], edSymbol[2], 8)
+    local ed = ImageWriter.blank(8, 8, 0, 0, 0, 0)
+    for y = 0, 7 do
+      local row = edRaw[y + 1]
+      for x = 0, 7 do
+        if bit.band(row, 2 ^ (7 - x)) ~= 0 then
+          ed:setPixel(x, y, 0, 0, 0, 1)
+        end
+      end
+    end
+    self:save(ed, "fonts/ed.png")
+    data.imageEd = "assets/generated/fonts/ed.png"
+  end
   self:write("font", data)
   self:tick("Fonts", 2, 2)
   return data
+end
+
+-- engine/overworld/map_sprites.asm:181
+function RomExtractor.spriteSheetLength(constName, width, height, firstHalf)
+  local byteLength = width * height / 4
+  local frames = height / 16
+  local expected = firstHalf * (frames >= 6 and 2 or 1)
+  if byteLength < expected then
+    byteLength = expected
+    assert(byteLength * 4 % width == 0,
+      constName .. ": ROM sprite length not tile-aligned")
+    height = byteLength * 4 / width
+    frames = height / 16
+    expected = firstHalf * (frames >= 6 and 2 or 1)
+    assert(byteLength == expected, constName .. ": sprite length mismatch")
+  end
+  return byteLength, height, frames
 end
 
 function RomExtractor:extractSprites()
@@ -452,21 +509,8 @@ function RomExtractor:extractSprites()
     local firstHalf = self.rom:byte(pointerTable.bank, address + 2)
     local bank = self.rom:byte(pointerTable.bank, address + 3)
     local width = spec.imageWidth
-    local height = spec.imageHeight
-    local byteLength = width * height / 4
-    local frames = height / 16
-    local expected = firstHalf * (frames >= 6 and 2 or 1)
-    if byteLength ~= expected then
-      -- Commercial ROM sheet length wins over pret PNG atlases (Yellow nurse
-      -- PNG is taller than the 12-tile SpriteSheetPointerTable entry).
-      byteLength = expected
-      assert(byteLength * 4 % width == 0,
-        constName .. ": ROM sprite length not tile-aligned")
-      height = byteLength * 4 / width
-      frames = height / 16
-      expected = firstHalf * (frames >= 6 and 2 or 1)
-      assert(byteLength == expected, constName .. ": sprite length mismatch")
-    end
+    local byteLength, height, frames = RomExtractor.spriteSheetLength(
+      constName, width, spec.imageHeight, firstHalf)
     local base = spec.imageBase
     if not written[base] then
       self:write2bpp(self.rom:bytes(bank, pointer, byteLength),
@@ -780,12 +824,21 @@ function RomExtractor:extractBattleAnimations()
     end
   end
 
+  -- engine/battle/animations.asm:2418
+  local deltaSymbol = self:symbol("FallingObjects_DeltaXs")
+  local fallingDeltaXs = {}
+  for index = 0, 63 do
+    fallingDeltaXs[index] =
+      self.rom:byte(deltaSymbol.bank, deltaSymbol.address + index)
+  end
+
   local out = {
     tilesheets = tilesheets,
     baseCoords = baseCoords,
     frameBlocks = frameBlocks,
     subanims = subanims,
     moveAnims = moveAnims,
+    fallingDeltaXs = fallingDeltaXs,
   }
   self:write("battle_anims", out)
   return out
@@ -1408,7 +1461,8 @@ function RomExtractor:textGlyph(value)
   if TEXT_GLYPH_OVERRIDES[value] then return TEXT_GLYPH_OVERRIDES[value] end
   local glyph = self.manifest.charmap[tostring(value)]
     or ("{BYTE:%02X}"):format(value)
-  if glyph:sub(1, 1) == "<" and glyph:sub(-1) == ">" then
+  -- home/text.asm:186
+  if glyph:match("^<[^<>]*>$") then
     return "{" .. glyph:sub(2, -2) .. "}"
   end
   return glyph
@@ -1424,6 +1478,8 @@ function RomExtractor:decodeTextCommands(symbol, substitutions)
     if command == 0x50 then
       assert(pending > #substitutions,
         symbol.name .. ": unused dynamic text substitutions")
+      -- home/text.asm:221
+      if #out > 0 then out[#out + 1] = "{DONE}" end
       return table.concat(out)
     elseif command == 0 then
       while true do
@@ -1433,6 +1489,10 @@ function RomExtractor:decodeTextCommands(symbol, substitutions)
         if value == 0x57 or value == 0x58 or value == 0x5F then
           assert(pending > #substitutions,
             symbol.name .. ": unused dynamic text substitutions")
+          -- constants/charmap.asm:19-20
+          if value ~= 0x5F and #out > 0 then
+            out[#out + 1] = (value == 0x58) and "{PROMPT}" or "{DONE}"
+          end
           return table.concat(out)
         end
         out[#out + 1] = self:textGlyph(value)
@@ -1511,6 +1571,14 @@ function RomExtractor:extractYellowTitleArt()
   local bg = sheetTiles("TitlePikachuBGGraphics", 64)
   local ob = sheetTiles("TitlePikachuOBGraphics", 12)
   local obClear = sheetTiles("TitlePikachuOBGraphics", 12, true)
+  -- Title rOBP0=$E0: remap eye OAM shades 1/2 → white before baking into the
+  -- MEWMON BG composition (otherwise glints read as body yellow).
+  local eyeOb = {}
+  for i, tile in ipairs(obClear) do
+    local copy = ImageWriter.blank(8, 8, 0, 0, 0, 0)
+    ImageWriter.blit(copy, tile, 0, 0)
+    eyeOb[i] = ImageWriter.applyTitleObp0(copy)
+  end
   local function tileFor(id)
     if id < 0x80 then return logo[id + 1] end
     if id < 0xF0 then return bg[id - 0x80 + 1] end
@@ -1599,17 +1667,124 @@ function RomExtractor:extractYellowTitleArt()
     local overlay = ImageWriter.blank(48, 16, 1, 1, 1, 0)
     ImageWriter.blit(overlay, pikachu, 0, 0, 24, 16, 48, 16)
     for _, e in ipairs(EYE_LAYOUT) do
-      blitSprite(overlay, obClear[base + e[1]], e[2] - 24, e[3] - 16, e[4])
+      blitSprite(overlay, eyeOb[base + e[1]], e[2] - 24, e[3] - 16, e[4])
     end
     overlays[suffix] = overlay
   end
   -- open eyes bake into pikachu.png AFTER the blank-face crops
   for _, e in ipairs(EYE_LAYOUT) do
-    blitSprite(pikachu, obClear[e[1]], e[2], e[3], e[4])
+    blitSprite(pikachu, eyeOb[e[1]], e[2], e[3], e[4])
   end
   self:save(pikachu, "title/pikachu.png")
   for suffix, overlay in pairs(overlays) do
     self:save(overlay, "title/" .. suffix .. ".png")
+  end
+end
+
+function RomExtractor:extractSurfingPikachuTitleArt()
+  -- engine/minigame/surfing_pikachu.asm
+  -- DrawSurfingPikachuMinigameIntroBackground: compose the 160x144
+  -- "Pikachu's Beach" title from SurfingMinigame_* tilemaps over
+  -- SurfingPikachu1Graphics3 tiles (mirrors tools/build_rom_data.py).
+  if not self.symbols["SurfingPikachu1Graphics3"] then return end
+  if not self.symbols["SurfingMinigame_BeachIntroTilemap"] then return end
+
+  local beachIntro = self:symbol("SurfingMinigame_BeachIntroTilemap")
+  local useCtrlPad = self:symbol("SurfingMinigame_UseControlPadTilemap")
+  local toSurfRad = self:symbol("SurfingMinigame_ToSurfRadTilemap")
+  local titleMap = self:symbol("SurfingMinigame_TitleTilemap")
+
+  local beachBytes = self.rom:bytes(
+    beachIntro.bank, beachIntro.address, 12 * 20)
+  local useCtrlBytes = self.rom:bytes(
+    useCtrlPad.bank, useCtrlPad.address, 15)
+  local toSurfRadBytes = self.rom:bytes(
+    toSurfRad.bank, toSurfRad.address, 13)
+  local titleMapBytes = self.rom:bytes(
+    titleMap.bank, titleMap.address, 6 * 12)
+
+  local screen = {}
+  for _ = 1, 20 * 18 do screen[#screen + 1] = 0xff end
+
+  for i = 1, #beachBytes do
+    screen[6 * 20 + i] = beachBytes[i]
+  end
+  for r = 0, 5 do
+    for c = 0, 11 do
+      screen[r * 20 + (4 + c) + 1] = titleMapBytes[r * 12 + c + 1]
+    end
+  end
+  for r = 0, 2 do
+    for c = 0, 14 do
+      screen[(7 + r) * 20 + (3 + c) + 1] = 0xff
+    end
+  end
+  for i = 1, #useCtrlBytes do
+    screen[7 * 20 + 3 + i] = useCtrlBytes[i]
+  end
+  for i = 1, #toSurfRadBytes do
+    screen[9 * 20 + 4 + i] = toSurfRadBytes[i]
+  end
+
+  local gfx3 = self:symbol("SurfingPikachu1Graphics3")
+  local rawGfx3 = self.rom:bytes(gfx3.bank, gfx3.address, 144 * 16)
+  local tiles = {}
+  for tile = 0, 143 do
+    local one = {}
+    for j = 1, 16 do one[j] = rawGfx3[tile * 16 + j] end
+    tiles[tile + 1] = ImageWriter.decode2bpp(one, 8, 8, false)
+  end
+  local blank = ImageWriter.blank(8, 8, 1, 1, 1, 1)
+
+  local titleBg = ImageWriter.blank(160, 144, 1, 1, 1, 1)
+  for r = 0, 17 do
+    for c = 0, 19 do
+      local tileId = screen[r * 20 + c + 1]
+      local tileImg = blank
+      if tileId ~= 0xff then
+        local idx = tileId >= 0x80 and (tileId - 0x80 + 1) or (128 + tileId + 1)
+        if idx >= 1 and idx <= 144 then tileImg = tiles[idx] end
+      end
+      ImageWriter.blit(titleBg, tileImg, c * 8, r * 8)
+    end
+  end
+  self:save(titleBg, "minigame/title_bg.png")
+
+  -- Intro paddling Pikachu frames (surfing_pikachu_oam.asm .IntroPikachu).
+  local INTRO_PIKA_FRAME_BASE = { 0x80, 0x84, 0x88, 0x8c }
+  local INTRO_PIKA_OAM = {
+    { -12, -16, 0x03, true }, { -12, -8, 0x02, true },
+    { -12, 0, 0x01, true }, { -12, 8, 0x00, true },
+    { -4, -16, 0x13, true }, { -4, -8, 0x12, true },
+    { -4, 0, 0x11, true }, { -4, 8, 0x10, true },
+    { 4, -16, 0x23, true }, { 4, -8, 0x22, true },
+    { 4, 0, 0x21, true }, { 4, 8, 0x20, true },
+  }
+  local function blitIntroTile(target, tile, tx, ty, flipX)
+    for y = 0, 7 do
+      for x = 0, 7 do
+        local sx = flipX and (7 - x) or x
+        local r, g, b, a = tile:getPixel(sx, y)
+        local px, py = tx + x, ty + y
+        if a ~= 0 and px >= 0 and py >= 0
+            and px < target:getWidth() and py < target:getHeight() then
+          target:setPixel(px, py, r, g, b, a)
+        end
+      end
+    end
+  end
+  for frame, vramBase in ipairs(INTRO_PIKA_FRAME_BASE) do
+    local pose = ImageWriter.blank(32, 24, 1, 1, 1, 0)
+    local sheetBase = vramBase - 0x80
+    for _, sp in ipairs(INTRO_PIKA_OAM) do
+      local dy, dx, rel, flipX = sp[1], sp[2], sp[3], sp[4]
+      local tileImg = tiles[sheetBase + rel + 1]
+      if tileImg then
+        blitIntroTile(pose, tileImg,
+          16 + dx + (flipX and 8 or 0), 12 + dy, flipX)
+      end
+    end
+    self:save(pose, ("minigame/intro_pika_%d.png"):format(frame - 1))
   end
 end
 
@@ -1639,9 +1814,100 @@ function RomExtractor:raw1bpp(label, width, height, relative, transparent)
   return image
 end
 
+-- Trading animation art: gfx/trade.asm TradingAnimationGraphics is one
+-- 49-tile atlas (game_boy.2bpp, built with --remove-duplicates, then
+-- link_cable.2bpp), and the Game Boy and open-cable plates are painted out
+-- of it through the tilemaps in data/tilemaps.asm (GameBoyTiles 6x8,
+-- LinkCableTiles 12x3), whose ids are absolute vChars2 ids starting at $31
+-- because trade.asm reaches them through
+-- CopyTileIDsFromList_ZeroBaseTileID.  Only the developer-only Python path
+-- ever wrote these files, so an imported cache had none of them and
+-- TradeAnim drew the whole cinematic as plain rectangles (#750).
+function RomExtractor:extractTradeArt()
+  local BASE, COUNT = 0x31, 49
+  local gfx = self:symbol("TradingAnimationGraphics")
+  local atlas = ImageWriter.decode2bpp(
+    self.rom:bytes(gfx.bank, gfx.address, COUNT * 16), COUNT * 8, 8)
+  local function tileX(id)
+    local index = id - BASE
+    assert(index >= 0 and index < COUNT,
+      ("trade tile $%02X is outside the animation atlas"):format(id))
+    return index * 8
+  end
+  local function plate(label, tilesWide, tilesHigh, relative, matte)
+    local map = self:symbol(label)
+    local ids = self.rom:bytes(map.bank, map.address, tilesWide * tilesHigh)
+    local image = ImageWriter.blank(tilesWide * 8, tilesHigh * 8, 1, 1, 1, 1)
+    for index, id in ipairs(ids) do
+      ImageWriter.blit(image, atlas,
+        (index - 1) % tilesWide * 8,
+        math.floor((index - 1) / tilesWide) * 8, tileX(id), 0, 8, 8)
+    end
+    if matte then image = ImageWriter.matteColor0(image) end
+    self:save(image, relative)
+  end
+  plate("GameBoyTiles", 6, 8, "trade/game_boy.png", true)
+  plate("LinkCableTiles", 12, 3, "trade/open_cable.png", false)
+  for _, spec in ipairs({
+    { 0x5D, "cable_conn" }, { 0x5E, "cable_seg" }, { 0x5F, "cable_corner" },
+    { 0x60, "cable_end" }, { 0x61, "cable_vert" },
+  }) do
+    local tile = ImageWriter.blank(8, 8, 1, 1, 1, 1)
+    ImageWriter.blit(tile, atlas, 0, 0, tileX(spec[1]), 0, 8, 8)
+    self:save(tile, "trade/" .. spec[2] .. ".png")
+  end
+  -- Trade_DrawCableAcrossScreen fills a whole 20-tile row with tile $5e.
+  local horizontal = ImageWriter.blank(160, 8, 1, 1, 1, 1)
+  for column = 0, 19 do
+    ImageWriter.blit(horizontal, atlas, column * 8, 0, tileX(0x5E), 0, 8, 8)
+  end
+  self:save(horizontal, "trade/cable_horiz.png")
+
+  -- Trade_BallInsideLinkCableOAMBlock draws one tile four times with the
+  -- X/Y flips, so each of the two frames -- $7e travelling, $7f bulging,
+  -- the bottom row of TradingAnimationGraphics2 -- makes a 16x16 ball.
+  local ball = self:symbol("TradingAnimationGraphics2")
+  local frames = ImageWriter.decode2bpp(
+    self.rom:bytes(ball.bank, ball.address, 64), 16, 16, true)
+  for index, name in ipairs({ "cable_ball", "cable_ball_alt" }) do
+    local image = ImageWriter.blank(16, 16, 1, 1, 1, 0)
+    for y = 0, 7 do
+      for x = 0, 7 do
+        local r, g, b, a = frames:getPixel((index - 1) * 8 + x, 8 + y)
+        image:setPixel(x, y, r, g, b, a)
+        image:setPixel(15 - x, y, r, g, b, a)
+        image:setPixel(x, 15 - y, r, g, b, a)
+        image:setPixel(15 - x, 15 - y, r, g, b, a)
+      end
+    end
+    self:save(image, "trade/" .. name .. ".png")
+  end
+  -- The ring around the travelling mon: one 16x16 quadrant per animation
+  -- frame (engine/gfx/mon_icons.asm TradeBubbleIconGFX), mirrored into a
+  -- 32x32 circle by the OAM attributes in Trade_CircleOAMBlocks.
+  local bubble = self:symbol("TradeBubbleIconGFX")
+  self:write2bpp(self.rom:bytes(bubble.bank, bubble.address, 128),
+    16, 32, "trade/bubble.png", true)
+
+  return {
+    gameBoy = "assets/generated/trade/game_boy.png",
+    openCable = "assets/generated/trade/open_cable.png",
+    cableHoriz = "assets/generated/trade/cable_horiz.png",
+    cableConn = "assets/generated/trade/cable_conn.png",
+    cableVert = "assets/generated/trade/cable_vert.png",
+    cableCorner = "assets/generated/trade/cable_corner.png",
+    cableEnd = "assets/generated/trade/cable_end.png",
+    cableBall = "assets/generated/trade/cable_ball.png",
+    cableBallAlt = "assets/generated/trade/cable_ball_alt.png",
+    bubble = "assets/generated/trade/bubble.png",
+    source = "ROM:TradingAnimationGraphics + ROM:TradeBubbleIconGFX"
+      .. " (engine/movie/trade.asm InternalClockTradeAnim)",
+  }
+end
+
 function RomExtractor:extractField()
   self:beginStage("Interface artwork")
-  local done, total = 0, 49
+  local done, total = 0, 53
   local function tick()
     done = done + 1
     self:tick("Interface artwork", math.min(done, total), total)
@@ -1657,6 +1923,16 @@ function RomExtractor:extractField()
     "title/copyright.png"); tick()
   self:raw2bpp("GameFreakLogoGraphics", 72, 8,
     "title/gamefreak_inc.png"); tick()
+
+  do
+    local gf = self.symbols["GameFreakLogoGraphics"]
+    local tb = self.symbols["TextBoxGraphics"]
+    if gf and tb and tb[2] == gf[2] + 9 * 16 + 16 then
+      local raw = self.rom:bytes(gf[1], gf[2] + 9 * 16, 16)
+      self:save(ImageWriter.decode2bpp(raw, 8, 8, false), "title/nine.png")
+    end
+  end
+  tick()
   -- Yellow fixed Pikachu title art (no-op on Red/Blue manifests).
   self:extractYellowTitleArt(); tick()
 
@@ -1832,6 +2108,8 @@ function RomExtractor:extractField()
   end
   self:save(emotes, "emotes.png"); tick()
 
+  local tradeArt = self:extractTradeArt(); tick()
+
   -- Yellow-only: the Surfing Pikachu minigame sheets
   -- (gfx/surfing_pikachu.asm) at pret's canvas widths, so
   -- src/ui/SurfingMinigame.lua's quads can be read off the source pngs.
@@ -1851,6 +2129,7 @@ function RomExtractor:extractField()
       self:save(image, spec[5])
     end
   end
+  self:extractSurfingPikachuTitleArt()
 
   -- Yellow-only: TalkToPikachu's framed portrait, one 5x5 base frame per
   -- PikaPicAnimScript -- each script's FIRST pikapic_loadgfx in
@@ -1858,10 +2137,7 @@ function RomExtractor:extractField()
   -- (PikaAnimTilemap_1, column order) paints.  Scripts 18/22/23/24 have no
   -- compressed base and take PikaPicAnimBGFrames_5 -> PikaAnimTilemap_9,
   -- which is ROW order over a raw 25-tile sheet, hence no columns flag.
-  -- Script 26 shares script 11's base.  The pikaframe overlays each script
-  -- draws ON TOP of the base are a second full pose out of the same blob and
-  -- stay unripped: PikachuFollower.picLift stands in for their motion
-  -- (#561, still on #407's stand-in).
+  -- Script 26 shares script 11's base.
   local PIKAPIC_BASE = {
     "Pic_e4000", "Pic_e411c", "Pic_e4272", "Pic_e4383", "Pic_e458b",
     "Pic_e467b", "Pic_e476e", "Pic_e49d1", "Pic_e4b39", "Pic_e4c3e",
@@ -1878,6 +2154,17 @@ function RomExtractor:extractField()
       else
         self:writeCompressedPic(label, path)
       end
+    end
+    -- data/pikachu/pikachu_pic_animation.asm:340
+    for _, label in ipairs({
+      "GFX_e4841", "GFX_e4ce0", "GFX_e4e70", "GFX_e50af", "GFX_e52fe",
+      "GFX_e5541", "GFX_e5794", "GFX_e59ed", "GFX_e5c4d", "GFX_e5e90",
+      "GFX_e6020", "GFX_e61b0", "GFX_e63f7", "GFX_e6646", "GFX_e682f",
+      "GFX_e69bf", "GFX_e6b4f", "GFX_e6cdf", "GFX_e6e6f", "GFX_e6fff",
+      "GFX_e718f", "GFX_e731f", "GFX_e74af", "GFX_e763f", "GFX_e7863",
+      "GFX_e79f3", "GFX_e7b83", "GFX_e7d13", "GFX_f0b64", "GFX_f0d82",
+    }) do
+      self:raw2bpp(label, 40, 40, "pikachu/" .. label:lower() .. ".png")
     end
   end
 
@@ -1956,12 +2243,31 @@ function RomExtractor:extractField()
     "townmap/tiles.png"); tick()
   self:raw1bpp("TownMapCursor", 16, 16,
     "townmap/cursor.png", true); tick()
+  -- engine/items/town_map.asm:296, 150
+  local nestArt, upArrowArt
+  if self.symbols["MonNestIcon"] then
+    self:raw1bpp("MonNestIcon", 8, 8, "townmap/nest.png", true); tick()
+    nestArt = {
+      path = "assets/generated/townmap/nest.png", width = 8, height = 8,
+    }
+  end
+  if self.symbols["TownMapUpArrow"] then
+    self:raw1bpp("TownMapUpArrow", 8, 8, "townmap/up_arrow.png", true); tick()
+    upArrowArt = {
+      path = "assets/generated/townmap/up_arrow.png", width = 8, height = 8,
+    }
+  end
 
   local data = copy(self.manifest.field)
+  if type(data.townMap) == "table" then
+    data.townMap.nest = nestArt
+    data.townMap.upArrow = upArrowArt
+  end
   local adjacency = data.hiddenExtras.trashCans.adjacent
   local converted = {}
   for index, values in pairs(adjacency) do converted[tonumber(index)] = values end
   data.hiddenExtras.trashCans.adjacent = converted
+  data.tradeArt = tradeArt
   data.source = "canonical Pokemon Red ROM + bundled port metadata"
   self:write("field", data)
   self:tick("Interface artwork", total, total)

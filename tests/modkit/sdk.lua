@@ -24,6 +24,8 @@ end
 -- and answer getDirectoryItems("mods") with just the selected aliases
 local function aliasFs(inner, alias)
   local fs = { root = inner.root }
+  local overlay = {}
+  local loadstr = loadstring or load
 
   local function map(path)
     if path == nil then return path end
@@ -37,12 +39,21 @@ local function aliasFs(inner, alias)
     return path
   end
 
-  function fs.read(path) return inner.read(map(path)) end
-  function fs.write(path, body) return inner.write(map(path), body) end
-  function fs.load(path) return inner.load(map(path)) end
+  function fs.read(path)
+    local key = map(path)
+    if overlay[key] ~= nil then return overlay[key] end
+    return inner.read(key)
+  end
+  function fs.write(path, body) overlay[map(path)] = body return true end
+  function fs.load(path)
+    local key = map(path)
+    if overlay[key] ~= nil then return loadstr(overlay[key], "@" .. key) end
+    return inner.load(key)
+  end
 
   function fs.getInfo(path)
     if path == "mods" then return { type = "directory" } end
+    if overlay[map(path)] ~= nil then return { type = "file" } end
     return inner.getInfo(map(path))
   end
 
@@ -111,10 +122,14 @@ function Sdk.restoreRuntime()
   saved = nil
 end
 
--- opts.data   the merge target (defaults to a fresh fixture dataset)
--- opts.fs     override the filesystem entirely (e.g. Sdk.memfs)
--- opts.root   repo root the real paths are relative to
--- opts.dev    force the dev tripwire on
+-- opts.data        the merge target (defaults to a fresh fixture dataset)
+-- opts.fs          override the filesystem entirely (e.g. Sdk.memfs)
+-- opts.root        repo root the real paths are relative to
+-- opts.dev         force the dev tripwire on
+-- opts.generation  1 (default), 2 or 3; loads as if Gold or FireRed were the
+--                  running game, which is the seam the generation gate and the
+--                  registry target routing are tested through without a boot;
+--                  a Gen 3 run wants opts.data = Sdk.gen3Data()
 function Sdk.loadMods(paths, opts)
   opts = opts or {}
   local data = opts.data or require("tests.modkit.fixtures").fresh()
@@ -127,7 +142,8 @@ function Sdk.loadMods(paths, opts)
   end
 
   Sdk.captureRuntime()
-  local loader = Loader.new({ fs = fs, dev = opts.dev })
+  local loader = Loader.new({ fs = fs, dev = opts.dev,
+                              generation = opts.generation })
   local ok, err = pcall(loader.load, loader, data)
   if not ok then
     Sdk.restoreRuntime()
@@ -148,6 +164,98 @@ function Sdk.loadMods(paths, opts)
     errors = loader.errors,
     -- release the buses; a case that wants them live calls keep()
     release = function() Sdk.restoreRuntime() end,
+  }
+end
+
+local function mon(hp, atk, def, spe, spa, spd)
+  return { hp = hp, atk = atk, def = def, spe = spe, spa = spa, spd = spd }
+end
+
+local function meta(catchRate, expYield, growthRate)
+  return { catchRate = catchRate, expYield = expYield, genderRatio = 31,
+           eggCycles = 20, friendship = 70, growthRate = growthRate,
+           eggGroup1 = 1, eggGroup2 = 1, itemCommon = 0, itemRare = 0 }
+end
+
+local function move(power, typeId, accuracy, pp)
+  return { effect = 0, power = power, type = typeId, accuracy = accuracy,
+           pp = pp, secondaryChance = 0, target = 0, priority = 0, flags = 0 }
+end
+
+function Sdk.gen3Data()
+  return {
+    maps = {
+      FR_OAKS_LAB = { id = "FR_OAKS_LAB", name = "OAKS LAB",
+                      width = 13, height = 12 },
+    },
+    tilesets = {},
+    gen3Pokemon = {
+      _names = { [4] = "CHARMANDER", [5] = "CHARMELEON", [16] = "PIDGEY",
+                 [29] = "NIDORAN\226\153\128", [151] = "MEW",
+                 [252] = "?" },
+      _types = { [4] = { 10, 10 }, [5] = { 10, 10 }, [16] = { 0, 2 },
+                 [29] = { 3, 3 }, [151] = { 14, 14 } },
+      _stats = { [4] = mon(39, 52, 43, 65, 60, 50),
+                 [5] = mon(58, 64, 58, 80, 80, 65),
+                 [16] = mon(40, 45, 40, 56, 35, 35),
+                 [29] = mon(55, 47, 52, 41, 40, 40),
+                 [151] = mon(100, 100, 100, 100, 100, 100) },
+      _speciesMeta = { [4] = meta(45, 65, 3), [5] = meta(45, 142, 3),
+                       [16] = meta(255, 55, 3), [29] = meta(235, 59, 3),
+                       [151] = meta(45, 64, 3) },
+      _abilities = { [4] = { 66, 0 }, [5] = { 66, 0 }, [16] = { 51, 0 },
+                     [29] = { 38, 0 }, [151] = { 28, 0 } },
+      _abilityNames = { [28] = "SYNCHRONIZE", [38] = "POISON POINT",
+                        [51] = "KEEN EYE", [66] = "BLAZE" },
+      _learnsets = { [4] = { { 1, 10 }, { 7, 52 } }, [5] = { { 1, 10 } },
+                     [16] = { { 1, 33 } }, [29] = { { 1, 33 } },
+                     [151] = { { 1, 1 } } },
+      -- sparse, exactly like the extractor: a species with no egg move has
+      -- no key rather than an empty list
+      _eggMoves = { [4] = { 57 }, [16] = { 10, 33 } },
+      _evolutions = { [4] = { { method = 4, param = 16, target = 5 } } },
+      _dex = { [4] = { category = "LIZARD", height = 6, weight = 85 },
+               [151] = { category = "NEW SPECIES", height = 4, weight = 40 } },
+      _moveNames = { [0] = "-", [1] = "POUND", [10] = "SCRATCH",
+                     [33] = "TACKLE", [52] = "EMBER", [57] = "SURF" },
+    },
+    gen3Moves = {
+      _rom = { [1] = move(40, 0, 100, 35), [10] = move(40, 0, 100, 35),
+               [33] = move(35, 0, 95, 35), [52] = move(40, 10, 100, 25),
+               [57] = move(95, 11, 100, 15) },
+    },
+    gen3Items = {
+      _byId = {
+        [0] = { name = "????????", pocket = "ITEMS", price = 0 },
+        [4] = { name = "POK\195\169 BALL", pocket = "POKE_BALLS", price = 200 },
+        [13] = { name = "POTION", pocket = "ITEMS", price = 300 },
+        [96] = { name = "THUNDERSTONE", pocket = "ITEMS", price = 2100 },
+      },
+    },
+    gen3Encounters = {
+      FR_ROUTE_1 = { mapGroup = 3, mapNum = 19, land = { rate = 21, slots = {
+        { species = 16, minLevel = 2, maxLevel = 3 },
+        { species = 29, minLevel = 2, maxLevel = 4 } } } },
+      ["3:19"] = { mapGroup = 3, mapNum = 19, land = { rate = 21, slots = {
+        { species = 16, minLevel = 2, maxLevel = 3 },
+        { species = 29, minLevel = 2, maxLevel = 4 } } } },
+    },
+    gen3Trainers = {
+      classNames = { [81] = "RIVAL" },
+      trainers = {
+        [326] = { class = 81, className = "RIVAL", name = "TERRY",
+                  partySize = 1, party = { { species = 4, level = 5 } },
+                  dialogs = {} },
+      },
+    },
+    gen3Text = {
+      Text_BootedUpPC = { { t = "player" }, { t = "text", s = " booted up the PC." },
+                          { t = "eos" } },
+    },
+    gen3Scripts = {
+      EventScript_Fixture = { { op = "msgbox", text = "Text_BootedUpPC" },
+                              { op = "end" } },
+    },
   }
 end
 

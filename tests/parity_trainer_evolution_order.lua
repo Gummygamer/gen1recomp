@@ -1,6 +1,5 @@
--- A trainer script's post-battle text must finish before a level evolution.
--- Its start_battle row resumes the script after OverworldState:afterBattle,
--- so this covers the same handoff used by trainer and Rocket encounters.
+-- EndOfBattle evolves on the battle screen, before the map comes back
+-- (engine/battle/end_of_battle.asm:42-45) (#1656)
 
 package.path = "./?.lua;./?/init.lua;" .. package.path
 if not _G.love then _G.love = require("tests.love_stub") end
@@ -77,8 +76,9 @@ check(#Game.stack.states == 1,
 Game.stack:pop()
 moreText.onDone()
 
-local evolutionText = Game.stack:top()
-check(stateHas(evolutionText, "evolving"),
-  "the level evolution starts after trainer after-text closes")
+-- The evolution belongs to the battle screen (BattleState:finish ->
+-- Evolution.checkParty), so afterBattle leaves nothing behind the text.
+check(#Game.stack.states == 0,
+  "afterBattle pushes no evolution; the battle screen already ran it")
 
 S.finish()

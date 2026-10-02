@@ -14,6 +14,14 @@ local MODULES = {
 -- Optional for compatibility with developer and stale caches.
 local OPTIONAL = { "audio", "palettes", "icons" }
 
+-- Gold's extractor never writes these Gen 1 tables (RomExtractorGen2 has
+-- maps/text/pokemon/items, not text_pointers / trainer_headers / field).
+-- Desktop can still `require` Red's copies from the source tree, so Gold
+-- Edit appeared to work there; an Android APK has only the per-version
+-- cache, so Data:load used to throw on the first Gold Edit and take the
+-- activity down.  Empty tables are enough for seedDefaults / the editor.
+local GEN2_OPTIONAL = { text_pointers = true, trainer_headers = true, field = true }
+
 -- Vanilla defaults for rules exposed through the constants registry.  A
 -- value has to exist before a mod can patch it; each one matches the
 -- engine's no-mod behavior, so seeding them changes nothing on a vanilla
@@ -74,8 +82,9 @@ local function copy(value)
   return out
 end
 
-function Data:applyVersionedFieldData()
-  if require("src.core.GameVersion").isYellow() then
+function Data:applyVersionedFieldData(version)
+  version = version or require("src.core.GameVersion").get()
+  if version == "yellow" then
     self.field.trades = copy(YELLOW_TRADES)
     -- The old man's catch demo is a RATTATA in Yellow
     -- (scripts/ViridianCity.asm ViridianCityOldManStartCatchTrainingScript
@@ -84,29 +93,53 @@ function Data:applyVersionedFieldData()
     -- Yellow caches carry the wrong demo species too.  The fixed import
     -- manifest below stamps RATTATA for fresh imports.
     self.field.oldManBattle = { species = "RATTATA", level = 5 }
+    -- The Oak-speech show-off mon is the player's Pikachu in Yellow
+    -- (engine/battle/core.asm BATTLE_TYPE_PIKACHU / the ProfOak demo)
+    -- but caches imported before the manifest carried demoSpecies fell
+    -- back to Red's NIDORINO (#915).  The fixed import manifest below
+    -- stamps PIKACHU for fresh imports; fill it here for stale caches.
+    local oakSpeech = self.field.oakSpeech
+    if type(oakSpeech) == "table" and not oakSpeech.demoSpecies then
+      oakSpeech.demoSpecies = "PIKACHU"
+    end
   end
 end
 
 -- Fills only what the cache is missing, so an importer that learns to
 -- stamp one of these keys silently takes over from the engine.
-function Data:seedDefaults()
-  local constants = self.constants
+function Data:seedDefaults(version)
+  version = version or require("src.core.GameVersion").get()
+  local gen = require("src.core.GameVersion").generation()
+  local constants = self.constants or {}
+  self.constants = constants
+  self.field = self.field or {}
+  self.maps = self.maps or {}
+  self.pokemon = self.pokemon or {}
   for key, value in pairs(CONSTANT_DEFAULTS) do
     if constants[key] == nil then constants[key] = copy(value) end
+  end
+  if gen == 3 then
+    constants.dexSize = constants.dexSize or 386
+    constants.dexDigits = 3
+    return
   end
   -- derived, not literal: a dataset with a different roster gets the right
   -- upper bound without 151 being written down anywhere
   if constants.dexSize == nil then
     local highest = 0
     for _, def in pairs(self.pokemon) do
-      if def.dex and def.dex > highest then highest = def.dex end
+      -- Gold's pokemon.lua also carries growthRates / tmhmMoves / generation
+      -- scalars beside species rows.
+      if type(def) == "table" and def.dex and def.dex > highest then
+        highest = def.dex
+      end
     end
     constants.dexSize = highest
   end
   if constants.dexDigits == nil then
     constants.dexDigits = math.max(3, #tostring(constants.dexSize))
   end
-  self:applyVersionedFieldData()
+  Data.applyVersionedFieldData(self, version)
   local boot = self.field.boot
   if boot == nil then
     boot = {}
@@ -119,7 +152,7 @@ function Data:seedDefaults()
   -- only the un-overridden default flips, so a total conversion that set
   -- field.boot.screens.splash keeps its choice on any version.
   if boot.screens.splash == BOOT_DEFAULTS.screens.splash
-     and require("src.core.GameVersion").isYellow() then
+     and version == "yellow" then
     boot.screens.splash = "YellowIntro"
   end
   -- the naming screen presets the importer already extracts but nothing
@@ -138,11 +171,15 @@ function Data:seedDefaults()
   -- extractor never writes headers for them.  Seed the EVENT_BEAT_* /
   -- after-battle rows so Blaine's SetEventRange deactivation and talk
   -- after-text work like the other gyms (scripts/CinnabarGym.asm).
-  self:seedCinnabarGymTrainerHeaders()
+  Data.seedCinnabarGymTrainerHeaders(self)
   -- #197: the Fighting Dojo Karate Master is text_asm, so the extractor
   -- writes no header for him -- seed one so he engages on sight and has
   -- his defeat / re-talk lines (same idea as the Cinnabar seed above).
-  self:seedFightingDojoKarateMaster()
+  Data.seedFightingDojoKarateMaster(self)
+  -- #1743: Mt. Moon B2F Super Nerd is text_asm (no def_trainers), so Yellow's
+  -- extractor never writes his header -- seed one so engageTrainer finds
+  -- battle/won/after text instead of the "I like shorts!" fallback.
+  Data.seedMtMoonB2FSuperNerd(self)
   -- #189: 1F cabin door order vs rooms map (survey zoom)
   require("src.world.SsAnneLayout").apply(self.maps)
 end
@@ -171,6 +208,25 @@ function Data:seedFightingDojoKarateMaster()
     battle = "_FightingDojoKarateMasterText",
     won = "_FightingDojoKarateMasterDefeatedText",
     after = "_FightingDojoKarateMasterStayAndTrainWithUsText",
+  }
+end
+
+-- Mt. Moon B2F Super Nerd (object index 1) is text_asm with no def_trainers
+-- row, so Yellow never gets a trainerHeaders.MtMoonB2F[1] entry (Red/Blue
+-- pin one in make_rom_manifest.py). Without it, engageTrainer falls through
+-- to the hard-coded "I like shorts!" fallback (#1743). trainerDefeated still
+-- tracks him via defeatedTrainers[npc.id]; the fabricated event name matches
+-- the shipped Red/Blue manifest pin for consistency with fossil drivers.
+function Data:seedMtMoonB2FSuperNerd()
+  local headers = self.trainer_headers
+  if not headers then return end
+  headers.MtMoonB2F = headers.MtMoonB2F or {}
+  if headers.MtMoonB2F[1] then return end
+  headers.MtMoonB2F[1] = {
+    battle = "_MtMoonB2FSuperNerdTheyreBothMineText",
+    won = "_MtMoonB2FSuperNerdOkIllShareText",
+    after = "_MtMoonB2FSuperNerdTheresAPokemonLabText",
+    event = "EVENT_BEAT_MT_MOON_3_SUPER_NERD",
   }
 end
 
@@ -203,36 +259,67 @@ local function loadModule(dir, name)
     if not chunk then return false, err end
     return pcall(chunk)
   end
-  local ok, mod = pcall(require, "data.generated." .. name)
-  if ok then return true, mod end
-  -- Fused PhysFS / Blue|Yellow prefix: load bytes from the active version's
-  -- cache explicitly when require cannot see the mounted tree.
   local CacheFs = require("src.import.CacheFs")
   local GameVersion = require("src.core.GameVersion")
   local path = "data/generated/" .. name .. ".lua"
   local bytes = CacheFs.readActive(path)
   if type(bytes) == "string" then
-    local chunk, err = loadstring(bytes, "@" .. GameVersion.cachePrefix() .. path)
-    if not chunk then return false, err or mod end
-    return pcall(chunk)
+    -- Sandbox the generated module the way every other cache loader in the
+    -- engine does (dataset/doors/field/...).  Without an environment the chunk
+    -- ran with the real os/io/loadfile in scope, so a file dropped into the
+    -- user-writable cache would execute at boot.
+    local chunk = load(bytes, "@" .. GameVersion.cachePrefix() .. path, "t", {})
+    if chunk then
+      local ok, res = pcall(chunk)
+      if ok then return true, res end
+    end
   end
-  return false, mod
+  local ok, mod = pcall(require, "data.generated." .. name)
+  if ok then return true, mod end
+  return false, nil
 end
+
+-- Test seam: the generated-module loader, so a suite can pin the sandbox that
+-- keeps cache files from reaching os/io/loadfile at boot.
+Data._loadModule = loadModule
 
 function Data:load()
   local dir = os.getenv("POKEPORT_DATA_DIR")
+  local gen = require("src.core.GameVersion").generation()
+  local gen2 = gen == 2
+  local gen3 = gen == 3
+
+  if gen3 then
+    for _, name in ipairs(MODULES) do
+      self[name] = {}
+    end
+    for _, name in ipairs(OPTIONAL) do
+      self[name] = {}
+    end
+    self:seedDefaults()
+    local pristine = {}
+    self._pristineKeys = pristine
+    for key in pairs(self) do pristine[key] = true end
+    Logger.info("generated data initialized for gen3 (self-contained runtime)")
+    return
+  end
+
   for _, name in ipairs(MODULES) do
     local ok, mod = loadModule(dir, name)
     if not ok then
-      if dir then
+      if gen2 and GEN2_OPTIONAL[name] then
+        self[name] = {}
+      elseif dir then
         error(("missing data module '%s/%s.lua' (POKEPORT_DATA_DIR).\n(%s)")
               :format(dir, name, mod))
+      else
+        error(("missing generated data module 'data/generated/%s.lua'.\n" ..
+               "Import the ROM again or rebuild developer data.\n(%s)")
+              :format(name, mod))
       end
-      error(("missing generated data module 'data/generated/%s.lua'.\n" ..
-             "Import the ROM again or rebuild developer data.\n(%s)")
-            :format(name, mod))
+    else
+      self[name] = mod
     end
-    self[name] = mod
   end
   for _, name in ipairs(OPTIONAL) do
     local ok, mod = loadModule(dir, name)
@@ -271,11 +358,14 @@ function Data:unloadGenerated()
       if not pristine[key] then self[key] = nil end
     end
   end
+  self._pristineKeys = nil
   for _, name in ipairs(MODULES) do
     package.loaded["data.generated." .. name] = nil
+    self[name] = nil
   end
   for _, name in ipairs(OPTIONAL) do
     package.loaded["data.generated." .. name] = nil
+    self[name] = nil
   end
 end
 

@@ -9,15 +9,39 @@
 -- ui.naming.grid may replace either page; keep an "ED" cell and a
 -- single-cell case-switch row so confirm / case-flip keep working.
 
+local Assets = require("src.render.Assets")
 local Font = require("src.render.Font")
+local HudTiles = require("src.render.HudTiles")
 local Runtime = require("src.mods.Runtime")
 local Sound = require("src.core.Sound")
 local Theme = require("src.ui.Theme")
 local Strings = require("src.core.Strings")
 
-local NamingScreen = {}
+local NamingScreen = { isMenu = true }
 NamingScreen.__index = NamingScreen
 NamingScreen.isOpaque = true
+
+-- engine/menus/naming_screen.asm:389
+local UNDERSCORE, RAISED = 0x76, 0x77
+-- engine/gfx/mon_icons.asm:88
+local ICON_SPEED = 16
+
+-- engine/menus/naming_screen.asm:326
+local ED_IMAGE = "assets/generated/fonts/ed.png"
+local edTile
+
+local function drawEd(x, y)
+  if edTile == nil then
+    local ok, image = pcall(Assets.image, ED_IMAGE)
+    edTile = ok and image or false
+  end
+  if not edTile then return false end
+  love.graphics.draw(edTile, x, y)
+  return true
+end
+
+function NamingScreen.invalidate() edTile = nil end
+Assets.register(NamingScreen.invalidate)
 
 -- SGB: generic whole-screen palette (SET_PAL_GENERIC)
 function NamingScreen:sgbPalettes(game)
@@ -67,43 +91,86 @@ function NamingScreen.new(game, opts)
   self.game = game
   self.title = opts.title or Strings("YOUR NAME?")
   self.presets = opts.presets
+  self.introBox = opts.introBox
   self.maxLen = opts.maxLen or 7
   self.default = opts.default
   self.onDone = opts.onDone
   self.glyphs = {} -- typed glyphs; multi-byte cells (<PK>, ♂, ×) count as 1
   self.row, self.col = 1, 1
   self.lower = false
+  -- engine/menus/naming_screen.asm:460
+  self.mon = opts.mon
+  self.speciesName = opts.speciesName
+  if self.mon and not self.speciesName then
+    local def = game and game.data and game.data.pokemon
+      and game.data.pokemon[self.mon.species]
+    self.speciesName = (def and def.name) or self.mon.species
+  end
+  self.anim = 0
   return self
 end
 
 function NamingScreen:enter()
   if self.presets and #self.presets > 0 then
     local Menu = require("src.ui.Menu")
-    local items = { { label = Strings("NEW NAME") } }
+    -- engine/movie/oak_speech/oak_speech2.asm:1
+    self.choosing = true
+    self.isOpaque = false
+    local items = { {
+      label = Strings("NEW NAME"),
+      onSelect = function()
+        self.choosing = nil
+        self.isOpaque = nil
+      end,
+    } }
     for _, preset in ipairs(self.presets) do
       table.insert(items, {
         label = preset,
         onSelect = function()
           -- the menu already popped itself; pop the naming screen too
           self.game.stack:pop()
-          if self.onDone then self.onDone(preset) end
+          if self.onDone then self.onDone(preset, false) end
         end,
       })
     end
-    self.game.stack:push(Menu.new(self.game, items, {
-      tx = 4, ty = 0, tw = 12, th = #items * 2 + 2, cancelable = false,
-    }))
+    if self.introBox then
+      -- DisplayIntroNameTextBox (oak_speech2.asm:162): TextBoxBorder at
+      -- hlcoord 0,0 with b=$a c=$9, "NAME" at hlcoord 3,0, list at hlcoord 2,2
+      -- TextBoxBorder's b = $a is a fixed 12-row box, whatever the preset
+      -- list's length (oak_speech2.asm:163-166)
+      self.game.stack:push(Menu.new(self.game, items, {
+        tx = 0, ty = 0, tw = 11, th = 12,
+        itemY = 2, title = Strings("NAME"), cancelable = false,
+      }))
+    else
+      self.game.stack:push(Menu.new(self.game, items, {
+        tx = 4, ty = 0, tw = 12, th = #items * 2 + 2, cancelable = false,
+      }))
+    end
   end
 end
 
 function NamingScreen:confirm()
   local name = table.concat(self.glyphs)
   if name == "" then
-    name = (self.presets and self.presets[1]) or self.default or "A"
+    -- An empty confirm (START, or the ED cell with nothing typed) must not
+    -- invent a letter (#833).  DisplayNamingScreen seeds wStringBuffer with
+    -- '@' (engine/menus/naming_screen.asm) and every caller checks that first
+    -- byte: AskName falls through to .declinedNickname, copying the species
+    -- name over the nick slot -- vanilla's "un-nicknamed", which this port
+    -- models as mon.nickname == nil (src/save_convert/GenSave.lua), so
+    -- evolution can still rename the mon.  DisplayNameRaterScreen takes
+    -- .playerCancelled and keeps the old nick, which is why an explicit
+    -- opts.default still wins here.  Player/rival naming
+    -- (oak_speech2.asm ChoosePlayerName) re-opens on '@' and never accepts an
+    -- empty result; the port keeps its preset fallback for that.
+    -- Contract for callers: "" means NO name -- BattleState:askNicknameUI and
+    -- Commands.give_pokemon both guard on #name > 0 before setting nickname.
+    name = (self.presets and self.presets[1]) or self.default or ""
   end
   Sound.play(self.game.data, "Press_AB")
   self.game.stack:pop()
-  if self.onDone then self.onDone(name) end
+  if self.onDone then self.onDone(name, true) end
 end
 
 function NamingScreen:grid()
@@ -126,6 +193,8 @@ function NamingScreen:jumpToEnd()
 end
 
 function NamingScreen:update(dt)
+  -- engine/menus/naming_screen.asm:131
+  self.anim = (self.anim or 0) + 1
   local GRID = self:grid()
   local caseRow, edRow, edCol = findMeta(GRID)
   local input = self.game.input
@@ -180,20 +249,42 @@ function NamingScreen:update(dt)
 end
 
 function NamingScreen:draw()
+  if self.choosing then return end
   love.graphics.setColor(1, 1, 1, 1)
   love.graphics.rectangle("fill", 0, 0, 160, 144)
   love.graphics.setColor(0, 0, 0, 1)
-  Font.draw(self.title, 8, 8)
-  -- typed name with dashes for the empty slots
-  for i = 1, self.maxLen do
-    Font.draw(self.glyphs[i] or "-", 56 + (i - 1) * 8, 24)
+  -- engine/menus/naming_screen.asm:453
+  if self.mon then
+    -- engine/gfx/mon_icons.asm:234
+    local PartyMenu = require("src.ui.PartyMenu")
+    love.graphics.setColor(1, 1, 1, 1)
+    PartyMenu.drawIcon(self.game, self.mon, 8, 0, false, 0,
+      math.floor((self.anim or 0) / ICON_SPEED) % 2 == 1)
+    love.graphics.setColor(0, 0, 0, 1)
+    Font.draw(self.speciesName or "", 32, 8)
+    Font.draw(self.title, 8, 24)
+  else
+    Font.draw(self.title, 0, 8)
   end
+  -- engine/menus/naming_screen.asm:369
+  Font.draw(table.concat(self.glyphs), 80, 16)
+  local raised = math.min(#self.glyphs, self.maxLen - 1)
+  for i = 0, self.maxLen - 1 do
+    HudTiles.namingTile(i == raised and RAISED or UNDERSCORE, 80 + i * 8, 24)
+  end
+  -- engine/menus/naming_screen.asm:99
+  Font.drawBox(0, 4, 20, 11)
+  love.graphics.setColor(0, 0, 0, 1)
+  -- engine/menus/naming_screen.asm:346
   for r, row in ipairs(self:grid()) do
     for c, cell in ipairs(row) do
-      Font.draw(Strings(cell), c * 16, 32 + r * 16)
+      local x, y = c * 16, 24 + r * 16
+      if cell ~= "ED" or not drawEd(x, y) then
+        Font.draw(Strings(cell), x, y)
+      end
     end
   end
-  Font.drawCode(Theme.cursor, self.col * 16 - 8, 32 + self.row * 16)
+  Font.drawCode(Theme.cursor, self.col * 16 - 8, 24 + self.row * 16)
   love.graphics.setColor(1, 1, 1, 1)
 end
 

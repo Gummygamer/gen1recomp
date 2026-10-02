@@ -21,6 +21,7 @@ package.loaded["src.core.Music"] = {
   play = function(_, id) music.played[#music.played + 1] = id end,
   playOnce = function() return true end,
   stop = function() music.played[#music.played + 1] = "stop" end,
+  playMap = function() end,
 }
 package.loaded["src.render.TextBox"] = {
   new = function(_, text) return { text = text } end,
@@ -29,9 +30,11 @@ package.loaded["src.ui.PicBox"] = { new = function() return {} end }
 
 local story3 = dofile("data/scripts/story3.lua")
 local story5 = dofile("data/scripts/story5.lua")
-local text = dofile("data/generated/text.lua")
-local audio = dofile("data/generated/audio.lua")
-local maps = dofile("data/generated/maps.lua")
+local Data = require("src.core.Data")
+if not Data.maps then Data:load() end
+local text = Data.text
+local audio = Data.audio
+local maps = Data.maps
 
 local function dirsEqual(a, b)
   if type(a) ~= "table" or #a ~= #b then return false end
@@ -67,7 +70,7 @@ local function ambush(x)
   check(story5.SS_ANNE_2F.onStep(game, ow, x, 8),
         ("SS Anne 2F ambush fires at (%d,8)"):format(x))
   check(rows ~= nil, "the ambush queued rows")
-  return rows
+  return rows, ow
 end
 
 do
@@ -78,14 +81,33 @@ do
 
   for _, case in ipairs({ { 37, RIGHT_OF_HIM }, { 36, AROUND_HIM } }) do
     local x, dirs = case[1], case[2]
-    local rows = ambush(x)
+    local rows, ow = ambush(x)
+    -- scripts/SSAnne2F.asm:93
+    eq(ow.player.facing, "down",
+       ("x=%d the trigger leaves the player's facing alone"):format(x))
+    local function rowIndex(kind)
+      for i, r in ipairs(rows) do if r[1] == kind then return i end end
+    end
+    local turns = rowsOfKind(rows, "face_player_dir")
+    if x == 37 then
+      -- scripts/SSAnne2F.asm:73-77
+      eq(#turns, 1, "x=37 turns the player as a script row")
+      eq(turns[1][2], "left", "and it turns him LEFT")
+      local at, moved, spoke =
+        rowIndex("face_player_dir"), rowIndex("move_npc_to"), rowIndex("show_text")
+      check(moved and at and spoke and moved < at and at < spoke,
+            "the turn lands after the rival's walk and before the dialogue")
+    else
+      eq(#turns, 0, "x=36 never touches the player's facing")
+    end
     local said = {}
     for _, r in ipairs(rowsOfKind(rows, "show_text")) do
       said[#said + 1] = r[2]
     end
+    -- SSAnne2FRivalText's text_asm arms SaveEndBattleTextPointers, so the
+    -- defeat line prints in battle, not on the map (scripts/SSAnne2F.asm:199)
     local order = {
       "_SSAnne2FRivalText",
-      "_SSAnne2FRivalDefeatedText",
       "_SSAnne2FRivalCutMasterText",
     }
     local pi = 1
@@ -93,7 +115,10 @@ do
       if pi <= #order and id == order[pi] then pi = pi + 1 end
     end
     eq(pi, #order + 1,
-       ("x=%d text order: greeting, defeated, CUT master"):format(x))
+       ("x=%d text order: greeting, then CUT master"):format(x))
+    local armed = rowsOfKind(rows, "save_end_battle_text")[1]
+    check(armed ~= nil and armed[2] == "_SSAnne2FRivalDefeatedText",
+       ("x=%d arms the defeat line for the battle screen (#1688)"):format(x))
 
     local walk = rowsOfKind(rows, "walk_npc")[1]
     check(walk ~= nil, ("x=%d exit is a walk_npc list"):format(x))
@@ -107,7 +132,17 @@ do
     end
     -- jump_if_false on a lost battle has to clear the whole tail
     local jump = rowsOfKind(rows, "jump_if_false")[1]
-    eq(jump and jump[2], #rows, "a lost battle jumps past the exit walk")
+    local target = jump and jump[2]
+    if type(target) == "string" then
+      for i, r in ipairs(rows) do
+        if r[1] == "label" and r[2] == target then target = i break end
+      end
+    end
+    while type(target) == "number" and rows[target]
+          and rows[target][1] == "label" do
+      target = target + 1
+    end
+    eq(target, #rows, "a lost battle jumps past the exit walk")
   end
 end
 
@@ -123,13 +158,9 @@ local function dockBlock(bx, by)
 end
 
 local function sail(cellX, cellY)
-  local rows, puffs = nil, 0
+  local rows = nil
   local ow = {
     player = { cellX = cellX, cellY = cellY },
-    startDustAnim = function(_, _, _, done)
-      puffs = puffs + 1
-      if done then done() end
-    end,
     queueScript = function(_, r) rows = r end,
   }
   local game = {
@@ -139,8 +170,13 @@ local function sail(cellX, cellY)
   story3.VERMILION_DOCK.onEnter(game, ow)
   check(rows ~= nil, "stepping off the gangway queues the departure")
   check(game.save.flags.EVENT_SS_ANNE_LEFT == true, "EVENT_SS_ANNE_LEFT set")
-  eq(puffs, 3, "three funnel smoke puffs (LoadSmokeTileFourTimes)")
   return rows
+end
+
+local function kindIndex(rows, kind, from)
+  for i = from or 1, #rows do
+    if rows[i][1] == kind then return i end
+  end
 end
 
 do
@@ -165,60 +201,25 @@ do
   local waits = rowsOfKind(rows, "wait")
   eq(waits[1][2], 120, "120 frames before the first horn")
   eq(waits[#waits][2], 120, "EraseSSAnne's 120 frames before the walk out")
-  local slide = 0
-  for _, w in ipairs(waits) do
-    if w[2] == 20 then slide = slide + 1 end
-  end
-  eq(slide, 8, "eight column shifts, .shift_columns_up's ld e, $8")
 
-  -- the bug was the whole hull blinking to water in a single frame with no
-  -- travel at all: her bow block has to be written one column further west
-  -- each step, and the water has to close in astern behind her
-  local bow, wake = {}, {}
-  for _, r in ipairs(rowsOfKind(rows, "replace_block")) do
-    if r[3] == 1 and r[4] == dockBlock(DOCK_HULL.x0, 1) then
-      bow[#bow + 1] = r[2]
-    elseif r[3] == 1 and r[4] == 1 then
-      wake[#wake + 1] = r[2]
-    end
-  end
-  check(dirsEqual(bow, { 4, 3, 2, 1 }), "the bow sails west a column a step")
-  -- 7 is missing because that is the block the player is stood on
-  check(dirsEqual(wake, { 8, 6, 5, 4, 3, 2, 1 }),
-        "water closes in astern, stern column first")
+  -- scripts/VermilionDock.asm:50 zeroes wSpritePlayerStateData1ImageIndex and
+  -- :77 freezes sprite updates: he faces DOWN until he walks out (#1689)
+  eq(rows[1][1], "face_player_dir", "he is turned before the first delay")
+  eq(rows[1][2], "down", "and he is turned to face DOWN")
 
-  -- EraseSSAnne leaves the player's own block alone ("south of the player
-  -- and won't be redrawn"), so he never stands on water on the way out
-  local pbx, pby = 7, 1
-  for _, r in ipairs(rowsOfKind(rows, "replace_block")) do
-    check(not (r[2] == pbx and r[3] == pby),
-          "the block under the player is never rewritten")
-    check(r[2] >= 1 and r[2] <= DOCK_HULL.x1,
-          "the slide stays inside the dock's water, off the pier column 0")
-  end
+  -- she used to be shuffled west one whole 32px block per beat, which read as
+  -- teleporting; .shift_columns_up is a 1px-per-8-frames slide (#1689)
+  eq(#rowsOfKind(rows, "replace_block"), 0,
+     "no block shuffle: the hull slides, it does not jump")
+  eq(#rowsOfKind(rows, "ss_anne_departs"), 1, "one blocking sail-away beat")
 
-  -- she has to end up gone: every hull block bar the player's is water by
-  -- the last edit that touches it
-  local final = {}
-  for _, r in ipairs(rowsOfKind(rows, "replace_block")) do
-    final[r[2] .. "," .. r[3]] = r[4]
-  end
-  for bx = DOCK_HULL.x0, DOCK_HULL.x1 do
-    for by = DOCK_HULL.y0, DOCK_HULL.y1 do
-      if not (bx == pbx and by == pby) then
-        check(WATER[final[bx .. "," .. by]],
-              ("hull block (%d,%d) ends as open water"):format(bx, by))
-      end
-    end
-  end
-
-  -- and she has to have travelled: the westmost water column of the map
-  -- carried hull blocks partway through
-  local sawWest = false
-  for _, r in ipairs(rowsOfKind(rows, "replace_block")) do
-    if r[2] == 1 and not WATER[r[4]] then sawWest = true end
-  end
-  check(sawWest, "the hull reaches the west edge of the water before it goes")
+  local horn1 = kindIndex(rows, "play_sound")
+  local sailIdx = kindIndex(rows, "ss_anne_departs")
+  local horn2 = kindIndex(rows, "play_sound", (horn1 or 0) + 1)
+  check(horn1 and sailIdx and horn2 and horn1 < sailIdx and sailIdx < horn2,
+        "horn, then she sails, then the horn again")
+  check(kindIndex(rows, "warp") > sailIdx,
+        "the walk out only starts once she has gone")
 end
 
 do

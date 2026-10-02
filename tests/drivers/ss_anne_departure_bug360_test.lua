@@ -19,7 +19,9 @@ return function(game)
   local DOCK, DOCK_CELL = "VERMILION_DOCK", { x = 14, y = 2 }
   local ANNE2F, TRIGGER = "SS_ANNE_2F", { x = 37, y = 8 }
 
+  local allOk = true
   local function check(label, ok)
+    if not ok then allOk = false end
     U.log(ok and "PASS" or "FAIL", label)
     return ok
   end
@@ -49,7 +51,7 @@ return function(game)
     }
     run(ow)
     Music.play = realPlay
-    return rows
+    return rows, ow
   end
 
   -- ---------------------------------------------------------- rival exit
@@ -63,9 +65,27 @@ return function(game)
 
   for _, side in ipairs({ { 37, 4 }, { 36, 6 } }) do
     local x, steps = side[1], side[2]
-    local rows = capture(function(ow)
+    local rows, capturedOw = capture(function(ow)
       story5[ANNE2F].onStep({ save = { flags = {} }, data = game.data }, ow, x, 8)
     end)
+    -- SSAnne2FSetFacingDirectionScript (scripts/SSAnne2F.asm:73)
+    check(("x=%d the player keeps his walking facing at trigger time"):format(x),
+          capturedOw.player.facing == "down")
+    local turnIndex, moveIndex, textIndex
+    for i, r in ipairs(rows) do
+      if r[1] == "face_player_dir" and not turnIndex then turnIndex = i end
+      if r[1] == "move_npc_to" and not moveIndex then moveIndex = i end
+      if r[1] == "show_text" and not textIndex then textIndex = i end
+    end
+    if x == 37 then
+      check("x=37 turns the player LEFT as a scripted row",
+            turnIndex ~= nil and rows[turnIndex][2] == "left")
+      check("x=37 turns him after the walk and before the dialogue",
+            turnIndex ~= nil and moveIndex ~= nil and textIndex ~= nil
+            and turnIndex > moveIndex and turnIndex < textIndex)
+    else
+      check("x=36 never writes the player's direction", turnIndex == nil)
+    end
     local said = rowsOfKind(rows, "show_text")
     check(("x=%d the goodbye is the last thing he says"):format(x),
           said[#said] ~= nil and said[#said][2] == CUT)
@@ -90,11 +110,11 @@ return function(game)
     if r[2] == "SS_Anne_Horn" then horns = horns + 1 end
   end
   check("the departure blows the horn twice", horns == 2)
-  local slide = 0
-  for _, w in ipairs(rowsOfKind(dockRows, "wait")) do
-    if w[2] == 20 then slide = slide + 1 end
-  end
-  check("she sails in eight beats, not one frame", slide == 8)
+  check("she sails as one blocking slide, not a block shuffle",
+        #rowsOfKind(dockRows, "ss_anne_departs") == 1
+        and #rowsOfKind(dockRows, "replace_block") == 0)
+  check("he keeps facing down until he walks out",
+        (rowsOfKind(dockRows, "face_player_dir")[1] or {})[2] == "down")
   check("no keepMusic override into the city", (function()
     for _, r in ipairs(rowsOfKind(dockRows, "play_music")) do
       if r[3] and r[3].keep then return false end
@@ -130,10 +150,12 @@ return function(game)
         and game.save.flags.EVENT_SS_ANNE_LEFT == nil
         and game.save.flags.EVENT_BEAT_SS_ANNE_RIVAL == nil)
 
-  U.log("Watch for: she idles a couple of seconds with smoke off the funnel,")
-  U.log("one horn, then travels WEST a block at a time with the water closing")
-  U.log("in behind her, a second horn once she is gone, and the surf loop")
-  U.log("gives way to the Vermilion theme the moment you cross into town.")
+  U.log("Watch for: he turns to face DOWN and stays that way, she idles two")
+  U.log("seconds, one horn, then she slides WEST smoothly for about seventeen")
+  U.log("seconds with white smoke puffing off the front funnel and drifting")
+  U.log("east, the dock row he stands on never moving; a second horn once she")
+  U.log("is gone, the gangway stub still under his feet, then he walks up and")
+  U.log("the surf loop gives way to the Vermilion theme as you cross in.")
 
   U.teleport(game, DOCK, DOCK_CELL.x, DOCK_CELL.y, "up")
   local ow = game.overworld
@@ -174,6 +196,9 @@ return function(game)
   U.log("the other branch, console: game.save.flags.EVENT_BEAT_SS_ANNE_RIVAL")
   U.log("= nil, then step onto (36,8) -- there he goes RIGHT around you first.")
 
+  U.log(allOk and "ss_anne_departure_bug360: ALL PASS"
+        or "ss_anne_departure_bug360: FAILED")
+  love.event.quit(allOk and 0 or 1)
   while true do
     coroutine.yield()
   end

@@ -7,14 +7,18 @@ local M = {}
 
 local function text(game) return game.data.text end
 
-local function push(game, s, done)
+local function push(game, s, done, opts)
   local TextBox = require("src.render.TextBox")
-  game.stack:push(TextBox.new(game, s, done))
+  game.stack:push(TextBox.new(game, s, done, opts))
 end
 
+-- PrintText on a text_end string returns with the box still drawn and
+-- YesNoChoice then draws the menu above it (InitYesNoTextBoxParameters,
+-- engine/menus/text_box.asm); no A press clears the question first.  Ride
+-- TextBox's opts.choice, the same as Commands.ask (#854).
 local function ask(game, s, cb)
-  local ChoiceBox = require("src.ui.ChoiceBox")
-  push(game, s, function() game.stack:push(ChoiceBox.new(game, cb)) end)
+  local TextBox = require("src.render.TextBox")
+  game.stack:push(TextBox.new(game, s, nil, { choice = cb }))
 end
 
 -- -------------------------------------------------------------------
@@ -83,15 +87,17 @@ local function mansionFloor(switchCoords, textPrefix)
               or "Not quite yet!")
             return
           end
-          local f = game.save.flags
-          if f.EVENT_MANSION_SWITCH_ON then
-            f.EVENT_MANSION_SWITCH_ON = nil
-          else
-            f.EVENT_MANSION_SWITCH_ON = true
-          end
-          require("src.core.Sound").play(game.data, "Go_Inside")
-          applyMansionBlocks(game, ow)
-          push(game, t[textPrefix .. "SwitchPressedText"] or "Who wouldn't?")
+          push(game, t[textPrefix .. "SwitchPressedText"] or "Who wouldn't?",
+            function()
+              local f = game.save.flags
+              if f.EVENT_MANSION_SWITCH_ON then
+                f.EVENT_MANSION_SWITCH_ON = nil
+              else
+                f.EVENT_MANSION_SWITCH_ON = true
+              end
+              require("src.core.Sound").play(game.data, "Go_Inside")
+              applyMansionBlocks(game, ow)
+            end)
         end)
       return true
     end,
@@ -118,8 +124,7 @@ local MANSION_HOLES = {
 M.POKEMON_MANSION_3F.onStep = function(game, ow, x, y)
   for _, h in ipairs(MANSION_HOLES) do
     if x == h[1] and y == h[2] then
-      require("src.core.Sound").play(game.data, "Faint_Fall")
-      ow:startWarpTo(h[3], h[4], h[5], ow.player.facing)
+      ow:fallThroughHole(h[3], h[4], h[5], ow.player.facing)
       return true
     end
   end
@@ -232,7 +237,6 @@ M.CINNABAR_GYM = {
           if yes == machine.yes then
             -- CinnabarGymQuizCorrectText: item jingle, then the gate
             -- slides open (SFX_GO_INSIDE) if it was still locked
-            Sound.play(game.data, "Get_Item1")
             push(game, t._CinnabarGymQuizCorrectText
               or "You're absolutely\ncorrect!\fGo on through!", function()
               if not game.save.flags[gymGateFlag(index)] then
@@ -240,7 +244,9 @@ M.CINNABAR_GYM = {
                 Sound.play(game.data, "Go_Inside")
               end
               applyGymGates(game, ow)
-            end)
+            end, { preSound = function()
+              return Sound.play(game.data, "Get_Item1")
+            end })
             return
           end
           Sound.play(game.data, "Denied")

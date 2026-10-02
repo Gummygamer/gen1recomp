@@ -29,6 +29,9 @@ local data = {
   maps = loadfile("data/generated/maps.lua")(),
   eventFlags = loadfile("src/save_convert/data/event_flags.lua")(),
 }
+-- home/overworld.asm:2016 (#1691)
+local stampMapWindow = loadfile("tests/fixture_data/map_window.lua")()
+for mapId in pairs(data.maps) do stampMapWindow(data, mapId) end
 
 -- Independent re-implementation of CalcCheckSum (complement of the additive
 -- byte sum) so the export scenarios below can verify all three SRAM checksums
@@ -111,7 +114,9 @@ save.inventory = { POKE_BALL = 5, BOULDERBADGE = 1, ANTIDOTE = 1 }
 save.bagOrder = { "POKE_BALL", "ANTIDOTE" }
 save.pcItems = { REVIVE = 2 }
 save.pokedex = { seen = { MEW = true, PIKACHU = true }, owned = { PIKACHU = true } }
-save.flags = { EVENT_GOT_STARTER = true, EVENT_GOT_POKEDEX = true }
+-- ram/wram.asm:2074-2078 (#1625)
+save.flags = { EVENT_GOT_STARTER = true, EVENT_GOT_POKEDEX = true,
+               EVENT_CHOSE_SQUIRTLE = true }
 -- the FLY destination set (pokered's wTownVisitedFlag), keyed by map id
 save.visited = { PALLET_TOWN = true, CELADON_CITY = true }
 save.boxes = {}
@@ -153,6 +158,12 @@ check(decoded2.pokedex.seen.MEW and decoded2.pokedex.seen.PIKACHU and decoded2.p
 check(not decoded2.pokedex.owned.MEW, "a species only marked seen doesn't also come back owned")
 check(decoded2.flags.EVENT_GOT_STARTER and decoded2.flags.EVENT_GOT_POKEDEX,
       "event flags round-trip")
+-- scripts/OaksLab.asm:797-825; scripts/PokemonTower2F.asm:155-168
+check(bytes2:byte(OFF.playerStarter + 1) == cw.pokemonIndex.SQUIRTLE
+      and bytes2:byte(OFF.rivalStarter + 1) == cw.pokemonIndex.BULBASAUR,
+      "the starter pair reaches wPlayerStarter/wRivalStarter")
+check(decoded2.flags.EVENT_CHOSE_SQUIRTLE and not decoded2.flags.EVENT_CHOSE_BULBASAUR,
+      "the starter choice round-trips as exactly one EVENT_CHOSE_* flag")
 -- wTownVisitedFlag: bit index == map index, LSB first (PALLET_TOWN is bit 0,
 -- CELADON_CITY bit 6).  Before #263 decode never touched it, so an imported
 -- save reached FLY with no destinations at all.
@@ -284,8 +295,9 @@ check(scSave and scSave.player and scSave.player.id == 12345,
 check(scSave and scSave.inventory and scSave.inventory.POKE_BALL == 5,
       "SaveConvert.importSav: decoded bag items survive the merge")
 -- merge over new-game defaults
-check(scSave and type(scSave.options) == "table" and scSave.options.ruleset == "gen1_faithful",
-      "SaveConvert.importSav: new-game default options merged in")
+check(scSave and type(scSave.options) == "table"
+      and scSave.options.textSpeed == bytes2:byte(GenSave.OFFSETS.options + 1) % 8,
+      "SaveConvert.importSav: wOptions rides the imported save")
 check(scSave and type(scSave.defeatedTrainers) == "table" and type(scSave.modData) == "table"
       and scSave.repelSteps == 0,
       "SaveConvert.importSav: default defeatedTrainers/modData/repelSteps merged in")
@@ -293,8 +305,9 @@ check(scSave and type(scSave.defeatedTrainers) == "table" and type(scSave.modDat
 check(scSave and scSave.meta and scSave.meta.version == 2,
       "SaveConvert.importSav: save is tagged with the requested version")
 -- derived heal/outdoor anchors
-check(scSave and scSave.lastHeal and scSave.lastHeal.map == scSave.player.map,
-      "SaveConvert.importSav: lastHeal derives from the decoded position")
+check(scSave and scSave.lastHeal and scSave.lastHeal.map
+      == GenSave.crosswalks(data).mapsByIndex[bytes2:byte(GenSave.OFFSETS.lastBlackoutMap + 1)],
+      "SaveConvert.importSav: lastHeal comes from wLastBlackoutMap")
 check(scSave and scSave.lastOutdoor and scSave.lastOutdoor.id ~= nil,
       "SaveConvert.importSav: lastOutdoor is set")
 -- The original SRAM image carries the current-map cache that Red restores on
@@ -556,16 +569,18 @@ do
   check(ob2:byte(OFF.options + 1) == 3,
         ("wOptions defaults to medium text, shift style, effects on ($%02X)"):format(
           ob2:byte(OFF.options + 1)))
-  -- ...but with a template the cartridge's own byte wins (the round-trip
-  -- invariant): an imported save's FAST+SET options must not be flattened
-  -- to the session defaults on re-export
   local tpl = {}
   for i = 1, GenSave.SAVE_SIZE do tpl[i] = string.char(0) end
-  tpl[OFF.options + 1] = string.char(0xC1)
+  tpl[OFF.options + 1] = string.char(0xF1)
   local ob3 = GenSave.encode(o2, data, table.concat(tpl))
-  check(ob3:byte(OFF.options + 1) == 0xC1,
-        ("wOptions survives from the template on re-export ($%02X)"):format(
+  check(ob3:byte(OFF.options + 1) == 0x33,
+        ("wOptions follows the save's options and keeps the template's sound bits ($%02X)"):format(
           ob3:byte(OFF.options + 1)))
+  local back = GenSave.decode(ob3, data)
+  back.options.battleStyle, back.options.animations, back.options.textSpeed = "set", false, 1
+  local ob4 = GenSave.encode(back, data, nil)
+  check(ob4:byte(OFF.options + 1) == 0xF1,
+        ("an imported FAST+SET+sound 3 wOptions round-trips ($%02X)"):format(ob4:byte(OFF.options + 1)))
 end
 
 -- (3) catchRate: Pokemon.new stamps the as-caught byte, evolution keeps it,
@@ -588,6 +603,65 @@ do
         "encode writes the mon's catchRate, not the evolved species' ("
         .. sb:byte(OFF.partyMons + 7 + 1) .. " vs "
         .. data.pokemon.NIDORAN_F.catchRate .. ")")
+end
+
+-- (4) name-field tails: real cartridge saves legitimately hold 0x00 (and
+-- stale glyph) bytes after a name's $50 terminator, and rewriting them broke
+-- the import -> export byte-identical round trip.  With a template every
+-- tail byte must survive verbatim; only a templateless (engine-origin)
+-- export $50-pads the tail (#206).
+do
+  local s = SaveData.newGame({ playerName = "RED" })
+  for i = 1, 12 do s.boxes = s.boxes or {}; s.boxes[i] = {} end
+  local b1 = GenSave.encode(s, data, nil)
+  -- templateless: the tail past "RED@" must be all $50 padding
+  local ok50 = true
+  for i = 4, 10 do
+    if b1:byte(OFF.playerName + i + 1) ~= 0x50 then ok50 = false end
+  end
+  check(ok50, "templateless export $50-pads the player-name tail (#206)")
+  -- build a template whose player-name tail mixes 0x00 and stale glyphs
+  -- after the terminator, exactly like a real traded/edited cartridge save
+  local tpl = {}
+  for i = 1, #b1 do tpl[i] = b1:sub(i, i) end
+  tpl[OFF.playerName + 5] = string.char(0x00)
+  tpl[OFF.playerName + 6] = string.char(0x81)
+  tpl[OFF.playerName + 7] = string.char(0x00)
+  local tplBytes = table.concat(tpl)
+  local decoded = GenSave.decode(tplBytes, data)
+  check(decoded.player.name == "RED",
+        "a 0x00/stale tail past the terminator does not leak into the name")
+  local b2 = GenSave.encode(decoded, data)
+  check(b2:sub(OFF.playerName + 1, OFF.playerName + 11)
+          == tplBytes:sub(OFF.playerName + 1, OFF.playerName + 11),
+        "template name tails (incl. 0x00 bytes) round-trip byte-identical")
+end
+
+-- scripts/PokemonTower2F.asm:155-168
+do
+  local Commands = require("src.script.Commands")
+  local cart = SaveData.newGame({ playerName = "RED", rivalName = "BLUE" })
+  cart.flags = { EVENT_GOT_STARTER = true }
+  local raw = GenSave.encode(cart, data, nil)
+  local function poke(bytes, off, value)
+    return bytes:sub(1, off) .. string.char(value) .. bytes:sub(off + 2)
+  end
+  raw = poke(raw, OFF.playerStarter, cw.pokemonIndex.BULBASAUR)
+  raw = poke(raw, OFF.rivalStarter, cw.pokemonIndex.CHARMANDER)
+  local imported = GenSave.decode(raw, data)
+  check(imported.flags.EVENT_CHOSE_BULBASAUR,
+        "a BULBASAUR cartridge save imports with EVENT_CHOSE_BULBASAUR")
+
+  local picked
+  local realStart = Commands.start_battle
+  Commands.start_battle = function(_, _, _, party) picked = party end
+  local ok, err = pcall(Commands.rival_battle,
+                        { save = imported, game = { data = data } }, "OPP_RIVAL2", 4)
+  Commands.start_battle = realStart
+  check(ok, "rival_battle runs on the imported save (" .. tostring(err) .. ")")
+  check(picked == 6,
+        "Tower 2F picks OPP_RIVAL2 party 6 (CHARMELEON), not 4 (WARTORTLE) -- got "
+        .. tostring(picked))
 end
 
 print(string.format("save convert: %d/%d checks passed", checks - failures, checks))

@@ -4,8 +4,25 @@
 
 local FixedStep = {}
 
+FixedStep.GB_HZ = 4194304 / 70224
 FixedStep.STEP = 1 / 60
-local MAX_ACCUM = 0.25 -- avoid spiral of death after a stall
+FixedStep.MAX_ACCUM = 0.25
+FixedStep.WORK_FRACTION = 0.75
+FixedStep.clock = nil
+local MAX_ACCUM = FixedStep.MAX_ACCUM
+local SMOOTH_FRAMES = 4
+local SMOOTH_MAX = 1 / 60 * 2.5
+local STEP_EPS = 1 / 60 * 0.02
+
+function FixedStep.setHz(hz)
+  hz = tonumber(hz)
+  if not hz or hz <= 0 then hz = 60 end
+  FixedStep.STEP = 1 / hz
+  SMOOTH_MAX = FixedStep.STEP * 2.5
+  STEP_EPS = FixedStep.STEP * 0.02
+  FixedStep.phasedFor = nil
+  return hz
+end
 
 -- Phase the accumulator is re-seeded with once an absorbed hitch frame has
 -- been paid for.  Half a step is the balanced point: a frame has to come in
@@ -19,35 +36,142 @@ local MAX_ACCUM = 0.25 -- avoid spiral of death after a stall
 -- warps go through Transition instead (issue #487).
 local RESEED_PHASE = 0.5
 
+FixedStep.refreshPeriod = nil
+
+local PHASE_PROBE = 600
+
+local function phaseOffset(period, step)
+  local residuals, seen, accum = {}, {}, 0
+  for _ = 1, PHASE_PROBE do
+    accum = accum + period
+    while accum >= step - STEP_EPS do accum = accum - step end
+    local key = math.floor(accum / step * 1e6 + 0.5)
+    if seen[key] then break end
+    seen[key] = true
+    residuals[#residuals + 1] = accum
+  end
+  if #residuals == 0 then return 0 end
+  table.sort(residuals)
+  local bestGap, bestCentre = -1, 0
+  for i = 1, #residuals do
+    local a = residuals[i]
+    local b = (i < #residuals) and residuals[i + 1] or (residuals[1] + step)
+    if b - a > bestGap then bestGap, bestCentre = b - a, (a + b) * 0.5 end
+  end
+  return (step - bestCentre) % step
+end
+
 function FixedStep:init(callback)
   self.accum = 0
   self.callback = callback
   self.suppressCatchup = false
+  self.dtHistory, self.dtSum = nil, 0
+  self.phasedFor = nil
+  self.frameBreak = false
 end
 
--- The anti-spiral clamp doubles as a steps-per-frame ceiling (0.25s = 15
--- steps), which silently throttled the high fast-forward levels: at 100X
--- a 60fps frame wants ~100 steps. Game:update raises this to fit the
--- current speed target; a stall still cannot snowball past one frame's
--- intended budget.
 FixedStep.maxAccum = MAX_ACCUM
 
-function FixedStep:update(dt)
+function FixedStep.catchupLimit(speed, dt)
+  speed = tonumber(speed) or 1
+  if speed < 1 then speed = 1 end
+  local step = FixedStep.STEP
+  local frame = tonumber(dt) or step
+  if frame ~= frame or frame < step or frame > SMOOTH_MAX then frame = step end
+  local target = speed * frame * 1.5
+  local floor = step * 2
+  if target < floor then target = floor end
+  return target
+end
+
+local function workBudget(self, dt)
+  local base = self.refreshPeriod or self.STEP
+  local frame = dt
+  if frame < base then frame = base end
+  if frame > self.STEP * 2 then frame = math.max(base, self.STEP * 2) end
+  return frame * FixedStep.WORK_FRACTION
+end
+
+local function workClock()
+  if FixedStep.clock then return FixedStep.clock end
+  local timer = love and love.timer
+  return timer and timer.getTime or nil
+end
+
+function FixedStep:update(dt, speed)
   -- A hitch's oversized dt lands on the frame AFTER discardCatchup was
   -- called (the hitch itself already ran inside the current step); absorb
   -- that one frame as a single step instead of the normal accumulator so
   -- the burst it would otherwise release doesn't play out as a slide.
+  self.frameBreak = false
   if self.suppressCatchup then
     self.suppressCatchup = false
+    self.dtHistory, self.dtSum = nil, 0
     self.accum = self.STEP * RESEED_PHASE
     self.callback(self.STEP)
+    self.frameBreak = false
     return
   end
-  self.accum = math.min(self.accum + dt, self.maxAccum or MAX_ACCUM)
-  while self.accum >= self.STEP do
+  -- Snap/smooth against the wall-clock frame dt first.  Game speed is a
+  -- multiplier on how many logic steps that real frame buys — applying it
+  -- before refresh-period snap made 2–4X look like multi-period frames and
+  -- destabilized pacing under DISPLAY sync.
+  speed = tonumber(speed) or 1
+  if speed < 1 then speed = 1 end
+  -- Pathological wall-clock stalls: do not let dt alone exceed the catch-up
+  -- ceiling before speed is applied (speed amplify would just hit the clamp).
+  if dt > MAX_ACCUM then dt = MAX_ACCUM end
+  local frameDt = dt
+  local period = self.refreshPeriod
+  local snapped = false
+  if period and dt > 0 then
+    local frames = math.floor(dt / period + 0.5)
+    if frames >= 1 and frames * period <= SMOOTH_MAX
+       and math.abs(frames * period - dt) < period * 0.25 then
+      dt = frames * period
+      snapped = true
+    end
+  end
+  if snapped then
+    self.dtHistory, self.dtSum = nil, 0
+  elseif dt > 0 and dt <= SMOOTH_MAX then
+    local hist = self.dtHistory
+    if not hist then hist = {}; self.dtHistory = hist; self.dtSum = 0 end
+    hist[#hist + 1] = dt
+    self.dtSum = self.dtSum + dt
+    if #hist > SMOOTH_FRAMES then
+      self.dtSum = self.dtSum - hist[1]
+      table.remove(hist, 1)
+    end
+    dt = self.dtSum / #hist
+  else
+    self.dtHistory, self.dtSum = nil, 0
+  end
+  if period and self.phasedFor ~= period then
+    self.phasedFor = period
+    local target = phaseOffset(period, self.STEP)
+    self.accum = self.accum - self.accum % self.STEP + target
+  end
+  self.accum = math.min(self.accum + dt * speed, self.maxAccum or MAX_ACCUM)
+  local clock = speed > 1 and workClock() or nil
+  local deadline = clock and (clock() + workBudget(self, frameDt)) or nil
+  while self.accum >= self.STEP - STEP_EPS do
     self.accum = self.accum - self.STEP
     self.callback(self.STEP)
+    if self.frameBreak then
+      self.frameBreak = false
+      self.accum = self.accum % self.STEP
+      break
+    end
+    if deadline and self.accum >= self.STEP - STEP_EPS and clock() >= deadline then
+      self.accum = self.accum % self.STEP
+      break
+    end
   end
+end
+
+function FixedStep:endFrame()
+  self.frameBreak = true
 end
 
 -- Drop any pending catch-up steps and arm the one-frame clamp above.  A

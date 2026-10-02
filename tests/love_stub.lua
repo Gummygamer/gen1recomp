@@ -56,7 +56,12 @@ stub.graphics = {
   end,
   newQuad = function(x, y, w, h) return { x = x, y = y, w = w, h = h } end,
   newCanvas = function(w, h)
-    return setmetatable({ w = w, h = h, setFilter = noop }, Image)
+    local canvas = setmetatable({ w = w, h = h, setFilter = noop, released = false }, Image)
+    function canvas:release() self.released = true end
+    function canvas:newImageData()
+      return love.image.newImageData(self.w or 8, self.h or 8)
+    end
+    return canvas
   end,
   newSpriteBatch = function(image, size)
     local batch = { image = image, sprites = {} }
@@ -65,7 +70,7 @@ stub.graphics = {
     function batch:setTexture(tex) self.texture = tex end
     return batch
   end,
-  draw = noop, rectangle = noop, clear = noop,
+  draw = noop, rectangle = noop, clear = noop, polygon = noop,
   setDefaultFilter = noop, print = noop, printf = noop,
   line = noop, circle = noop, setLineWidth = noop,
   -- Fonts: the save editor lays itself out from font metrics, so a headless
@@ -74,11 +79,36 @@ stub.graphics = {
   -- newMesh / stencil stay absent on purpose: tools/save-editor/Theme.lua
   -- probes for them and falls back to flat fills, which is the path a
   -- headless run should take.
-  newFont = function(size)
-    local px = size or 12
+  -- Accepts both real signatures: newFont(size) and
+  -- newFont(filename, size, hinting), the latter for the TTF text mode
+  -- (src/render/Font.lua).  Width counts codepoints, not bytes, and CJK /
+  -- kana measure double, so tests can assert the wide-glyph metrics a real
+  -- pixel font (5px base, 11px double-width) exhibits without rasterizing.
+  newFont = function(a, b)
+    if type(a) == "string" then
+      -- real LÖVE raises on a missing file; callers pcall and fall back
+      local handle = io.open(a, "rb")
+      if not handle then error("Could not open file " .. a) end
+      handle:close()
+    end
+    local px = (type(a) == "number" and a) or b or 12
+    local unit = math.max(1, px * 0.5)
     return {
-      getWidth = function(_, text) return #tostring(text) * math.max(1, px * 0.5) end,
+      getWidth = function(_, text)
+        text = tostring(text)
+        local w, i, n = 0, 1, #text
+        while i <= n do
+          local byte = text:byte(i)
+          local len = byte >= 0xF0 and 4 or byte >= 0xE0 and 3
+                      or byte >= 0xC0 and 2 or 1
+          w = w + (byte >= 0xE1 and 2 or 1) * unit  -- U+1000+: double width
+          i = i + len
+        end
+        return w
+      end,
       getHeight = function() return px end,
+      getBaseline = function() return px - 2 end,
+      setFilter = noop,
     }
   end,
   setFont = function(f) gstate.font = f end,
@@ -112,6 +142,7 @@ stub.graphics = {
   end,
   translate = noop, scale = noop,
   rotate = noop, origin = noop, setScissor = noop,
+  getScissor = function() return nil end,
   getDimensions = function() return 640, 576 end,
   -- dpi=1 desktop default; issue #87 tests override these for Android density
   getPixelDimensions = function() return 640, 576 end,
@@ -323,7 +354,14 @@ function ImageData:getDimensions() return self.w, self.h end
 function ImageData:getPixel() return 0, 0, 0, 1 end
 function ImageData:setPixel() end
 function ImageData:mapPixel() end
-function ImageData:encode() return { getString = function() return "" end } end
+function ImageData:paste() end
+function ImageData:encode(format, filename)
+  local bytes = "\137PNG\r\n\26\n"
+  if type(filename) == "string" and love.filesystem and love.filesystem.write then
+    love.filesystem.write(filename, bytes)
+  end
+  return { getString = function() return bytes end }
+end
 
 stub.image = {
   newImageData = function(a, b)
@@ -335,6 +373,12 @@ stub.image = {
     end
     return setmetatable({ w = a or 8, h = b or 8 }, ImageData)
   end,
+}
+
+-- Headless runs report the desktop OS so platform gates (GamepadMap's NX
+-- check, the touch-overlay filter) take their desktop branch.
+stub.system = {
+  getOS = function() return "OS X" end,
 }
 
 -- Desktop / headless: full-window safe area (matches LÖVE's fallback).

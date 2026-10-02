@@ -2,6 +2,7 @@
 -- the other joins by typing that address in.  Direct peer-to-peer over
 -- lua-enet (bundled with LÖVE),  no relay server.
 
+local CableFrame = require("src.render.CableFrame")
 local CodeEntry = require("src.link.CodeEntry")
 local DiscordPresence = require("src.core.DiscordPresence")
 local Font = require("src.render.Font")
@@ -10,6 +11,7 @@ local Net = require("src.link.Net")
 local Protocol = require("src.link.Protocol")
 local Runtime = require("src.mods.Runtime")
 local Screens = require("src.ui.Screens")
+local Session = require("src.link.Session")
 local TextBox = require("src.render.TextBox")
 local Strings = require("src.core.Strings")
 
@@ -18,6 +20,7 @@ LinkState.__index = LinkState
 LinkState.isOpaque = true
 
 local CURSOR = 0xED
+local CURSOR_HOLLOW = 0xEC
 local ANY = "ANY" -- sentinel: a leading nil array entry breaks ipairs under
                   -- LuaJIT even though # still reports the full size, so
                   -- the level picker cycles this string instead of nil,
@@ -44,30 +47,46 @@ local function forceLevelLabel(v)
   return (v == ANY or v == nil) and "ANY" or ("AUTO " .. tostring(v))
 end
 
--- stages before any Net object is meaningfully "this session's link" --
--- .net can still be a leftover failed attempt sitting on self, so error/
--- closed checks below skip these rather than keying off self.net's
--- presence alone
-local PRE_CONNECT_STAGES = { menu = true, lanMenu = true, onlineMenu = true }
+-- stages before a successful transport has become this link's Session;
+-- terminal checks skip them rather than keying off self.net's presence
+local PRE_CONNECT_STAGES = { menu = true }
 
 -- how long the host waits for a v2 hello before deciding the peer predates
 -- the handshake (a pre-mod guest sends nothing until it hears the mode)
 local HELLO_GRACE = 2
 
--- the joiner edits an IPv4 address as 12 digits (three per octet),
--- prefilled with our own LAN IP so usually only the tail needs changing
-local function ipDigits(ip)
-  local digits = {}
-  local a, b, c, d = (ip or ""):match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
-  local octets = { tonumber(a) or 192, tonumber(b) or 168,
-                   tonumber(c) or 0, tonumber(d) or 1 }
+LinkState.ADDR_LENGTH = 15
+LinkState.ADDR_CHARSET = "0123456789. "
+
+local ADDR_OPTS = { length = LinkState.ADDR_LENGTH,
+                    charset = LinkState.ADDR_CHARSET }
+
+function LinkState.addrEntry(ip)
+  local seed = ip or "192.168.0.1"
+  if not seed:match("^%d+%.%d+%.%d+%.%d+$") then seed = "192.168.0.1" end
+  local state = CodeEntry.fromText(seed, ADDR_OPTS)
+  state.pos = math.max(1, math.min(ADDR_OPTS.length, #seed))
+  return state
+end
+
+function LinkState.addrText(state)
+  local text = (CodeEntry.text(state):gsub(" ", ""))
+  local octets = { text:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$") }
+  if #octets ~= 4 then return nil end
   for _, o in ipairs(octets) do
-    o = math.min(255, o)
-    table.insert(digits, math.floor(o / 100))
-    table.insert(digits, math.floor(o / 10) % 10)
-    table.insert(digits, o % 10)
+    if #o > 3 or tonumber(o) > 255 then return nil end
   end
-  return digits
+  return text
+end
+
+local function openSession(role, connect)
+  local transport = Net.new()
+  if connect(transport) then
+    return Session.new(transport, { role = role, kind = "link" })
+  end
+  local detail = transport.error or "?"
+  transport:close()
+  return nil, detail
 end
 
 function LinkState.new(game)
@@ -78,78 +97,47 @@ function LinkState.new(game)
   game.linkSession = true
   self.stage = "menu"
   self.index = 1
-  self.addr = ipDigits(Net.lanIP())
-  self.addrPos = 12 -- the last octet is what usually differs
+  self.addr = LinkState.addrEntry(Net.lanIP())
   self.status = ""
   return self
 end
 
--- entry point for a Discord "Ask to Join" click (see DiscordPresence.lua):
--- skips the whole LAN/ONLINE/TOURNAMENT menu and jumps straight to
--- "connecting with this code", same as if the player had typed it in
-function LinkState.newJoinOnline(game, code)
+-- Adopt a transport that is ALREADY paired and skip the connect UI: an
+-- overworld multiplayer session handing one pair of players off to a battle
+-- or a trade.  The caller has settled which mode and which side hosts, so
+-- all that is left is the hello exchange every link session runs before it
+-- commits -- the fingerprint/mod compatibility check still gets its say,
+-- exactly as it would have on the LAN path.
+--
+-- `transport` is anything Session accepts (update/poll/send/close plus the
+-- .paired/.closed/.error fields), which is what lets a mod route a battle
+-- over a channel of its own.  Ownership transfers with it: exitWith closes
+-- the session, so the caller's transport is done once this state unwinds.
+--
+-- opts.forceLevel  the level rule, normally chosen on the battleOptions
+--                  screen; an adopted session has no menu to pick it on
+function LinkState.newFromSession(game, transport, mode, isHost, opts)
   local self = LinkState.new(game)
-  self.net = Net.new()
-  if self.net:joinOnline(nil, code) then
-    self.stage = "onlineJoining"
-  else
-    self.stage = "menu" -- exitWith below needs a real stage to unwind from
-    self:exitWith(Strings("Link error:\n%s", self.net.error or "?"))
-  end
+  self.net = Session.new(transport, { role = isHost and "host" or "guest",
+                                      kind = "link" })
+  self.adopted = true
+  self.adoptedMode, self.adoptedHost = mode, isHost and true or false
+  self.forceLevel = opts and opts.forceLevel or nil
+  self.stage = "adopted"
+  self:sendHello(isHost and mode or nil)
   return self
 end
 
 function LinkState:exitWith(message, reason)
   DiscordPresence.setJoinCode(nil)
   self.game.linkSession = nil -- back to the player's own GAME SPEED
+  if self.game.linkNet == self.net then self.game.linkNet = nil end
   Runtime.emit("link.ended", { reason = reason or (message and "error" or "bye") })
   if self.net then self.net:close() end
   self.game.stack:pop()
   if message then
     self.game.stack:push(TextBox.new(self.game, message))
   end
-end
-
--- Online play meets strangers, so it requires a vanilla simulation on both
--- ends (Handshake.onlineAllowed).  Mods merge into the shared Data
--- registries at boot and there is no unmerge, so switching them off has to
--- go through a relaunch -- but the player should not have to go find the
--- mod manager and work out which mods count.  This turns the blocking mods
--- off, records them so the mod manager can put them back, and relaunches.
--- Verified translations are not blockers (#501), so a player keeps their
--- language across the restart and only the gameplay mods go.  The restart
--- is confirmed rather than silent: it drops unsaved progress.
-function LinkState:offerVanillaRestart()
-  local game = self.game
-  local loader = game.mods
-  local mods = Handshake.onlineBlockers(game)
-  local names = {}
-  for i, mod in ipairs(mods) do
-    if i > 2 then break end
-    names[#names + 1] = tostring(mod.id):upper():sub(1, 12)
-  end
-  local list = table.concat(names, ", ")
-  if #mods > #names then list = list .. (" +%d"):format(#mods - #names) end
-  local text = Strings(
-    "Online play runs\nvanilla for both\nplayers.\fTurn off %s\nand restart?", list)
-  self.game.linkSession = nil
-  Runtime.emit("link.ended", { reason = "error" })
-  if self.net then self.net:close() end
-  game.stack:pop()
-  game.stack:push(TextBox.new(game, text, nil, { choice = function(yes)
-    if not yes then return end
-    -- setEnabled persists the toggle itself (Loader:_saveState), so the
-    -- relaunch comes up vanilla and the mod manager lists them as disabled
-    -- for the player to switch back on afterwards
-    for _, mod in ipairs(mods) do
-      if loader and loader.setEnabled then loader:setEnabled(mod.id, false) end
-    end
-    if game.restartWithMods then
-      game:restartWithMods()
-    elseif love.event and love.event.quit then
-      love.event.quit("restart")
-    end
-  end }))
 end
 
 -- -------------------------------------------------------------------
@@ -163,21 +151,13 @@ end
 -- take the peer's hello out of the inbox without eating anything that
 -- shares the batch with it
 function LinkState:pollHello()
-  local msgs = self.net:poll()
-  local keep, got = {}, false
-  for _, msg in ipairs(msgs) do
-    if msg.type == "hello" and not self.peerHello then
-      self.peerHello = msg
-      self.peerName = msg.name
-      got = true
-    else
-      keep[#keep + 1] = msg
-    end
+  local message
+  if not self.peerHello then message = self.net:take("hello") end
+  if message then
+    self.peerHello = message
+    self.peerName = message.name
   end
-  for i = #keep, 1, -1 do
-    table.insert(self.net.inbox, 1, keep[i])
-  end
-  return got, #keep > 0
+  return message ~= nil, self.net:hasPending()
 end
 
 function LinkState:sendHello(mode)
@@ -197,8 +177,9 @@ function LinkState:decideCompat(mode, isHost)
                mods = peer and peer.mods, fingerprint = peer and peer.fingerprint },
   })
   if self.verdict == "full" or self.verdict == "vanilla_peer" then
-    if isHost and mode == "battle" then
+    if isHost and mode == "battle" and not self.adopted then
       -- host picks the level rule now, before the parties are exchanged
+      -- (an adopted session had it passed in; see newFromSession)
       self.stage = "battleOptions"
     else
       self:startMode(mode, isHost)
@@ -220,126 +201,51 @@ function LinkState:update(dt)
   local input = self.game.input
   if self.net then
     self.net:update()
-    if self.net.error and not PRE_CONNECT_STAGES[self.stage] then
-      self:exitWith(Strings("Link error:\n%s", self.net.error:sub(1, 60)))
+    local status = self.net:getStatus()
+    if status == "failed" and not PRE_CONNECT_STAGES[self.stage] then
+      self:exitWith(Strings("Link error:\n%s",
+        (self.net.error or "?"):sub(1, 60)))
       return
     end
-    -- the peer vanished without a bye (only once the inbox is drained,
+    -- the peer vanished without a bye (only once the session FIFO drains,
     -- so a final message travelling with the disconnect still counts)
-    if self.net.closed and #self.net.inbox == 0
+    if status == "closed"
        and not PRE_CONNECT_STAGES[self.stage] and self.stage ~= "addrEntry"
-       and self.stage ~= "codeEntry" and self.stage ~= "notice"
-       and self.stage ~= "battleRunning" then
+       and self.stage ~= "notice" and self.stage ~= "battleRunning" then
       self:exitWith(Strings("The link was\nbroken."))
       return
     end
   end
 
+  -- handed over from an already-paired session (LinkState.newFromSession):
+  -- both hellos are in flight, and the first one to land settles compat and
+  -- drops us straight into the agreed mode
+  if self.stage == "adopted" then
+    if self:pollHello() then
+      self:decideCompat(self.adoptedMode, self.adoptedHost)
+    end
+    return
+  end
+
   if self.stage == "menu" then
-    if input:wasPressed("down") then
-      self.index = self.index % 3 + 1
-    elseif input:wasPressed("up") then
-      self.index = (self.index - 2) % 3 + 1
+    if input:wasPressed("up") or input:wasPressed("down") then
+      self.index = self.index == 1 and 2 or 1
     elseif input:wasPressed("b") then
       self:exitWith(nil)
     elseif input:wasPressed("a") then
       if self.index == 1 then
-        self.stage = "lanMenu"
-        self.index = 1
-      elseif self.index == 2 or self.index == 3 then
-        if not Handshake.onlineAllowed(self.game) then
-          self:offerVanillaRestart()
-          return
-        end
-        if self.index == 2 then
-          self.stage = "onlineMenu"
-        else
-          local Tournament = require("src.link.Tournament")
-          self.game.stack:pop()
-          self.game.stack:push(Tournament.new(self.game))
-        end
-        self.index = 1
-      end
-    end
-
-  elseif self.stage == "lanMenu" then
-    if input:wasPressed("up") or input:wasPressed("down") then
-      self.index = self.index == 1 and 2 or 1
-    elseif input:wasPressed("b") then
-      self.stage = "menu"
-      self.index = 1
-    elseif input:wasPressed("a") then
-      self.net = Net.new()
-      if self.index == 1 then
-        if self.net:host() then
+        local session, detail = openSession("host", function(transport)
+          return transport:host()
+        end)
+        if session then
+          self.net = session
           self.stage = "hosting"
         else
-          self:exitWith(Strings("Link error:\n%s", self.net.error or "?"))
+          self:exitWith(Strings("Link error:\n%s", detail))
         end
       else
         self.stage = "addrEntry"
       end
-    end
-
-  elseif self.stage == "onlineMenu" then
-    if input:wasPressed("up") or input:wasPressed("down") then
-      self.index = self.index == 1 and 2 or 1
-    elseif input:wasPressed("b") then
-      self.stage = "menu"
-      self.index = 2
-    elseif input:wasPressed("a") then
-      if self.index == 1 then
-        self.net = Net.new()
-        if self.net:hostOnline() then
-          self.stage = "onlineHosting"
-        else
-          self:exitWith(Strings("Link error:\n%s", self.net.error or "?"))
-        end
-      else
-        self.stage = "codeEntry"
-        self.codeEntry = CodeEntry.new()
-      end
-    end
-
-  elseif self.stage == "onlineHosting" then
-    if not self.discordCodeSet and self.net.code then
-      DiscordPresence.setJoinCode(self.net.code)
-      self.discordCodeSet = true
-    end
-    if input:wasPressed("b") then self:exitWith(nil) return end
-    if self.net.paired then
-      DiscordPresence.setJoinCode(nil) -- someone's here now; stop advertising
-      self.stage = "modeSelect"
-      self.index = 1
-    end
-
-  elseif self.stage == "codeEntry" then
-    if input:wasPressed("b") then
-      self.stage = "onlineMenu"
-      self.index = 2
-    elseif input:wasPressed("up") then
-      CodeEntry.up(self.codeEntry)
-    elseif input:wasPressed("down") then
-      CodeEntry.down(self.codeEntry)
-    elseif input:wasPressed("left") then
-      CodeEntry.left(self.codeEntry)
-    elseif input:wasPressed("right") then
-      CodeEntry.right(self.codeEntry)
-    elseif input:wasPressed("a") then
-      local code = CodeEntry.text(self.codeEntry)
-      self.net = Net.new()
-      if self.net:joinOnline(nil, code) then
-        self.stage = "onlineJoining"
-      else
-        self:exitWith(Strings("Link error:\n%s", self.net.error or "?"))
-      end
-    end
-
-  elseif self.stage == "onlineJoining" then
-    if input:wasPressed("b") then self:exitWith(nil) return end
-    if self.net.paired then
-      self.stage = "waitMode"
-      self:sendHello(nil) -- the host owns the mode; this is just who we are
     end
 
   elseif self.stage == "hosting" then
@@ -352,25 +258,28 @@ function LinkState:update(dt)
   elseif self.stage == "addrEntry" then
     if input:wasPressed("b") then self:exitWith(nil) return end
     if input:wasPressed("up") then
-      self.addr[self.addrPos] = (self.addr[self.addrPos] + 1) % 10
+      CodeEntry.up(self.addr)
     elseif input:wasPressed("down") then
-      self.addr[self.addrPos] = (self.addr[self.addrPos] - 1) % 10
+      CodeEntry.down(self.addr)
     elseif input:wasPressed("left") then
-      self.addrPos = math.max(1, self.addrPos - 1)
+      CodeEntry.left(self.addr)
     elseif input:wasPressed("right") then
-      self.addrPos = math.min(12, self.addrPos + 1)
+      CodeEntry.right(self.addr)
     elseif input:wasPressed("a") then
-      local octets = {}
-      for i = 1, 4 do
-        local base = (i - 1) * 3
-        octets[i] = math.min(255, self.addr[base + 1] * 100
-                                  + self.addr[base + 2] * 10
-                                  + self.addr[base + 3])
+      local address = LinkState.addrText(self.addr)
+      if not address then
+        self.status = Strings("Not an IP address.")
+        return
       end
-      if self.net:join(table.concat(octets, ".")) then
+      self.status = ""
+      local session, detail = openSession("guest", function(transport)
+        return transport:join(address)
+      end)
+      if session then
+        self.net = session
         self.stage = "joining"
       else
-        self:exitWith(Strings("Link error:\n%s", self.net.error or "?"))
+        self:exitWith(Strings("Link error:\n%s", detail))
       end
     end
 
@@ -428,19 +337,11 @@ function LinkState:update(dt)
 
   elseif self.stage == "waitMode" then -- guest waits for host's pick
     if input:wasPressed("b") then self:exitWith(nil) return end
-    local msgs = self.net:poll()
-    for i, msg in ipairs(msgs) do
-      if msg.type == "hello" then
-        self.peerHello = msg
-        self.peerName = msg.name
-        -- the host's next messages (party, ...) can share this batch;
-        -- put them back so the new stage's poll sees them
-        for j = #msgs, i + 1, -1 do
-          table.insert(self.net.inbox, 1, msgs[j])
-        end
-        self:decideCompat(msg.mode, false)
-        break
-      end
+    local message = self.net:take("hello")
+    if message then
+      self.peerHello = message
+      self.peerName = message.name
+      self:decideCompat(message.mode, false)
     end
 
   elseif self.stage == "notice" then
@@ -456,44 +357,57 @@ function LinkState:update(dt)
 
   elseif self.stage == "battleWait" then
     if input:wasPressed("b") then self:exitWith(nil) return end
-    local msgs = self.net:poll()
-    for i, msg in ipairs(msgs) do
-      if msg.type == "party" then
-        -- the host owns this rule (same as mode); the guest only learns
-        -- it here, off the host's own party message
-        if not self.isHost then self.forceLevel = msg.forceLevel end
-        local LinkBattle = require("src.link.LinkBattle")
-        local opts = {
-          myParty = Protocol.packParty(self.game.save.party),
-          theirParty = msg.mons,
-          theirName = self.peerName or "FOE",
-          seed = self.isHost and self.linkSeed or msg.seed,
-          verdict = self.verdict,
-          strict = Handshake.strict(self.verdict),
-          forceLevel = self.forceLevel,
-        }
-        local battle, why
-        if self.isHost then
-          battle, why = LinkBattle.newHost(self.game, self.net, opts)
-        else
-          battle, why = LinkBattle.newGuest(self.game, self.net, opts)
-        end
-        if not battle then
-          self.net:send({ type = "bye" })
-          self:exitWith(why or Strings("Link battle\ncan't start."), "error")
-          return
-        end
-        self.game.stack:push(battle)
-        self.stage = "battleRunning"
-        for j = #msgs, i + 1, -1 do
-          table.insert(self.net.inbox, 1, msgs[j])
-        end
-        break
+    local message = self.net:take("party")
+    if message then
+      -- the host owns this rule (same as mode); the guest only learns
+      -- it here, off the host's own party message
+      if not self.isHost then
+        self.forceLevel = message.forceLevel
+        self.rulesetId = message.ruleset
       end
+      local LinkBattle = require("src.link.LinkBattle")
+      local opts = {
+        myParty = Protocol.packParty(self.game.save.party),
+        theirParty = message.mons,
+        theirName = self.peerName or "FOE",
+        seed = self.isHost and self.linkSeed or message.seed,
+        verdict = self.verdict,
+        strict = Handshake.strict(self.verdict),
+        forceLevel = self.forceLevel,
+        ruleset = self.rulesetId,
+      }
+      local battle, why
+      if self.isHost then
+        battle, why = LinkBattle.newHost(self.game, self.net, opts)
+      else
+        battle, why = LinkBattle.newGuest(self.game, self.net, opts)
+      end
+      if not battle then
+        self.net:send({ type = "bye" })
+        self:exitWith(why or Strings("Link battle\ncan't start."), "error")
+        return
+      end
+      self.game.stack:push(battle)
+      self.battle = battle
+      self.stage = "battleRunning"
     end
 
   elseif self.stage == "battleRunning" then
     if self.game.stack:top() == self then
+      -- the lockstep copies carry the damage the real party never takes
+      -- (cable rules), so a mode that wants it -- a tournament ladder, a
+      -- battle royale -- reads it from here before the state unwinds
+      local battle = self.battle
+      if battle and Runtime.wants("link.battle_ended") then
+        Runtime.emit("link.battle_ended", {
+          result = battle.result or "ended",
+          myParty = battle.playerParty,
+          theirParty = battle.enemyParty,
+          peerName = self.peerName,
+          role = self.isHost and "host" or "guest",
+        })
+      end
+      self.battle = nil
       self:exitWith(nil) -- battle finished
     end
   end
@@ -513,16 +427,21 @@ function LinkState:startMode(mode, isHost)
     })
     self.net:send(self.trade:opening())
     self.index = 1
+    self.theirIndex = 1
+    self.side = "mine"
+    self.pickChoice = nil
   else
     self.stage = "battleWait"
     -- the host deals the shared RNG seed for the lockstep simulation
     if isHost then
       self.linkSeed = love.math.random(1, 2 ^ 30)
+      self.rulesetId = Handshake.ruleset(self.game)
     end
     self.net:send({ type = "party",
                     mons = Protocol.packParty(self.game.save.party),
                     seed = self.linkSeed,
-                    forceLevel = isHost and self.forceLevel or nil })
+                    forceLevel = isHost and self.forceLevel or nil,
+                    ruleset = isHost and self.rulesetId or nil })
   end
 end
 
@@ -530,7 +449,44 @@ end
 -- trade flow
 -- -------------------------------------------------------------------
 
+function LinkState:openStats(mon)
+  if not mon then return end
+  self.game.linkNet = self.net
+  Screens.push(self.game, "SummaryMenu", mon)
+end
+
+-- engine/link/cable_club.asm:657
+function LinkState:listLabel(mon, t, index)
+  local def = mon and self.game.data.pokemon[mon.species]
+  local label = (def and def.name) or (mon and mon.species) or ""
+  if t and index and not t:canPick(index) then label = label .. "X" end
+  return label
+end
+
+-- engine/link/cable_club.asm:26
+function LinkState:beginRound()
+  self.roundBusy = false
+  if self.game.linkNet == self.net then self.game.linkNet = nil end
+  if not self.net or self.net:getStatus() == "closed" then
+    self:exitWith(Strings("The link was\nbroken."))
+    return
+  end
+  self.trade = Protocol.TradeSession.new(self.game.data, self.game.save.party, {
+    subset = self.verdict == "subset",
+    strict = Handshake.strict(self.verdict),
+    peerName = self.peerName,
+  })
+  self.net:send(self.trade:opening())
+  self.index = 1
+  self.theirIndex = 1
+  self.side = "mine"
+  self.pickChoice = nil
+  self.confirmed = nil
+end
+
 function LinkState:updateTrade(input)
+  if self.roundBusy then return end
+  if self.game.linkNet == self.net then self.game.linkNet = nil end
   for _, msg in ipairs(self.net:poll()) do
     local reply = self.trade:handle(msg)
     if reply then self.net:send(reply) end
@@ -554,12 +510,19 @@ function LinkState:updateTrade(input)
     -- headless LinkBattle-style fake games with no writeSave are unaffected.
     if self.game.writeSave then self.game:writeSave() end
     local name = received.nickname or self.game.data.pokemon[received.species].name
-    Runtime.emit("link.ended", { reason = "done" })
-    self.game.linkSession = nil -- this path pops without exitWith
-    self.net:close()
-    self.game.stack:pop()
     local game = self.game
-    require("src.core.Sound").play(game.data, "Trade_Machine")
+    -- engine/link/cable_club.asm:870  #758
+    local again = self.verdict == "full" and self.net ~= nil
+                  and self.net:getStatus() ~= "closed"
+    if again then
+      self.roundBusy = true
+      game.linkNet = self.net
+    else
+      Runtime.emit("link.ended", { reason = "done" })
+      game.linkSession = nil
+      self.net:close()
+      game.stack:pop()
+    end
     Screens.push(game, "TradeAnim", {
       sent = sent, received = received,
       enemyName = (self.peerName or "TRAINER"),
@@ -570,6 +533,9 @@ function LinkState:updateTrade(input)
         game.stack:push(TextBox.new(game,
           Strings("Trade completed!\f%s received\n%s!", game.save.player.name, name),
           function()
+            local nextRound = function()
+              if again then self:beginRound() end
+            end
             if evoTo then
               -- via="TRADE": a trade evolution cannot be B-cancelled
               -- (pokered LINK_STATE_TRADING skips the flash B-poll) (#213).
@@ -577,7 +543,12 @@ function LinkState:updateTrade(input)
               -- species (not the pre-evo landed by t:apply) is what persists,
               -- keeping disk in step with the autosave above (#222).
               require("src.pokemon.Evolution").evolve(game, received, evoTo,
-                function() if game.writeSave then game:writeSave() end end, "TRADE")
+                function()
+                  if game.writeSave then game:writeSave() end
+                  nextRound()
+                end, "TRADE")
+            else
+              nextRound()
             end
           end))
       end,
@@ -585,10 +556,63 @@ function LinkState:updateTrade(input)
     return
   end
 
-  if t.stage == "picking" and input:wasPressed("up") then
-    self.index = math.max(1, self.index - 1)
+  -- pokered engine/link/cable_club.asm TradeCenter_SelectMon: A on one of
+  -- your own mons opens the "STATS     TRADE" row (.displayStatsTradeMenu)
+  -- and only TRADE commits the pick, while the enemy list carries its own
+  -- cursor whose A shows that mon's status pages (.displayEnemyMonStats).
+  -- The cart's enemy path sets hl but never wMonDataLocation, the way the
+  -- battle menu's STATS (engine/battle/core.asm) does, so LoadMonData_ reads
+  -- the player's party and it draws YOUR mon at that slot -- an omission,
+  -- not behaviour, so we show the peer's mon.
+  if t.stage == "picking" and self.pickChoice then
+    if input:wasPressed("left") then
+      self.pickChoice = 1
+    elseif input:wasPressed("right") then
+      self.pickChoice = 2
+    elseif input:wasPressed("b") then
+      self.pickChoice = nil -- .cancelPlayerMonChoice: back to the list, not
+                            -- out of the trade
+    elseif input:wasPressed("a") then
+      if self.pickChoice == 1 then
+        self.pickChoice = nil
+        self:openStats(self.game.save.party[self.index])
+      elseif t:canPick(self.index) then
+        self.pickChoice = nil
+        self.side = "mine"
+        self.net:send(t:pick(self.index))
+      end
+    end
+  elseif t.stage == "picking" and input:wasPressed("up") then
+    -- engine/link/cable_club.asm:537
+    if self.side == "cancel" then
+      self.side = "mine"
+      self.index = math.max(1, #self.game.save.party)
+    elseif self.side == "theirs" then
+      self.theirIndex = math.max(1, self.theirIndex - 1)
+    else
+      self.index = math.max(1, self.index - 1)
+    end
   elseif t.stage == "picking" and input:wasPressed("down") then
-    self.index = math.min(#self.game.save.party, self.index + 1)
+    if self.side == "cancel" then
+      self.side = "cancel"
+    elseif self.side == "theirs" then
+      if self.theirIndex >= #(t.theirParty or {}) then
+        self.side = "cancel"
+      else
+        self.theirIndex = self.theirIndex + 1
+      end
+    elseif self.index >= #self.game.save.party then
+      self.side = "cancel"
+    else
+      self.index = self.index + 1
+    end
+  elseif t.stage == "picking" and input:wasPressed("right") then
+    if t.theirParty and #t.theirParty > 0 then
+      self.side = "theirs"
+      self.theirIndex = math.min(self.theirIndex, #t.theirParty)
+    end
+  elseif t.stage == "picking" and input:wasPressed("left") then
+    self.side = "mine"
   elseif self.confirmed == nil and input:wasPressed("b") then
     -- once confirm=true has been sent to the peer, backing out here
     -- would desync the two sides (the peer may already be committing
@@ -597,8 +621,14 @@ function LinkState:updateTrade(input)
     self.net:send({ type = "bye" })
     self:exitWith(Strings("The trade was\ncancelled."))
   elseif t.stage == "picking" and input:wasPressed("a") then
-    if t:canPick(self.index) then
-      self.net:send(t:pick(self.index))
+    if self.side == "cancel" then
+      -- engine/link/cable_club.asm:537
+      self.net:send({ type = "bye" })
+      self:exitWith(Strings("The trade was\ncancelled."))
+    elseif self.side == "theirs" then
+      self:openStats((t.theirParty or {})[self.theirIndex])
+    else
+      self.pickChoice = 1
     end
   elseif t.stage == "confirming" and self.confirmed == nil then
     if input:wasPressed("a") then
@@ -621,48 +651,11 @@ end
 
 function LinkState:draw()
   if self.stage == "menu" then
-    drawTitle("BOIS CLUB LIVE")
-    Font.draw(Strings("LINK CABLE (LAN)"), 32, 44)
-    Font.draw(Strings("ONLINE MATCH"), 32, 60)
-    Font.draw(Strings("TOURNAMENT"), 32, 76)
-    Font.drawCode(CURSOR, 24, 44 + (self.index - 1) * 16)
-
-  elseif self.stage == "lanMenu" then
     drawTitle("LINK CABLE (LAN)")
     Font.draw(Strings("HOST A GAME"), 32, 48)
     Font.draw(Strings("JOIN A GAME"), 32, 68)
     Font.drawCode(CURSOR, 24, self.index == 1 and 48 or 68)
     Font.draw(Strings("UDP port %s", Net.defaultPort()), 8, 128)
-
-  elseif self.stage == "onlineMenu" then
-    drawTitle("ONLINE MATCH")
-    Font.draw(Strings("HOST ONLINE"), 32, 48)
-    Font.draw(Strings("JOIN ONLINE"), 32, 68)
-    Font.drawCode(CURSOR, 24, self.index == 1 and 48 or 68)
-
-  elseif self.stage == "onlineHosting" then
-    drawTitle("HOSTING ONLINE")
-    Font.draw(Strings("Tell your friend"), 16, 40)
-    Font.draw(Strings("the code:"), 16, 52)
-    Font.draw(self.net.code or "??????", 32, 68)
-    Font.draw(Strings("Waiting for join..."), 8, 96)
-
-  elseif self.stage == "codeEntry" then
-    drawTitle("ENTER CODE")
-    for i = 1, CodeEntry.LENGTH do
-      local x = 16 + (i - 1) * 16
-      local ch = CodeEntry.CHARSET:sub(self.codeEntry.chars[i], self.codeEntry.chars[i])
-      Font.draw(ch, x, 64)
-      if i == self.codeEntry.pos then
-        Font.drawCode(0xEE, x, 76) -- ▼ under the active slot
-      end
-    end
-    Font.draw(Strings("A: connect  B: back"), 8, 128)
-
-  elseif self.stage == "onlineJoining" then
-    drawTitle("CONNECTING...")
-    Font.draw(Strings("Calling..."), 8, 56)
-    Font.draw(self.net.target or "", 8, 72)
 
   elseif self.stage == "hosting" then
     drawTitle("HOSTING")
@@ -672,18 +665,16 @@ function LinkState:draw()
 
   elseif self.stage == "addrEntry" then
     drawTitle("ENTER HOST ADDRESS")
-    for i = 1, 12 do
-      local octet = math.floor((i - 1) / 3) -- 0..3
-      local x = 16 + (i - 1) * 8 + octet * 8 -- gap for the dots
-      Font.draw(tostring(self.addr[i]), x, 64)
-      if i == self.addrPos then
-        Font.drawCode(0xEE, x, 76) -- ▼ under the active digit
+    for i = 1, LinkState.ADDR_LENGTH do
+      local x = 8 + (i - 1) * 8
+      local ch = CodeEntry.charAt(self.addr, i)
+      if ch ~= " " then Font.draw(ch, x, 64) end
+      if i == self.addr.pos then
+        Font.drawCode(0xEE, x, 76)
       end
     end
-    for octet = 1, 3 do
-      Font.draw(".", 16 + octet * 32 - 8, 64)
-    end
-    Font.draw(Strings("Port: %s", Net.defaultPort()), 16, 96)
+    Font.draw(Strings("Port: %s", Net.defaultPort()), 8, 96)
+    if self.status ~= "" then Font.draw(self.status, 8, 112) end
     Font.draw(Strings("A: connect  B: back"), 8, 128)
 
   elseif self.stage == "joining" then
@@ -715,8 +706,13 @@ function LinkState:draw()
 
   elseif self.stage == "notice" then
     -- a version-skew notice has nothing to do with mods (#758)
-    drawTitle(self.verdict == "engine_skew" and "UPDATE YOUR GAME"
-                                             or "CHECK YOUR MODS")
+    local noticeTitle = "CHECK YOUR MODS"
+    if self.verdict == "engine_skew" then
+      noticeTitle = "UPDATE YOUR GAME"
+    elseif self.verdict == "ruleset_skew" then
+      noticeTitle = "CHECK YOUR RULES"
+    end
+    drawTitle(noticeTitle)
     for i, line in ipairs(self.noticeLines or {}) do
       if i > 8 then break end -- what fits above the prompt row
       Font.draw(line, 8, 24 + (i - 1) * 12)
@@ -724,33 +720,64 @@ function LinkState:draw()
     Font.draw(self.noticeExits and "A: back" or Strings("A: trade anyway"), 8, 128)
 
   elseif self.stage == "trade" then
-    drawTitle("TRADE")
+    -- engine/link/cable_club.asm:635
     local t = self.trade
-    Font.draw(Strings("YOURS"), 8, 20)
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.rectangle("fill", 0, 0, 160, 144)
+    CableFrame.box(0, 0, 20, 8)
+    CableFrame.box(0, 8, 20, 8)
+    -- engine/link/cable_club.asm:643
+    local function nameOnBorder(name, y)
+      if not name or name == "" then return end
+      love.graphics.setColor(1, 1, 1, 1)
+      love.graphics.rectangle("fill", 40, y, Font.width(name), 8)
+      love.graphics.setColor(0, 0, 0, 1)
+      Font.draw(name, 40, y)
+    end
+    nameOnBorder((self.game.save.player and self.game.save.player.name), 0)
+    nameOnBorder(self.peerName, 64)
+    love.graphics.setColor(0, 0, 0, 1)
+    -- engine/link/cable_club.asm:657
     for i, mon in ipairs(self.game.save.party) do
-      local def = self.game.data.pokemon[mon.species]
-      local label = (mon.nickname or def.name):sub(1, 8)
-      if not t:canPick(i) then label = label .. "X" end
-      Font.draw(label, 16, 20 + i * 12)
-      if i == self.index then Font.drawCode(CURSOR, 8, 20 + i * 12) end
+      Font.draw(self:listLabel(mon, t, i), 16, i * 8)
+      if i == self.index and self.side == "mine" then
+        Font.drawCode(CURSOR, 8, i * 8)
+      end
     end
-    Font.draw(Strings("THEIRS"), 84, 20)
     for i, mon in ipairs(t.theirParty or {}) do
-      local def = self.game.data.pokemon[mon.species]
-      Font.draw((mon.nickname or def.name):sub(1, 8), 92, 20 + i * 12)
-      if t.theirPick == i then Font.drawCode(CURSOR, 84, 20 + i * 12) end
+      Font.draw(self:listLabel(mon), 16, 64 + i * 8)
+      -- engine/link/cable_club.asm:617
+      if self.side == "theirs" and i == self.theirIndex then
+        Font.drawCode(CURSOR, 8, 64 + i * 8)
+      elseif t.theirPick == i then
+        Font.drawCode(CURSOR_HOLLOW, 8, 64 + i * 8)
+      end
     end
-    local hint
-    if t.stage == "waitRecords" then hint = "Comparing games..."
-    elseif t.stage == "waitParty" then hint = "Exchanging data..."
-    elseif t.stage == "picking" then
-      hint = t:canPick(self.index) and "Pick one to trade"
-             or Strings("X: not on theirs")
-    elseif t.stage == "waitPick" then hint = "Waiting for them..."
-    elseif t.stage == "confirming" then
-      hint = self.confirmed and "Waiting..." or Strings("A: trade  B: cancel")
+    if self.pickChoice then
+      -- engine/link/cable_club.asm:468
+      CableFrame.box(0, 14, 20, 4)
+      love.graphics.setColor(0, 0, 0, 1)
+      Font.draw(Strings("STATS"), 16, 128)
+      Font.draw(Strings("TRADE"), 96, 128)
+      Font.drawCode(CURSOR, self.pickChoice == 1 and 8 or 88, 128)
+    else
+      -- engine/link/cable_club.asm:601
+      CableFrame.fill(11, 15, 9, 1)
+      CableFrame.fill(0, 16, 20, 2)
+      CableFrame.box(0, 15, 11, 3)
+      love.graphics.setColor(0, 0, 0, 1)
+      Font.draw(Strings("CANCEL"), 16, 128)
+      -- engine/link/cable_club.asm:552
+      if self.side == "cancel" then Font.drawCode(CURSOR, 8, 128) end
     end
-    Font.draw(hint or "", 8, 132)
+    if t.stage == "waitRecords" or t.stage == "waitParty"
+       or t.stage == "waitPick" or (t.stage == "confirming" and self.confirmed) then
+      -- engine/link/print_waiting_text.asm
+      CableFrame.box(3, 10, 13, 3)
+      love.graphics.setColor(0, 0, 0, 1)
+      Font.draw(Strings("Waiting...!"), 32, 88)
+    end
+    love.graphics.setColor(0, 0, 0, 1)
 
   elseif self.stage == "battleWait" or self.stage == "battleRunning" then
     drawTitle("LINK BATTLE")

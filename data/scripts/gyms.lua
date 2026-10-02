@@ -18,6 +18,60 @@ local M = {
   VIRIDIAN_GYM  = { city = "VIRIDIAN CITY",  leader = "GIOVANNI", badge = "EARTHBADGE" },
 }
 
+-- The originals' middle branch shared by every leader's text_asm: beaten
+-- but EVENT_GOT_TM* unset means the bag was full when the victory script
+-- ran GiveItem, so talking to the leader re-runs the ReceiveTM script.
+-- Returns true when the retry took over the talk.  A save from before
+-- #797 already holds the TM without the flag; treat the owned TM as
+-- received so those saves fall through to the advice text instead of
+-- collecting a second copy.
+local function retryTmGive(game, ow, victoryKey, done)
+  local reward = require("data.scripts.victories")[victoryKey]
+  if not (reward and reward.gotFlag) then return false end
+  if game.save.flags[reward.gotFlag] then return false end
+  local owned = game.save.inventory and game.save.inventory[reward.item] or 0
+  if owned > 0 then
+    game.save.flags[reward.gotFlag] = true
+    return false
+  end
+  ow:offerGymTm(reward, done)
+  return true
+end
+
+-- The badge line + its jingle, armed for the battle screen the way
+-- SaveEndBattleTextPointers does (PewterGym.asm:117-119) (#1606).  The jingle
+-- comes from victories.badgeSoundFor, which knows that a badge line is read by
+-- the battle sound engine and so does not sound like its overworld name
+-- (#2339).
+local function pageCount(s)
+  local n = 0
+  for page in (s .. "\f"):gmatch("(.-)\f") do
+    if page ~= "" then n = n + 1 end
+  end
+  return n
+end
+
+local function badgeEndBattleText(game, victoryKey)
+  local victories = victoryKey and require("data.scripts.victories")
+  local reward = victories and victories[victoryKey]
+  if not (reward and reward.dialogue) then return nil end
+  local text = game.data.text or {}
+  local pages, soundPage = {}, nil
+  for _, label in ipairs(reward.dialogue) do
+    if text[label] and text[label] ~= "" then
+      pages[#pages + 1] = text[label]
+      -- scripts/PewterGym.asm:156-159
+      if not soundPage then
+        local n = pageCount(text[label])
+        if n > 0 then soundPage = n end
+      end
+    end
+  end
+  if #pages == 0 then return nil end
+  local sound = victories.badgeSoundFor(victoryKey)
+  return table.concat(pages, "\f"), sound, sound and soundPage or nil
+end
+
 -- scripts/PewterGym.asm PewterGymBrockText (text_asm): CheckEvent
 -- EVENT_BEAT_BROCK branches his dialogue.  Before the badge he prints
 -- _PewterGymBrockPreBattleText and engages the leader battle
@@ -25,18 +79,21 @@ local M = {
 -- badge/TM34 rewards and EVENT_BEAT_BROCK come from
 -- data/scripts/victories.lua OPP_BROCK#1).  After the badge his
 -- .afterBeat branch prints _PewterGymBrockPostBattleAdviceText ("Go to
--- the GYM in CERULEAN...").  The original's middle branch (beat but
--- TM34 not yet handed over, CheckEventReuseA EVENT_GOT_TM34) is
--- unreachable in the port: the TM is granted with the victory.
+-- the GYM in CERULEAN...").  The middle branch (beat but TM34 not yet
+-- handed over, CheckEventReuseA EVENT_GOT_TM34 -> call
+-- PewterGymScriptReceiveTM34) retries the TM give when the bag was full
+-- at the victory (#797).
 M.PEWTER_GYM.talk = {
   TEXT_PEWTERGYM_BROCK = function(game, ow, npc, done)
     if game.save.flags.EVENT_BEAT_BROCK then
+      if retryTmGive(game, ow, "OPP_BROCK#1", done) then return end
       local TextBox = require("src.render.TextBox")
       game.stack:push(TextBox.new(game,
         game.data.text._PewterGymBrockPostBattleAdviceText
         or "Go to the GYM in\nCERULEAN and test\nyour abilities!", done))
     else
-      ow:engageTrainer(npc, done)
+      local text, sound, soundPage = badgeEndBattleText(game, "OPP_BROCK#1")
+      ow:engageTrainer(npc, done, text, nil, sound, nil, soundPage)
     end
   end,
 }
@@ -48,16 +105,17 @@ M.PEWTER_GYM.talk = {
 -- (engageTrainer shows that same pre-battle text via resolveText; the
 -- badge/TM rewards and the beat flag come from data/scripts/victories.lua)
 -- -- and once beaten print the post-battle advice text.  As with Brock,
--- the originals' middle branch (beaten but the TM not yet handed over,
--- CheckEventReuseA EVENT_GOT_TM*) is unreachable in the port: the TM is
--- granted with the victory.
+-- the middle branch (beaten but the TM not yet handed over,
+-- CheckEventReuseA EVENT_GOT_TM*) retries the TM give when the bag was
+-- full at the victory.
 -- afterAdvice, when given, takes over `done`: it is handed (game, ow, npc,
 -- done) and must call done() itself once whatever it's doing (e.g. a fade
 -- around a HideObject) finishes, rather than having it invoked
 -- automatically. Only Giovanni's farewell uses this.
-local function leaderTalk(beatFlag, adviceLabel, fallback, afterAdvice)
+local function leaderTalk(beatFlag, adviceLabel, fallback, afterAdvice, victoryKey)
   return function(game, ow, npc, done)
     if game.save.flags[beatFlag] then
+      if victoryKey and retryTmGive(game, ow, victoryKey, done) then return end
       local TextBox = require("src.render.TextBox")
       local finish = done
       if afterAdvice then
@@ -68,7 +126,8 @@ local function leaderTalk(beatFlag, adviceLabel, fallback, afterAdvice)
       game.stack:push(TextBox.new(game,
         game.data.text[adviceLabel] or fallback, finish))
     else
-      ow:engageTrainer(npc, done)
+      local text, sound, soundPage = badgeEndBattleText(game, victoryKey)
+      ow:engageTrainer(npc, done, text, nil, sound, nil, soundPage)
     end
   end
 end
@@ -79,42 +138,42 @@ end
 M.CERULEAN_GYM.talk = {
   TEXT_CERULEANGYM_MISTY = leaderTalk("EVENT_BEAT_MISTY",
     "_CeruleanGymMistyTM11ExplanationText",
-    "TM11 teaches\nBUBBLEBEAM!"),
+    "TM11 teaches\nBUBBLEBEAM!", nil, "OPP_MISTY#1"),
 }
 
 -- scripts/VermilionGym.asm VermilionGymLTSurgeText .got_tm24_already
 M.VERMILION_GYM.talk = {
   TEXT_VERMILIONGYM_LT_SURGE = leaderTalk("EVENT_BEAT_LT_SURGE",
     "_VermilionGymLTSurgePostBattleAdviceText",
-    "A little word of\nadvice, kid!"),
+    "A little word of\nadvice, kid!", nil, "OPP_LT_SURGE#1"),
 }
 
 -- scripts/CeladonGym.asm CeladonGymErikaText .afterBeat
 M.CELADON_GYM.talk = {
   TEXT_CELADONGYM_ERIKA = leaderTalk("EVENT_BEAT_ERIKA",
     "_CeladonGymErikaPostBattleAdviceText",
-    "You are cataloging\nPOKéMON? I must\nsay I'm impressed."),
+    "You are cataloging\nPOKéMON? I must\nsay I'm impressed.", nil, "OPP_ERIKA#1"),
 }
 
 -- scripts/FuchsiaGym.asm FuchsiaGymKogaText .afterBeat
 M.FUCHSIA_GYM.talk = {
   TEXT_FUCHSIAGYM_KOGA = leaderTalk("EVENT_BEAT_KOGA",
     "_FuchsiaGymKogaPostBattleAdviceText",
-    "When afflicted by\nTOXIC, POKéMON\nsuffer more and\nmore as battle\nprogresses!"),
+    "When afflicted by\nTOXIC, POKéMON\nsuffer more and\nmore as battle\nprogresses!", nil, "OPP_KOGA#1"),
 }
 
 -- scripts/SaffronGym.asm SaffronGymSabrinaText .afterBeat
 M.SAFFRON_GYM.talk = {
   TEXT_SAFFRONGYM_SABRINA = leaderTalk("EVENT_BEAT_SABRINA",
     "_SaffronGymSabrinaPostBattleAdviceText",
-    "Everyone has\npsychic power!\nPeople just don't\nrealize it!"),
+    "Everyone has\npsychic power!\nPeople just don't\nrealize it!", nil, "OPP_SABRINA#1"),
 }
 
 -- scripts/CinnabarGym.asm CinnabarGymBlaineText .afterBeat
 M.CINNABAR_GYM.talk = {
   TEXT_CINNABARGYM_BLAINE = leaderTalk("EVENT_BEAT_BLAINE",
     "_CinnabarGymBlainePostBattleAdviceText",
-    "FIRE BLAST is the\nultimate fire\ntechnique!"),
+    "FIRE BLAST is the\nultimate fire\ntechnique!", nil, "OPP_BLAINE#1"),
 }
 
 -- scripts/ViridianGym.asm ViridianGymGiovanniText .afterBeat: after the
@@ -142,7 +201,7 @@ M.VIRIDIAN_GYM.talk = {
             "VIRIDIAN_GYM", "VIRIDIANGYM_GIOVANNI")
         end
       end, done))
-    end),
+    end, "OPP_GIOVANNI#3"),
 }
 
 return M

@@ -17,6 +17,7 @@ local ARCHIVE = {
 local files, dirs, arch = {}, {}, {}
 local fileDataMounts, pathMounts, stagedTemps = 0, 0, {}
 local stagedEver = false
+local failWriteOnce
 
 local function resetFs()
   for k in pairs(files) do files[k] = nil end
@@ -25,6 +26,7 @@ local function resetFs()
   fileDataMounts, pathMounts = 0, 0
   stagedTemps = {}
   stagedEver = false
+  failWriteOnce = nil
 end
 
 local function dirChild(key, name)
@@ -45,6 +47,10 @@ end
 local vfs = {}
 
 function vfs.write(name, data)
+  if failWriteOnce == name then
+    failWriteOnce = nil
+    return nil, "simulated write failure"
+  end
   files[name] = data
   if name:match("^mod_import_") then
     stagedTemps[name] = true
@@ -171,6 +177,16 @@ eq(staged, 0, "FileData path leaves no staged temp zip")
 check(files["mods/" .. MOD_ID .. "/manifest.json"] ~= nil,
   "install wrote manifest into mods/")
 
+-- A third-party archive cannot bypass modkit's no-baseroms packaging gate.
+resetFs()
+ARCHIVE[MOD_ID .. "/baseroms/source.z64"] = "packaged rom"
+files["imports/mods/packaged-rom.zip"] = "PK\3\4packaged-rom"
+ok, err = LauncherMods.installZip("imports/mods/packaged-rom.zip")
+check(not ok, "an archive containing baseroms is rejected")
+check(tostring(err):find("must not include", 1, true),
+  "baseroms archive rejection explains the policy")
+ARCHIVE[MOD_ID .. "/baseroms/source.z64"] = nil
+
 -- Fallback: no newFileData → stage temp + path mount
 resetFs()
 vfs.newFileData = nil
@@ -187,6 +203,87 @@ check(stagedEver, "fallback stages a mod_import_*.zip temp")
 local leftover = 0
 for _ in pairs(stagedTemps) do leftover = leftover + 1 end
 eq(leftover, 0, "fallback cleans staged temp after install")
+
+-- #801: a same-id copy under a different folder name is replaced too, so the
+-- update cannot leave a shadow copy for discover()'s first-id-wins race
+resetFs()
+files["mods/WildsOfKanto-1.5.0/manifest.json"] =
+  ('{"id":"%s","name":"Old Copy","version":"0.9.0","entry":"main.lua"}')
+    :format(MOD_ID)
+files["mods/WildsOfKanto-1.5.0/main.lua"] = "return function() end\n"
+files["imports/mods/update.zip"] = "PK\3\4update"
+ok, err = LauncherMods.installZip("imports/mods/update.zip",
+  { replace = true, expectId = MOD_ID })
+check(ok == true, "replace install succeeds over an odd-named copy ("
+  .. tostring(err) .. ")")
+check(files["mods/WildsOfKanto-1.5.0/manifest.json"] == nil,
+  "odd-named same-id folder is removed by the replace")
+check(files["mods/" .. MOD_ID .. "/manifest.json"] ~= nil,
+  "replace still lands in mods/<id>")
+
+-- User-selected baseroms belong to the installation, not the downloaded mod
+-- archive, and survive the same replacement path.
+resetFs()
+files["mods/OldFolder/manifest.json"] =
+  ('{"id":"%s","name":"Old Copy","version":"0.9.0","entry":"main.lua"}')
+    :format(MOD_ID)
+files["mods/OldFolder/main.lua"] = "return function() end\n"
+files["mods/OldFolder/baseroms/stadium2.z64"] = "user-owned-rom"
+files["imports/mods/update-with-rom.zip"] = "PK\3\4update"
+ok, err = LauncherMods.installZip("imports/mods/update-with-rom.zip",
+  { replace = true, expectId = MOD_ID })
+check(ok == true, "replace with a baserom succeeds (" .. tostring(err) .. ")")
+eq(files["mods/" .. MOD_ID .. "/baseroms/stadium2.z64"], "user-owned-rom",
+  "replace preserves user-owned baseroms under the canonical mod folder")
+check(files["mods/OldFolder/baseroms/stadium2.z64"] == nil,
+  "the shadow mod tree is still removed after preservation")
+
+-- A preservation write failure keeps recovery bytes outside mods/, where
+-- discovery cannot mistake a baseroms-only directory for an installed mod.
+resetFs()
+files["mods/OldFolder/manifest.json"] =
+  ('{"id":"%s","name":"Old Copy","version":"0.9.0","entry":"main.lua"}')
+    :format(MOD_ID)
+files["mods/OldFolder/main.lua"] = "return function() end\n"
+files["mods/OldFolder/baseroms/stadium2.z64"] = "user-owned-rom"
+files["imports/mods/preserve-fail.zip"] = "PK\3\4update"
+failWriteOnce = "mods/" .. MOD_ID .. "/baseroms/stadium2.z64"
+ok, err = LauncherMods.installZip("imports/mods/preserve-fail.zip",
+  { replace = true, expectId = MOD_ID })
+check(not ok, "preservation failure rejects the update")
+check(files["mods/" .. MOD_ID .. "/manifest.json"] == nil,
+  "preservation failure leaves no manifest-less tree under mods")
+eq(files["imports/baseroms-recovery/" .. MOD_ID .. "/stadium2.z64"],
+  "user-owned-rom", "preservation failure stages recovery outside mods")
+
+files["imports/mods/preserve-retry.zip"] = "PK\3\4update"
+ok, err = LauncherMods.installZip("imports/mods/preserve-retry.zip",
+  { replace = true, expectId = MOD_ID })
+check(ok == true, "retry restores staged baseroms (" .. tostring(err) .. ")")
+eq(files["mods/" .. MOD_ID .. "/baseroms/stadium2.z64"], "user-owned-rom",
+  "retry restores the recovered baserom into the installed mod")
+check(files["imports/baseroms-recovery/" .. MOD_ID .. "/stadium2.z64"] == nil,
+  "successful retry clears baserom recovery debris")
+
+-- #834: a manifest-less mods/<id> tree (interrupted copy debris) must not
+-- block a plain re-import as "already installed"
+resetFs()
+files["mods/" .. MOD_ID .. "/gfx/a.bin"] = "x"
+files["imports/mods/again.zip"] = "PK\3\4again"
+ok, err = LauncherMods.installZip("imports/mods/again.zip")
+check(ok == true, "debris tree does not block re-import ("
+  .. tostring(err) .. ")")
+check(files["mods/" .. MOD_ID .. "/gfx/a.bin"] == nil,
+  "debris is cleared by the re-import")
+
+-- a real installed copy still refuses a plain duplicate import
+resetFs()
+files["mods/" .. MOD_ID .. "/manifest.json"] = ARCHIVE[MOD_ID .. "/manifest.json"]
+files["imports/mods/dup.zip"] = "PK\3\4dup"
+ok, err = LauncherMods.installZip("imports/mods/dup.zip")
+check(not ok, "a listed install still refuses a plain duplicate import")
+check(tostring(err):find("already installed", 1, true),
+  "duplicate refusal still names already installed")
 
 -- Restore
 love.filesystem = savedFs

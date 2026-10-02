@@ -79,6 +79,10 @@ end
 -- to the A/B path once the cry is over -- see TextBox's opts.auto.wait
 -- (#247, #251).
 function Commands.show_text(ctx, textId, subs, extraOpts)
+  -- home/window.asm:289
+  if ctx.overworld and ctx.overworld.applyPendingFace then
+    ctx.overworld:applyPendingFace()
+  end
   local text = ctx.game.data.text[textId]
   if not text and ctx.overworld then
     text = ctx.game.data:resolveText(ctx.overworld.map.def.label, textId)
@@ -111,6 +115,16 @@ function Commands.show_text(ctx, textId, subs, extraOpts)
       return require("src.core.Sound").playCry(ctx.game.data, species)
     end, delay = 0, wait = waitForButton } }
   end
+  if ctx.pendingEngageMusic then
+    local song = ctx.pendingEngageMusic
+    ctx.pendingEngageMusic = nil
+    opts = opts or {}
+    opts.auto = opts.auto or { delay = 0, wait = true }
+    -- home/trainers.asm:399
+    opts.auto.afterSound = function()
+      require("src.core.Music").play(ctx.game.data, song)
+    end
+  end
   -- text_opts armed the next box: auto = true is the plain no-button-wait
   -- form, overlap folds under auto, everything else passes through
   if ctx.textOpts then
@@ -133,6 +147,14 @@ function Commands.show_text(ctx, textId, subs, extraOpts)
     for k, v in pairs(extraOpts) do
       opts[k] = v
     end
+  end
+  -- MONEY_BOX (engine/menus/text_box.asm:133) reads the live wallet
+  if opts and opts.money == "choice" then
+    -- scripts/MtMoonPokecenter.asm:30
+    opts.money = function() return ctx.save.money end
+    opts.moneyWithChoice = true
+  elseif opts and opts.money == true then
+    opts.money = function() return ctx.save.money end
   end
   ctx.game.stack:push(TextBox.new(ctx.game, text, function()
     runner:resume()
@@ -162,6 +184,13 @@ end
 function Commands.face_player(ctx)
   if ctx.npc and ctx.overworld then
     ctx.npc:facePlayer(ctx.overworld.player)
+  end
+end
+
+-- engine/overworld/movement.asm:411; scripts/SSAnneCaptainsRoom.asm:8,32
+function Commands.no_npc_face_player(ctx, on)
+  if ctx.overworld then
+    ctx.overworld.noNpcFacePlayer = on and true or nil
   end
 end
 
@@ -210,22 +239,28 @@ function Commands.jump_if_false(ctx, target)
   if not ctx.lastCheck then return target end
 end
 
--- give_item <itemId> [count] [gotText]: adds to the bag, plays the gift
--- jingle and shows the "got item!" box.  pokered's GiveItem (home/
+-- give_item <itemId> [count] [gotText] [fullText] [sound] [fullNoFace]: adds to the bag, plays
+-- the gift jingle and shows the "got item!" box.  pokered's GiveItem (home/
 -- give.asm) copies the item name to wStringBuffer and every gift script
 -- then prints a text ending "<PLAYER> got\n<item>!" with
 -- sound_get_item_1/sound_get_key_item.  gotText picks that per-script
 -- text (label or literal; {RAM:wStringBuffer} becomes the item name);
--- pass false when the script shows its own received-text row.
-function Commands.give_item(ctx, itemId, count, gotText)
+-- pass false when the script shows its own received-text row.  fullText
+-- picks the refusal text (scripts/BillsHouse.asm:184-186).
+function Commands.give_item(ctx, itemId, count, gotText, fullText, sound,
+                             fullNoFace)
   -- the bag can refuse at its configured capacity (20 in vanilla): halt
   -- the script, so later set_flag rows don't burn the gift -- make
   -- room and talk again, like the original (pokered's `jr nc, .bag_full`
   -- skips the received text entirely when AddItemToInventory refuses)
   if not require("src.inventory.Bag").add(
       ctx.save, itemId, count or 1, ctx.game.data) then
-    Commands.show_text(ctx, ctx.game.data.text
-      and ctx.game.data.text._BagFullText or Strings("You can't carry\nany more items!"))
+    Commands.show_text(ctx, fullText or (ctx.game.data.text
+      and ctx.game.data.text._BagFullText) or Strings("You can't carry\nany more items!"))
+    if fullNoFace then
+      -- scripts/SSAnneCaptainsRoom.asm:36-37
+      Commands.no_npc_face_player(ctx, true)
+    end
     return math.huge
   end
   local def = ctx.game.data.items[itemId]
@@ -235,7 +270,8 @@ function Commands.give_item(ctx, itemId, count, gotText)
   -- the jingle rides the box -- Sound.play routes fanfares through
   -- Music.duckForFanfare, like PlaySoundWaitForCurrent
   local Sound = require("src.core.Sound")
-  local jingle = (def and def.keyItem) and "Get_Key_Item" or "Get_Item1"
+  local jingle = sound
+    or ((def and def.keyItem) and "Get_Key_Item" or "Get_Item1")
   if gotText ~= false then
     -- the gift texts carry the jingle as a trailing text command
     -- (sound_get_item_1 / sound_get_key_item -> home/text.asm
@@ -250,7 +286,8 @@ function Commands.give_item(ctx, itemId, count, gotText)
     Commands.show_text(ctx, gotText
       or Strings("{PLAYER} got\n%s!", ctx.game.stringBuffer))
   else
-    Sound.play(ctx.game.data, jingle)
+    -- scripts/OaksLab.asm:1058
+    Commands.text_sound(ctx, jingle)
   end
 end
 
@@ -260,24 +297,85 @@ function Commands.take_item(ctx, itemId, count)
   if inv[itemId] == 0 then inv[itemId] = nil end
 end
 
+-- save_end_battle_text <TEXT_KEY>: SaveEndBattleTextPointers
+-- (home/trainers.asm, called from e.g. RocketHideoutB4FScript10 just before
+-- wCurOpponent is set).  The armed line is the trainer's OWN loss line and
+-- belongs on the battle screen: PrintEndBattleText (home/trainers.asm) runs
+-- from TrainerBattleVictory (engine/battle/core.asm) after
+-- TrainerDefeatedText and the pic scroll but BEFORE MoneyForWinningText, and
+-- TrainerEndBattleText prints _TrainerNameText first so the line opens with
+-- the "CLASS: " tag.  Scripts that printed it with a plain show_text after
+-- start_battle got it a box too late -- after the payout -- and untagged
+-- (#866).  Arms exactly one battle; start_battle consumes it.
+function Commands.save_end_battle_text(ctx, textId)
+  local text = ctx.game.data.text[textId]
+  if not text and ctx.overworld then
+    text = ctx.game.data:resolveText(ctx.overworld.map.def.label, textId)
+  end
+  -- BattleState takes finished text, so expand {PLAYER}/{RIVAL} here the
+  -- way OverworldState:engageTrainer does for the sight/talk path
+  ctx.endBattleText = TextBox.substitute(ctx.game, text or textId)
+end
+
+-- Route scripted battles through the standard entry transition. In the
+-- originals, InitWildBattle (engine/battle/init_battle.asm) always calls
+-- DoBattleTransitionAndInitBattleVariables (engine/battle/core.asm), with
+-- no old-man or Pikachu-demo exception; BattleTransition then selects the
+-- wipe for the battle kind. Some tests provide only a partial overworld
+-- double, so retain a logged fallback even though it skips the transition
+-- and battle music.
+function Commands.pushBattle(ctx, battle, keepNpc)
+  if ctx.overworld and ctx.overworld.pushBattle then
+    -- hSpriteIndex -- pokered home/text_script.asm:2
+    -- pokered engine/battle/battle_transitions.asm:14
+    ctx.overworld:pushBattle(battle, keepNpc or ctx.npc or ctx.scriptSprite or nil)
+  else
+    Logger.warn("pushBattle: no overworld:pushBattle, skipping the transition wipe")
+    ctx.game.stack:push(battle)
+  end
+end
+
 -- start_battle "wild" species level | start_battle "trainer" OPP_CLASS partyIndex
 function Commands.start_battle(ctx, kind, a, b)
   local BattleState = require("src.battle.BattleState")
   local runner = ctx.runner
+  local resumed = ctx.resumeBattle
+  if resumed then
+    ctx.resumeBattle = nil
+    local result, restoredBattle = resumed.result, resumed.battle
+    ctx.lastBattleResult = result
+    ctx.lastCheck = result == "win"
+    if ctx.overworld then
+      if result == "win" then
+        ctx.afterScript = ctx.afterScript or {}
+        table.insert(ctx.afterScript, function()
+          ctx.overworld:afterBattle(result, restoredBattle)
+        end)
+      else
+        ctx.overworld:afterBattle(result, restoredBattle)
+      end
+    end
+    return
+  end
   local battle
   if kind == "wild" then
     battle = BattleState.newWild(ctx.game, a, b)
   else
     battle = BattleState.newTrainer(ctx.game, a, b)
   end
+  -- one SaveEndBattleTextPointers arms one battle; leaving it set would leak
+  -- the line into the next scripted fight
+  battle.endBattleText, ctx.endBattleText = ctx.endBattleText, nil
+  if runner and runner.battleCheckpointOrigin then
+    battle.checkpointOrigin = runner:battleCheckpointOrigin(battle)
+    if battle.checkpointOrigin then runner.checkpointBattle = battle end
+  end
   battle.onFinish = function(result)
     ctx.lastBattleResult = result
     ctx.lastCheck = result == "win"
     if ctx.overworld then
-      -- A map script often follows a trainer battle with its own text.
-      -- Keep a level evolution behind that text: otherwise afterBattle
-      -- pushes the evolution screen, then this runner resumes and pushes
-      -- the trainer's text on top of it.
+      -- The map-side follow-up (stampClosedDoors, #372) rides behind the
+      -- script's own text; the evolution now runs in BattleState:finish.
       if result == "win" then
         ctx.afterScript = ctx.afterScript or {}
         table.insert(ctx.afterScript, function()
@@ -289,19 +387,8 @@ function Commands.start_battle(ctx, kind, a, b)
     end
     runner:resume()
   end
-  -- Every battle enters through the transition wipe, script-driven ones
-  -- included: BattleTransition (engine/battle/battle_transitions.asm:1) runs
-  -- from DoBattleTransitionAndInitBattleVariables for all of them, and
-  -- GetBattleTransitionID_WildOrTrainer picks the style from the battle kind.
-  -- Pushing the BattleState straight onto the stack skipped the wipe
-  -- entirely, so every scripted trainer -- gym leaders, the rival, Giovanni --
-  -- and every scripted wild battle simply cut to the battle screen.  The
-  -- trainer-sight path already went through pushBattle; this one did not.
-  if ctx.overworld and ctx.overworld.pushBattle then
-    ctx.overworld:pushBattle(battle)
-  else
-    ctx.game.stack:push(battle)
-  end
+  -- A direct stack push would skip the battle-entry transition.
+  Commands.pushBattle(ctx, battle)
   runner:yield()
 end
 
@@ -379,10 +466,17 @@ local function bfsPath(map, sx, sy, tx, ty, entities, mover)
   return nil
 end
 
+-- hSpriteIndex (pokered home/text_script.asm:2)
+-- OAM block over the wipe (pokered engine/battle/battle_transitions.asm:14)
+local function stampSpriteIndex(ctx, npc)
+  ctx.scriptSprite = npc
+  return npc
+end
+
 function Commands.move_npc_to(ctx, objIndex, tx, ty)
   local ow = ctx.overworld
   if not ow then return end
-  local npc = ow:npcByIndex(objIndex)
+  local npc = stampSpriteIndex(ctx, ow:npcByIndex(objIndex))
   if not npc then return end
   local path = bfsPath(ow.map, npc.cellX, npc.cellY, tx, ty, ow.entities, npc)
   if not path then
@@ -408,9 +502,12 @@ function Commands.face(ctx, dir)
 end
 
 -- face an arbitrary map object (by object_event index)
-function Commands.face_object(ctx, objIndex, dir)
-  local npc = ctx.overworld and ctx.overworld:npcByIndex(objIndex)
+function Commands.face_object(ctx, objIndex, dir, opts)
+  local npc = stampSpriteIndex(ctx,
+    ctx.overworld and ctx.overworld:npcByIndex(objIndex))
   if npc then npc.facing = dir end
+  -- pokeyellow engine/overworld/movement.asm:349
+  if npc and opts and opts.hold then npc.timer = opts.hold end
 end
 
 -- Instantly relocate an NPC (OaksLabCalcRivalMovementScript / SetSpritePosition1).
@@ -418,7 +515,7 @@ end
 function Commands.place_npc(ctx, objIndex, x, y, facing)
   local ow = ctx.overworld
   if not ow then return end
-  local npc = ow:npcByIndex(objIndex)
+  local npc = stampSpriteIndex(ctx, ow:npcByIndex(objIndex))
   if not npc then return end
   npc.cellX, npc.cellY = x, y
   npc.px, npc.py = x * 16, y * 16
@@ -476,6 +573,32 @@ function Commands.set_field(ctx, key, value)
   ctx.save[key] = value
 end
 
+-- scripts/ChampionsRoom.asm:57
+function Commands.set_option(ctx, key, value)
+  local o = ctx.save.options
+  if not o then
+    o = {}
+    ctx.save.options = o
+  end
+  o[key] = value
+end
+
+function Commands.load_player_starter_name(ctx)
+  local flags = ctx.save.flags or {}
+  local species = flags.EVENT_CHOSE_PIKACHU and "PIKACHU"
+    or flags.EVENT_CHOSE_CHARMANDER and "CHARMANDER"
+    or flags.EVENT_CHOSE_SQUIRTLE and "SQUIRTLE"
+    or flags.EVENT_CHOSE_BULBASAUR and "BULBASAUR"
+    or (ctx.save.party and ctx.save.party[1] and ctx.save.party[1].species)
+  local def = species and ctx.game.data.pokemon[species]
+  ctx.game.stringBuffer = def and def.name or species or ""
+end
+
+function Commands.spawn_pikachu_follower(ctx)
+  require("src.world.PikachuFollower").onMapEntered(
+    ctx.game, ctx.overworld, nil, false)
+end
+
 local function toggleObject(ctx, mapId, objName, visible)
   local save = ctx.save
   save.objectToggles = save.objectToggles or {}
@@ -523,7 +646,43 @@ function Commands.hide_object(ctx, mapId, objName)
 end
 
 function Commands.play_sound(ctx, soundId)
-  require("src.core.Sound").play(ctx.game.data, soundId)
+  ctx.lastSfxSrc = require("src.core.Sound").play(ctx.game.data, soundId)
+end
+
+-- wait_sound: WaitForSoundToFinish (home/delay.asm:15), the drain that
+-- follows every PlaySound in the cell-separator chain
+-- (engine/events/hidden_events/bills_house_pc.asm:22)
+local WAIT_SOUND_CEILING = 600
+
+function Commands.wait_sound(ctx)
+  local Sound = require("src.core.Sound")
+  local src = ctx.lastSfxSrc
+  ctx.lastSfxSrc = nil
+  local function busy()
+    if Sound.sfxBusy() then return true end
+    if not src then return false end
+    local ok, playing = pcall(function() return src:isPlaying() end)
+    return ok and playing and true or false
+  end
+  if not busy() then return end
+  local runner = ctx.runner
+  local left = WAIT_SOUND_CEILING
+  runner.waitingCheck = function()
+    left = left - 1
+    return left <= 0 or not busy()
+  end
+  runner:yield()
+end
+
+-- text_sound <soundId>: the jingle the ROM parks at the END of a string as
+-- a trailing text command (sound_get_item_1, sound_get_key_item ->
+-- home/text.asm TextCommand_SOUND).  It arms the NEXT show_text the same
+-- way play_cry arms ctx.pendingCry, so the fanfare fires once the last page
+-- has typed and the box holds on WaitForSoundToFinish before the button
+-- wait.  play_sound stays the bare PlaySound used for the non-blocking
+-- beats (Bill's teleporter, the S.S. Anne horn).
+function Commands.text_sound(ctx, soundId)
+  ctx.textOpts = TextBox.soundOpts(ctx.game, soundId, ctx.textOpts)
 end
 
 -- play_once <songId>: one-shot jingle (Music_PkmnHealed, etc.); blocks
@@ -547,8 +706,7 @@ end
 -- (no A press) the instant the cry finishes, rather than firing immediately
 -- alongside the typewriter effect. Script rows run strictly in order, so
 -- this stashes the species on ctx for the show_text row that always
--- immediately follows it (Power Plant Zapdos, Seafoam Articuno, Victory
--- Road Moltres, Cerulean Cave Mewtwo battle text) to play once its box is
+-- immediately follows it to play once its box is
 -- done typing (see show_text's opts.auto).  Headless-safe no-op there.
 --
 -- waitForButton is the pet-NPC form (scripts/PewterNidoranHouse.asm and
@@ -560,6 +718,11 @@ end
 function Commands.play_cry(ctx, species, waitForButton)
   ctx.pendingCry = species
   ctx.pendingCryWait = waitForButton or nil
+end
+
+-- home/trainers.asm:327
+function Commands.engage_music(ctx, songId)
+  ctx.pendingEngageMusic = songId
 end
 
 -- mark_seen <species>: DisplayPokedex (pokedex.asm) records the species as
@@ -620,7 +783,7 @@ local function askNickname(ctx, mon)
       return
     end
     Screens.push(ctx.game, "NamingScreen", {
-      title = Strings("NICKNAME?"), maxLen = 10,
+      title = Strings("NICKNAME?"), maxLen = 10, mon = mon,
       onDone = function(nick)
         if nick and #nick > 0 then mon.nickname = nick end
         ctx.lastCheck = success
@@ -638,10 +801,10 @@ end
 -- AskName runs for party (AddPartyMon) and box (SendNewMonToBox) when a
 -- script runner is present; mods that pre-set gift.nickname skip it.
 -- Box deposits also print SentToBoxText (give_pokemon.asm:36-37).
--- skipNickname suppresses the AskName prompt: Yellow's lab Pikachu is
--- added straight through AddPartyMon (pokeyellow scripts/OaksLab.asm
--- OaksLabPlayerReceivedMonText) -- the starter Pikachu keeps its name.
-function Commands.give_pokemon(ctx, species, level, skipNickname)
+-- skipNickname suppresses AskName for callers that name the gift themselves;
+-- no vanilla script uses it (pokeyellow scripts/OaksLab.asm, #1013)
+-- gotText prints GotMonText ahead of AskName (give_pokemon.asm:46).
+function Commands.give_pokemon(ctx, species, level, skipNickname, gotText)
   -- Native mods can transform a gift before the Pokémon object is created.
   -- This is intentionally an event rather than a special-case starter hook:
   -- mods can use the same seam for story gifts, fossils, or custom scripts.
@@ -675,6 +838,11 @@ function Commands.give_pokemon(ctx, species, level, skipNickname)
   ctx.lastCheck = true
   ctx.addedToParty = addedToParty
   ctx.boxNum = boxNum
+  -- engine/events/give_pokemon.asm:46
+  if gotText and ctx.runner then
+    Commands.text_sound(ctx, "Get_Item1")
+    Commands.show_text(ctx, "_GotMonText", { RAM = species })
+  end
   -- AskName: both AddPartyMon and SendNewMonToBox; skip mod-set nicks
   -- and callback-style callers with no script runner to yield on.
   if not gift.nickname and not skipNickname and ctx.runner then
@@ -702,6 +870,21 @@ end
 
 function Commands.give_money(ctx, amount)
   ctx.save.money = math.max(0, ctx.save.money + amount)
+end
+
+-- check_money <amount>: HasEnoughMoney (home/money.asm:1)
+function Commands.check_money(ctx, amount)
+  ctx.lastCheck = (ctx.save.money or 0) >= (amount or 0)
+end
+
+-- take_money <amount>: SubBCDPredef (engine/math/bcd.asm:193)
+function Commands.take_money(ctx, amount)
+  ctx.save.money = math.max(0, (ctx.save.money or 0) - (amount or 0))
+end
+
+-- take_coins <amount>: SubBCDPredef (engine/events/prize_menu.asm:238-243)
+function Commands.take_coins(ctx, amount)
+  ctx.save.coins = math.max(0, (ctx.save.coins or 0) - (amount or 0))
 end
 
 -- Point LAST_MAP exits at an outdoor door (pokered wLastMap).  Keeps the
@@ -796,15 +979,7 @@ function Commands.old_man_demo(ctx, outcome)
   local battle = BattleState.newWild(ctx.game, om.species, om.level)
   battle:makeOldManDemo(nil, outcome == "fail")
   battle.onFinish = function() runner:resume() end
-  -- InitWildBattle calls DoBattleTransitionAndInitBattleVariables
-  -- unconditionally (core.asm:6699) -- there is no BATTLE_TYPE_OLD_MAN
-  -- special case -- so the catch tutorial gets the wipe like any other
-  -- wild battle
-  if ctx.overworld and ctx.overworld.pushBattle then
-    ctx.overworld:pushBattle(battle)
-  else
-    ctx.game.stack:push(battle)
-  end
+  Commands.pushBattle(ctx, battle)
   runner:yield()
 end
 
@@ -993,8 +1168,10 @@ function Commands.trade(ctx, tradeIndex, doneFlag)
     onDone = function() runner:resume() end,
   })
   runner:yield()
-  -- TradedForText (sound_get_key_item) then the dialogset's thanks
-  require("src.core.Sound").play(data, "Get_Key_Item")
+  -- TradedForText carries sound_get_key_item after the text, so the jingle
+  -- rides the box and blocks it (home/text.asm TextCommand_SOUND), then the
+  -- dialogset's thanks
+  Commands.text_sound(ctx, "Get_Key_Item")
   say(texts.tradedFor or "_TradedForText")
   say(texts.thanks or "_Thanks" .. dialogset .. "Text")
 end
@@ -1038,17 +1215,23 @@ end
 function Commands.walk_npc(ctx, objIndex, dirs, opts)
   local ow = ctx.overworld
   if not ow then return end
-  local entity = objIndex == "player" and ow.player or ow:npcByIndex(objIndex)
+  local entity = objIndex == "player" and ow.player
+    or stampSpriteIndex(ctx, ow:npcByIndex(objIndex))
   if not entity then return end
   claimMove(ctx, entity)
   local runner = ctx.runner
   local wait = not (opts and opts.wait == false)
+  -- pokeyellow engine/overworld/movement.asm:932
+  local fast = opts and opts.stepFrames and entity ~= ow.player
+  local prevStep = entity.stepFrames
+  if fast then entity.stepFrames = opts.stepFrames end
   local yielded, finished = false, false
   local i = 0
   local function step()
     i = i + 1
     if not dirs[i] then
       finished = true
+      if fast then entity.stepFrames = prevStep end
       if wait and yielded then runner:resume() end
       return
     end
@@ -1074,10 +1257,23 @@ function Commands.march_in_place(ctx, objIndex, on)
   ow.marchers[npc] = on and true or nil
 end
 
+-- pikachu_make_way: callfar OaksLabPikachuMovementScript (pokeyellow
+-- scripts/OaksLab_2.asm); a no-op without a Yellow follower (#1021)
+function Commands.pikachu_make_way(ctx)
+  local ow = ctx.overworld
+  if not ow then return end
+  local runner = ctx.runner
+  local started = require("src.world.PikachuFollower")
+    .oaksLabMakeWay(ctx.game, ow, function() runner:resume() end)
+  if started then runner:yield() end
+end
+
 -- play_music <songId> [opts]: switch map music now; opts.keep marks it
--- to survive the next warp (the story files' keepMusic idiom)
+-- to survive the next warp (the story files' keepMusic idiom).
+-- opts.tempo is the Music_*AlternateTempo override (audio/alternate_tempo.asm
+-- re-points channel 1 at a stub that only changes the song's `tempo`) (#847).
 function Commands.play_music(ctx, songId, opts)
-  require("src.core.Music").play(ctx.game.data, songId)
+  require("src.core.Music").play(ctx.game.data, songId, nil, opts)
   if opts and opts.keep and ctx.overworld then
     ctx.overworld.keepMusicOnce = true
   end
@@ -1085,6 +1281,15 @@ end
 
 function Commands.stop_music(ctx)
   require("src.core.Music").stop()
+end
+
+-- fade_music [control]: FadeOutAudio (home/fade_audio.asm) -- ramp the
+-- current song to silence over 7 * control frames and stop it, the way
+-- Music_Cities1AlternateTempo does before it restarts Cities1 (#847).
+-- Non-blocking, like the ROM's write to wAudioFadeOutControl: pair it with
+-- the `wait` that stands in for the following DelayFrames.
+function Commands.fade_music(ctx, control)
+  require("src.core.Music").fadeOut(control or 10)
 end
 
 -- play_default_music: PlayDefaultMusic -- resume the current map's own
@@ -1102,6 +1307,16 @@ end
 -- on the current map
 function Commands.replace_block(ctx, bx, by, blockId)
   if ctx.overworld then ctx.overworld:replaceBlock(bx, by, blockId) end
+end
+
+-- ss_anne_departs: scripts/VermilionDock.asm:80 .shift_columns_up, blocking
+-- until she has cleared her own width
+function Commands.ss_anne_departs(ctx)
+  local ow = ctx.overworld
+  if not ow or not ow.startSsAnneDeparture then return end
+  local runner = ctx.runner
+  ow:startSsAnneDeparture(function() runner:resume() end)
+  runner:yield()
 end
 
 -- set_tile_anim <anim|false>: override the current tileset's animation
@@ -1188,11 +1403,14 @@ function FadeOverlay:update()
 end
 
 function FadeOverlay:draw()
-  if self.color == "white" then
-    love.graphics.setColor(1, 1, 1, self.alpha)
-  else
-    love.graphics.setColor(0, 0, 0, self.alpha)
+  local shade = (self.color == "white") and 1 or 0
+  -- home/fade.asm:26
+  local r = self.game and self.game.renderer
+  if r then
+    r.screenVeil = { shade, self.alpha }
+    return
   end
+  love.graphics.setColor(shade, shade, shade, self.alpha)
   love.graphics.rectangle("fill", 0, 0, 160, 144)
   love.graphics.setColor(1, 1, 1, 1)
 end
@@ -1315,15 +1533,16 @@ Commands.meta = {}
 for _, verb in ipairs({ "show_text", "ask", "choice", "start_battle", "warp",
     "open_mart", "trade", "push_screen", "record_hall_of_fame",
     "old_man_demo", "static_battle", "rival_battle", "give_item",
-    "give_pokemon", "fade", "pan_camera" }) do
+    "give_pokemon", "fade", "pan_camera", "ss_anne_departs" }) do
   Commands.meta[verb] = { foreground = true }
 end
 for _, verb in ipairs({ "show_text", "ask", "choice", "start_battle", "warp",
     "open_mart", "trade", "push_screen", "record_hall_of_fame",
     "old_man_demo", "static_battle", "rival_battle", "give_item",
-    "give_pokemon", "wait",
+    "give_pokemon", "wait", "wait_sound",
     "wait_flag", "move_player", "move_npc", "move_npc_to", "walk_npc",
-    "emote", "fade", "pan_camera", "play_once" }) do
+    "emote", "fade", "pan_camera", "play_once", "pikachu_make_way",
+    "ss_anne_departs" }) do
   local meta = Commands.meta[verb] or {}
   Commands.meta[verb] = meta
   meta.blocking = true

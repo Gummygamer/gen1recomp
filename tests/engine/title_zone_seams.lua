@@ -15,21 +15,41 @@ local check, eq, same = T.check, T.eq, T.same
 -- endFrame's blit closure, which needs canvases and a compiled shader.  The
 -- source is loaded directly so the rect arithmetic can be exercised with no
 -- GPU, the same way parity_picker_pointer_grab reads RomImporter (#254).
-local scissorClamped, captured
-do
+local captured
+local function loadScissor(loveMajor)
   local f = io.open("src/render/Renderer.lua", "rb")
   check(f ~= nil, "Renderer source is readable")
   local src = f and f:read("*a") or ""
   if f then f:close() end
+  local bias = src:match("\nlocal SCISSOR_PIXEL_BIAS = 0%.5.-\nend\n")
+  check(bias ~= nil, "scissor bias is still version-gated")
   local body = src:match("\nlocal function scissorClamped.-\nend\n")
   check(body ~= nil, "scissorClamped is still a single local function")
-  local fakeLove = { graphics = { setScissor = function(x, y, w, h)
-    captured = { x = x, y = y, w = w, h = h }
-  end } }
-  local chunk = assert(loadstring("local love = ...\n" .. (body or "")
+  local fakeLove = {
+    getVersion = function() return loveMajor, 0, 0 end,
+    graphics = { setScissor = function(x, y, w, h)
+      captured = { x = x, y = y, w = w, h = h }
+    end },
+  }
+  local chunk = assert(loadstring("local love = ...\n" .. (bias or "")
+    .. (body or "")
     .. "\nreturn scissorClamped"))
-  scissorClamped = chunk(fakeLove)
-  check(type(scissorClamped) == "function", "scissorClamped loads standalone")
+  local scissor = chunk(fakeLove)
+  check(type(scissor) == "function", "scissorClamped loads standalone")
+  return scissor
+end
+local scissorClamped = loadScissor(11)
+
+-- LÖVE 12 changed setScissor from truncating Lua integers to accepting floats
+-- and rounding in the backend.  Its arguments must therefore describe the
+-- already-snapped rectangle exactly, without LÖVE 11's half-pixel nudge.
+do
+  local scissor12 = loadScissor(12)
+  captured = nil
+  check(scissor12(50, 60, 10, 20, 0, 0, 100, 100, 2, 2),
+    "LÖVE 12 integer test rect draws")
+  same(captured, { x = 50, y = 60, w = 10, h = 20 },
+    "LÖVE 12 receives an unbiased snapped scissor")
 end
 
 -- The title's three SGB zones in canvas pixels (PaletteFX.zone turns the
@@ -214,6 +234,32 @@ do
   same(z[3].colors[1], { 255, 255, 255 }, "the mon zone is pure white")
   same(z[2].colors[4], BLUE_LOGO1[4], "Blue's \"Version\" ink stays blue")
   same(z[2].colors[3], BLUE_LOGO1[3], "Blue LOGO1's other inks stay put")
+end
+
+-- #133's grays overlay follows every box on screen, not just the topmost
+-- state's: DisplayContinueGameInfo leaves the menu box up behind the info
+-- window (main_menu.asm:36-39), and reading only the top left the menu box
+-- on the raw LOGO2 / LOGO1 bands -- blue rows over a red EXIT GAME row.
+do
+  PaletteFX.mode = "gbc"
+  GameVersion.set("red")
+  local stack = {
+    states = { { isOpaque = true },
+               { titleUiBox = { 0, 0, 12, 9 } },
+               { titleUiBox = { 4, 7, 19, 16 } } },
+    visibleBase = function() return 1 end,
+    top = function(self) return self.states[#self.states] end,
+  }
+  local z = title:sgbPalettes({ data = romPack(RED_LOGO1), stack = stack })
+  eq(#z, 5, "both open boxes get an overlay zone")
+  eq(z[4].x, 0, "the menu box keeps its overlay while the info window is up")
+  eq(z[4].y, 0, "at the menu box's own origin")
+  eq(z[5].x, 32, "and the info window's sits on top of it")
+  eq(z[5].y, 56, "at hlcoord 4,7")
+
+  stack.states[3] = nil
+  z = title:sgbPalettes({ data = romPack(RED_LOGO1), stack = stack })
+  eq(#z, 4, "the menu alone is still one overlay, as before")
 end
 
 PaletteFX.mode = savedMode

@@ -2,6 +2,7 @@
 -- `down` = held this frame; `pressed` = edge, consumed per fixed step.
 
 local GamepadMap = require("src.core.GamepadMap")
+local PadHints = require("src.core.PadHints")
 
 local Input = {}
 
@@ -19,6 +20,11 @@ local DEFAULT_BINDINGS = {
   tab = "select",
   rshift = "select",
   lshift = "select",
+  -- FRLG shoulders: bag paging + L=A alias.
+  q = "l",
+  e = "r",
+  lctrl = "l",
+  rctrl = "r",
 }
 
 -- keys that map to "start" but also to "a" would conflict; keep Enter = a,
@@ -32,6 +38,33 @@ local STICK_OFF = 0.3
 
 -- Raw joystick defaults + NX overrides live in src/core/GamepadMap.lua
 -- (see RAW_BUTTON_BINDINGS / NX_RAW_BUTTON_BINDINGS and #620 / #632).
+--
+-- SELECT ON A PLAYSTATION PAD, checked rather than assumed.  There is no
+-- button called "select" in SDL's game-controller vocabulary: the small
+-- left-hand menu button is `back` on every family, and GamepadMap's
+-- DEFAULT_GAMEPAD_BINDINGS maps it to GB SELECT.  The DualSense's CREATE
+-- button (and the DualShock 4's SHARE) is that button -- the controller
+-- database LOVE 11.5 ships spells the DualSense row
+-- "PS5 Controller,a:b1,b:b2,back:b8,...,misc1:b13,start:b9" -- so a
+-- recognized pad delivers it here as gamepadpressed(_, "back") and needs no
+-- entry of its own.  What it also has, and what LOVE 11.x has no name for at
+-- all, is the TOUCHPAD click (SDL_CONTROLLER_BUTTON_TOUCHPAD) and the mute
+-- key (`misc1`): neither reaches love.gamepadpressed, so neither can be bound,
+-- and a player reaching for the touchpad expecting SELECT will find nothing.
+-- Not a mapping this file can add -- the event never arrives.
+--
+-- An unrecognized PlayStation pad falls to the raw path instead, where SHARE /
+-- CREATE is generic-HID button 9 and RAW_BUTTON_BINDINGS[9] is already
+-- "select".  Both roads reach SELECT; the one road that did not was Gold's,
+-- where src/core/Game2.lua used to answer `back` with love.event.quit().
+
+Input.PAD_ACTIONS = { speedUp = true, speedDown = true }
+
+local POLLABLE_PAD_BUTTONS = {
+  a = true, b = true, x = true, y = true, back = true, guide = true, start = true,
+  leftstick = true, rightstick = true, leftshoulder = true, rightshoulder = true,
+  dpup = true, dpdown = true, dpleft = true, dpright = true,
+}
 
 local HAT_DIRECTIONS = {
   u = { "up" }, d = { "down" }, l = { "left" }, r = { "right" },
@@ -63,10 +96,23 @@ function Input:applyBindings(overlay)
   for index, action in pairs(GamepadMap.rawBindings()) do
     joys[index] = action
   end
+  local acts = {}
+  for button, action in pairs(GamepadMap.DEFAULT_PAD_ACTIONS) do
+    acts[button] = action
+  end
   for actionId, binding in pairs(overlay or {}) do
-    if type(binding) == "table" then
+    if Input.PAD_ACTIONS[actionId] then
+      for button, action in pairs(acts) do
+        if action == actionId then acts[button] = nil end
+      end
+      if type(binding) == "table" and binding.pad then
+        acts[GamepadMap.TRIGGER_AXES[binding.pad] or binding.pad] = actionId
+      end
+    elseif type(binding) == "table" then
       if binding.key then keys[binding.key] = actionId end
-      if binding.pad then pads[binding.pad] = actionId end
+      if binding.pad then
+        pads[GamepadMap.TRIGGER_AXES[binding.pad] or binding.pad] = actionId
+      end
     elseif type(binding) == "string" then
       keys[binding] = actionId
     end
@@ -82,9 +128,50 @@ function Input:applyBindings(overlay)
     local n = tonumber(padName:match("^joy(%d+)$"))
     if n then joys[n] = action end
   end
+  local joyActs = {}
+  for padName, action in pairs(acts) do
+    local n = tonumber(padName:match("^joy(%d+)$"))
+    if n then joyActs[n] = action end
+  end
+  local poll = {}
+  local canPoll = GamepadMap.gamepadBindings() ~= GamepadMap.NX_GAMEPAD_BINDINGS
+  for button, action in pairs(pads) do
+    if canPoll and POLLABLE_PAD_BUTTONS[button] then
+      poll[#poll + 1] = { button = button, btn = action, source = "pad:" .. button,
+        chord = GamepadMap.displayChordDigit(button) ~= nil }
+    end
+  end
   self.keyBindings = keys
   self.padBindings = pads
   self.joyBindings = joys
+  self.padActions = acts
+  self.joyActions = joyActs
+  self.padPoll = poll
+end
+
+function Input.hotkeyKey(key)
+  if type(key) ~= "string" then return key end
+  if key:match("^%d$") then return key end
+  local bound = Input.keyBindings
+  if bound and bound[key] then return key end
+  local digit = key:match("^kp(%d)$")
+  if digit then return digit end
+  local kb = love and love.keyboard
+  if kb and kb.getScancodeFromKey then
+    local ok, scancode = pcall(kb.getScancodeFromKey, key)
+    if ok and type(scancode) == "string" and scancode:match("^%d$") then
+      return scancode
+    end
+  end
+  return key
+end
+
+function Input:padAction(button)
+  return self.padActions and self.padActions[button] or nil
+end
+
+function Input:joyAction(index)
+  return self.joyActions and self.joyActions[index] or nil
 end
 
 -- Purely event-driven state (press sets true, release sets false) has no
@@ -100,6 +187,72 @@ function Input:reset()
   self.stickAxis = { x = 0, y = 0 }
   self.stickDir = nil
   self.hatDirs = {}
+  self.triggerHeld = {}
+  self.captureArmed = false
+  self.captureEvents = nil
+  self.aliases = nil
+  self.aliasHeld = nil
+  self._pollPads = nil
+  self._pollPadCount = nil
+  local suppress = {}
+  local poll = self.padPoll
+  if poll then
+    for i = 1, #poll do suppress[poll[i].button] = true end
+  end
+  self.padSuppress = suppress
+end
+
+function Input:padEventSeen(button)
+  if type(button) ~= "string" then return end
+  local suppress = self.padSuppress
+  if not suppress then
+    suppress = {}
+    self.padSuppress = suppress
+  end
+  suppress[button] = true
+end
+
+-- pokefirered/src/main.c:325
+function Input:setButtonAlias(src, dst)
+  local aliases = self.aliases
+  if dst == nil then
+    if aliases then
+      aliases[src] = nil
+      if next(aliases) == nil then self.aliases = nil end
+    end
+    return
+  end
+  if not aliases then
+    aliases = {}
+    self.aliases = aliases
+  end
+  aliases[src] = dst
+end
+
+function Input:armCapture()
+  self.captureArmed = true
+  self.captureEvents = {}
+end
+
+function Input:disarmCapture()
+  self.captureArmed = false
+  self.captureEvents = nil
+end
+
+function Input:takeCaptureEvents()
+  local ev = self.captureEvents
+  self.captureEvents = self.captureArmed and {} or nil
+  return ev
+end
+
+local function noteCapture(self, kind, phase, value)
+  if not self.captureArmed then return end
+  local ev = self.captureEvents
+  if not ev then
+    ev = {}
+    self.captureEvents = ev
+  end
+  ev[#ev + 1] = { kind = kind, phase = phase, value = value }
 end
 
 -- Multiple physical sources (W + Up, d-pad + stick, etc.) can claim the
@@ -135,6 +288,7 @@ local function release(self, btn, source)
 end
 
 function Input:keypressed(key)
+  noteCapture(self, "key", "pressed", key)
   local btn = self.keyBindings[key]
   if btn then
     press(self, btn, "key:" .. key)
@@ -142,6 +296,7 @@ function Input:keypressed(key)
 end
 
 function Input:keyreleased(key)
+  noteCapture(self, "key", "released", key)
   local btn = self.keyBindings[key]
   if btn then
     release(self, btn, "key:" .. key)
@@ -154,8 +309,127 @@ end
 -- button stuck on after the queue drains.
 -- Synthetic injects (tests/drivers writing pressQueue directly, with no
 -- source entry) still set state so scripted holds keep working.
+local function modOwnsPad()
+  local Runtime = package.loaded["src.mods.Runtime"]
+  return type(Runtime) == "table" and Runtime.wantsHook ~= nil
+    and Runtime.wantsHook("input.gamepad") == true
+end
+
+local function notePadRepair(fix, button)
+  local Diag = package.loaded["src.debug.SwitchDiagnostics"]
+  if type(Diag) == "table" and Diag.onEvent then
+    Diag.onEvent("padwatch", { fix = fix, button = button })
+  end
+end
+
+local function anyPadDown(pads, button)
+  for k = 1, #pads do
+    local j = pads[k]
+    local ok, down = pcall(j.isGamepadDown, j, button)
+    if ok and down then return true end
+  end
+  return false
+end
+
+-- a joystick was added or removed: rebuild pollPads' list on the next poll
+function Input:joysticksChanged()
+  self._pollPads = nil
+end
+
+-- pokefirered/src/main.c:296
+function Input:pollPads()
+  local js = love and love.joystick
+  if not (js and js.getJoystickCount and js.getJoysticks) then return end
+  local okC, count = pcall(js.getJoystickCount)
+  if not okC or type(count) ~= "number" or count == 0 then
+    self._pollPadCount = 0
+    return
+  end
+  local pads = self._pollPads
+  -- The count alone cannot see one controller swapped for another between
+  -- two polls; a cached pad that has gone away forces the rebuild too (and
+  -- main.lua's joystickadded/removed drop the cache via
+  -- Input:joysticksChanged).
+  local stale = not pads or self._pollPadCount ~= count
+  if not stale then
+    for k = 1, #pads do
+      local j = pads[k]
+      if j.isConnected then
+        local okConn, connected = pcall(j.isConnected, j)
+        if okConn and not connected then
+          stale = true
+          break
+        end
+      end
+    end
+  end
+  if stale then
+    pads = {}
+    local ok, list = pcall(js.getJoysticks)
+    if ok and type(list) == "table" then
+      for _, j in ipairs(list) do
+        if j.isGamepadDown and GamepadMap.ignoreRawForJoystick(j)
+            and not GamepadMap.isAccelerometer(j) then
+          pads[#pads + 1] = j
+        end
+      end
+    end
+    self._pollPads = pads
+    self._pollPadCount = count
+  end
+  local list = self.padPoll
+  if #pads == 0 or not list then return end
+  local mute = self.captureArmed or modOwnsPad()
+  local suppress = self.padSuppress
+  if not suppress then
+    suppress = {}
+    self.padSuppress = suppress
+  end
+  local backDown = nil
+  local minimized = nil
+  for i = 1, #list do
+    local e = list[i]
+    local down = anyPadDown(pads, e.button)
+    local sources = self.sources[e.btn]
+    local held = sources ~= nil and sources[e.source] == true
+    if not down then suppress[e.button] = nil end
+    if down and not held and minimized == nil then
+      minimized = PadHints.windowMinimized()
+    end
+    if held and not down then
+      release(self, e.btn, e.source)
+      notePadRepair("release", e.button)
+    elseif down and not held and not mute and not minimized and not suppress[e.button]
+        and not self.padActions[e.button] then
+      if e.chord and backDown == nil then
+        backDown = self.state.select == true or anyPadDown(pads, "back")
+      end
+      if not (e.chord and backDown) then
+        press(self, e.btn, e.source)
+        notePadRepair("press", e.button)
+      end
+    end
+  end
+end
+
+-- step's two per-step tables are recycled rather than reallocated, but only
+-- while they are still the ones step itself installed: a test or driver that
+-- assigns its own `pressed` / `pressQueue` gets a fresh table afterwards,
+-- exactly as before, and never sees its own table emptied.
+local function ownedCleared(self, field, ownKey)
+  local own = self[ownKey]
+  if own ~= nil and self[field] == own then
+    for k in pairs(own) do own[k] = nil end
+  else
+    own = {}
+    self[ownKey] = own
+  end
+  self[field] = own
+end
+
 function Input:step()
-  self.pressed = {}
+  self:pollPads()
+  ownedCleared(self, "pressed", "_ownPressed")
   for _, btn in ipairs(self.pressQueue) do
     self.pressed[btn] = true
     local sources = self.sources[btn]
@@ -172,7 +446,20 @@ function Input:step()
       self.sources[btn] = nil
     end
   end
-  self.pressQueue = {}
+  ownedCleared(self, "pressQueue", "_ownPressQueue")
+  -- pokefirered/src/main.c:325
+  local aliases = self.aliases
+  local held = nil
+  if aliases then
+    for src, dst in pairs(aliases) do
+      if self.pressed[src] then self.pressed[dst] = true end
+      if self.state[src] then
+        held = held or {}
+        held[dst] = true
+      end
+    end
+  end
+  self.aliasHeld = held
 end
 
 -- The on-screen touch overlay (src/core/TouchControls.lua) presses GB
@@ -186,17 +473,46 @@ function Input:overlayReleased(btn)
   release(self, btn, "touch:" .. btn)
 end
 
+-- Programmatic mod input (#807).  mod.input taps and holds land here under
+-- loader-issued "mod:<id>:<n>" source names, riding the same per-source
+-- bookkeeping as every physical path above, so releasing one can never
+-- clear a hold a key, stick, hat, the overlay, or another mod still owns.
+-- A tap is a sourcePress immediately followed by its sourceRelease: the
+-- queued edge survives into the next step, and the emptied source map
+-- keeps the hold from being revived (see Input:step's sources == {} rule).
+function Input:sourcePress(btn, source)
+  press(self, btn, source)
+end
+
+function Input:sourceRelease(btn, source)
+  release(self, btn, source)
+end
+
 function Input:gamepadpressed(joystick, button)
+  if self.padSuppress then self.padSuppress[button] = nil end
+  noteCapture(self, "pad", "pressed", button)
   local btn = self.padBindings[button]
   if btn then
     press(self, btn, "pad:" .. button)
   end
+  -- FRLG first-class shoulders (bag paging / L=A), independent of speed binds.
+  if button == "leftshoulder" then
+    press(self, "l", "pad:l")
+  elseif button == "rightshoulder" then
+    press(self, "r", "pad:r")
+  end
 end
 
 function Input:gamepadreleased(joystick, button)
+  noteCapture(self, "pad", "released", button)
   local btn = self.padBindings[button]
   if btn then
     release(self, btn, "pad:" .. button)
+  end
+  if button == "leftshoulder" then
+    release(self, "l", "pad:l")
+  elseif button == "rightshoulder" then
+    release(self, "r", "pad:r")
   end
 end
 
@@ -215,19 +531,47 @@ end
 
 function Input:joystickpressed(joystick, button)
   if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
+  noteCapture(self, "joy", "pressed", button)
   local btn = self.joyBindings[button]
   if btn then press(self, btn, "joy:" .. button) end
 end
 
 function Input:joystickreleased(joystick, button)
   if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
+  noteCapture(self, "joy", "released", button)
   local btn = self.joyBindings[button]
   if btn then release(self, btn, "joy:" .. button) end
+end
+
+function Input:triggerAxis(axis, value)
+  local name = GamepadMap.TRIGGER_AXES[axis]
+  if not name then return nil end
+  self.triggerHeld = self.triggerHeld or {}
+  local was = self.triggerHeld[name]
+  if not was and value >= GamepadMap.TRIGGER_ON then
+    self.triggerHeld[name] = true
+    return name, "pressed"
+  elseif was and value <= GamepadMap.TRIGGER_OFF then
+    self.triggerHeld[name] = nil
+    return name, "released"
+  end
+  return name
 end
 
 -- left stick treated as a continuous held direction, same 4-way rule as
 -- the touch swipe d-pad: whichever axis has the larger magnitude wins.
 function Input:gamepadaxis(joystick, axis, value)
+  local trigger, phase = self:triggerAxis(axis, value)
+  if trigger then
+    if phase == "pressed" then
+      self:gamepadpressed(joystick, trigger)
+    elseif phase == "released" then
+      self:gamepadreleased(joystick, trigger)
+    end
+    return
+  end
   if axis == "leftx" then
     self.stickAxis.x = value
   elseif axis == "lefty" then
@@ -262,6 +606,7 @@ end
 
 function Input:joystickaxis(joystick, axis, value)
   if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
   if axis == 1 then
     self:gamepadaxis(joystick, "leftx", value)
   elseif axis == 2 then
@@ -275,6 +620,7 @@ end
 -- directions on top of a direction rebind.
 function Input:joystickhat(joystick, hat, direction)
   if GamepadMap.ignoreRawForJoystick(joystick) then return end
+  if GamepadMap.isAccelerometer(joystick) then return end
   local source = "hat:" .. hat
   for _, btn in ipairs(self.hatDirs[hat] or {}) do
     release(self, btn, source)
@@ -286,8 +632,80 @@ function Input:joystickhat(joystick, hat, direction)
   self.hatDirs[hat] = dirs
 end
 
+-- Lifecycle resets (focus/visibility flips, joystick add/remove, resume)
+-- wipe held state because a release can be swallowed while the OS owns the
+-- event stream.  A direction the player is STILL holding never re-fires
+-- keypressed/gamepadpressed after the wipe either, so a spurious reset --
+-- macOS re-enumerating a Bluetooth pad fires joystickadded with no hotplug,
+-- and the blanket reset took unrelated keyboard holds down with it --
+-- parked the player in place until every direction was released and
+-- pressed again (#799).  Rebuild holds from the devices' ground truth
+-- instead: only what is physically down right now comes back, so the
+-- swallowed-release hazards the resets guard against stay cleared.
+-- Deliberately separate from reset(): the soft-reset chord path in
+-- Game:step needs the clean slate (re-arming A there would read it as a
+-- title-menu choice).
+function Input:reconcile()
+  local okD, Diag = pcall(require, "src.debug.SwitchDiagnostics")
+  if okD and Diag.onPadReconcile then pcall(Diag.onPadReconcile) end
+  local kb = love and love.keyboard
+  if kb and kb.isDown then
+    for key, btn in pairs(self.keyBindings) do
+      local ok, down = pcall(kb.isDown, key)
+      if ok and down then press(self, btn, "key:" .. key) end
+    end
+  end
+  local js = love and love.joystick
+  if not (js and js.getJoysticks) then return end
+  local ok, joysticks = pcall(js.getJoysticks)
+  if not ok or type(joysticks) ~= "table" then return end
+  for _, j in ipairs(joysticks) do
+    if GamepadMap.isAccelerometer(j) then
+    elseif GamepadMap.ignoreRawForJoystick(j) then
+      -- SDL-recognized pad: buttons + left stick, the gamepad surfaces
+      if j.isGamepadDown then
+        for button, btn in pairs(self.padBindings) do
+          local ok2, down = pcall(j.isGamepadDown, j, button)
+          if ok2 and down then press(self, btn, "pad:" .. button) end
+        end
+      end
+      if j.getGamepadAxis then
+        local axes = { "leftx", "lefty", "triggerleft", "triggerright" }
+        for _, axis in ipairs(axes) do
+          local ok2, v = pcall(j.getGamepadAxis, j, axis)
+          if ok2 and type(v) == "number" then self:gamepadaxis(j, axis, v) end
+        end
+      end
+    else
+      -- raw stick (#620/#632): the surfaces the joystick* events feed
+      if j.isDown then
+        for index, btn in pairs(self.joyBindings) do
+          local ok2, down = pcall(j.isDown, j, index)
+          if ok2 and down then press(self, btn, "joy:" .. index) end
+        end
+      end
+      if j.getAxis then
+        for _, axis in ipairs({ 1, 2 }) do
+          local ok2, v = pcall(j.getAxis, j, axis)
+          if ok2 and type(v) == "number" then self:joystickaxis(j, axis, v) end
+        end
+      end
+      if j.getHatCount and j.getHat then
+        local ok2, count = pcall(j.getHatCount, j)
+        for hat = 1, (ok2 and count) or 0 do
+          local ok3, dir = pcall(j.getHat, j, hat)
+          if ok3 and dir then self:joystickhat(j, hat, dir) end
+        end
+      end
+    end
+  end
+end
+
+-- pokefirered/src/main.c:325
 function Input:isDown(btn)
-  return self.state[btn] or false
+  if self.state[btn] then return true end
+  local held = self.aliasHeld
+  return (held and held[btn]) or false
 end
 
 -- True when the on-screen overlay is one of the live sources holding this

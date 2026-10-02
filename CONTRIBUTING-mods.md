@@ -130,18 +130,301 @@ keeps validating with the value it has shipped since before the taxonomy
 existed.
 
 A translation may also set `"language": true` in the manifest. That is the
-one claim online play acts on: an install running nothing but verified
-translations may take an ONLINE MATCH or a TOURNAMENT instead of being
-asked to restart vanilla. The claim is checked, not taken -- the mod
+one claim online play acts on. Online rooms, spectating and tournaments live
+in the launcher's ONLINE tab, and a match is played in an **arena boot**: the
+game starts with the mod loader in `disableAll` (nothing runs) or `cartOnly`
+(one sealed cart and nothing else), never in the enable state the player has
+saved. A verified translation is the single exception `disableAll` carves
+out, so an install running nothing but translations still enters rooms and
+tournaments. The claim is checked, not taken -- the mod
 qualifies only if every record it writes lands in `text`, `strings` or
 `font`, it wraps no hook, subscribes to no event and requests no
 permission. Anything else and it is an ordinary content mod that happens to
-ship text.
+ship text, and it simply does not load in an arena.
 
-### 4. `mod.card`
+A mod is not shut out of link play by any of that: it just cannot ride the
+launcher's rooms. `LinkState.newFromSession(game, transport, mode, isHost,
+opts)` still adopts an already-paired transport of the mod's own and runs a
+LAN-style battle or trade on it, hello and fingerprint check intact (see
+`docs/modding.md`).
+
+### 4. `games` (and the legacy `gen2compat`)
+
+Pokemon Gold, Silver and Crystal are Gen 2, and they run their own battle
+engine, overworld, script VM and save format. The mod API is shared across both
+generations (same hook names, same event names, same registry names) but Gen 2
+cannot serve all of it yet, so it is opt-in. Say which games the mod is for:
+
+```json
+"games": ["gen1", "gen2"]
+```
+
+Each entry is a version id (`"red"`, `"blue"`, `"yellow"`, `"gold"`,
+`"silver"`, `"crystal"`), a generation (`"gen1"`, `"gen2"`) or `"all"`;
+`src/mods/ModTargets.lua` resolves them off `GameVersion.ORDER` so nothing
+restates the game list, which is why `"gen2"` covers Crystal as well as Gold
+and Silver. `python3 tools/modkit.py scaffold my_mod --games gen1,gen2` writes
+the key for you. The mod still installs to one directory, `mods/<id>/`, shared
+by every game -- targeting is declared, never filed.
+
+Absent means Gen 1 only, which is what every mod written before the key existed
+was tested as. `"gen2compat": true` is the legacy spelling, still accepted and
+purely additive (it *adds* the Gen 2 games), so no manifest can lose a game it
+already ran on. On a Gen 2 boot a mod claiming no Gen 2 game is not loaded at
+all: the manager lists it as `ENABLED (NOT THIS GAME)` and says why, because a
+mod that half-applies reads as a broken mod. Claim Gen 2 once you have actually
+run your mod on Gold, Silver or Crystal.
+
+Every token is enforced, per game: the loader gates on the same
+`ModTargets.supports` answer both mod surfaces draw, so `"games": ["blue"]`
+really does not load on Red and the skip line is the launcher's line, `For
+Blue, not Red`, and `"games": ["gold"]` alone does not load on Red either. A
+manifest with neither key still covers every Gen 1 game, so nothing written
+before the key existed changes behavior; list both generations or say `"all"`
+when you mean everywhere.
+
+Gen 3 is FireRed, LeafGreen and Emerald, and `"gen3"` covers all three. That
+includes Emerald on purpose: a manifest that said `"gen3"` before Emerald was
+added now loads there too, the same way `"gen2"` picked up Crystal. If your mod
+names Kanto maps, Kanto flags or FireRed-only items, narrow it with a family
+token: `"frlg"` is FireRed and LeafGreen, `"rse"` is the Hoenn games (Emerald
+today). Both families share one `src/battle/game3` and `src/world/game3` API,
+so a mod written against `mod.game` and `mod.world` usually runs on either.
+The Gen 1 adapter layer for Gen 3 (`src/mods/Gen3Compat.lua`, which answers a
+Gen 1 `require` on a Gen 3 boot) runs on FireRed and LeafGreen only, because
+its map bridge turns Gen 1 map ids into Kanto `FR_` ids that Emerald does not
+have; on Emerald those requires are reported like any other name with no
+adapter. `python3 tools/modkit.py gen3check` reads `"frlg"` and `"rse"` as a
+Gen 3 claim.
+
+`docs/mod-api-gen2-compat.md` is the compatibility matrix: what works on Gold,
+Silver and Crystal today (40 of the 46 registries, 40 event and 44 hook names
+shared with Gen 1, and 24 Gen 2-only ones), which registries have no Gen 2 home
+and drop their writes with a report, and which hooks and events are still to
+come.
+`docs/preparing-your-mod-for-gen2.md` is the step-by-step migration guide for a
+Gen 1 mod, and it is the one to start from.
+
+Two consequences worth knowing before you claim Gen 2.
+
+**Dependencies are contagious.** A mod whose hard dependency does not run here
+is left out too, with the dependency's own wording (`depends on X, which does
+not run here (For Blue, not Red)`). It is reported as a skip, not as a failure,
+and neither mod lands on the boot error list, but the mod does not run, so
+every hard dependency has to cover the same games.
+
+**The player can override you.** The claim is yours, and a mod written before
+the key existed can never carry one, so the manager's detail pane offers
+`TRY HERE ANYWAY` for any mod that does not claim the game being played. It
+persists per game in `options.modsGen2[id][version]` and takes effect on the
+next boot; forcing a mod onto Red does not force it onto Gold. A forced mod
+loads normally and keeps a note saying its author never verified it here.
+
+**Prefer the API on Gold, but the Gen 1 names still work.** Gen 2 is a
+parallel module tree behind `src/core/Game2.lua`. In new code take the live
+game from `mod.game` (or the `game.ready` payload, or any `ui.*` hook's first
+argument) and the world from `mod.world`; both resolve per generation, and
+neither needs `engine_internals`.
+
+For the mods written before Gold existed, a require made from a mod's own file
+is answered on a Gold boot by an adapter presenting the Gen 1 API over Gen 2
+internals. Fifteen names are served -- `src.core.Game`,
+`src.world.OverworldController`, `src.world.Map`, `src.world.NPC`,
+`src.world.Collision`, `src.world.WorldAPI`, `src.world.PikachuFollower`,
+`src.world.FieldDefaults`, `src.pokemon.Boxes`, `src.script.ScriptRunner`,
+`src.ui.PartyMenu`, `src.ui.StartMenu`, `src.ui.OptionsMenu`, `src.ui.BoxMenu`
+and `src.battle.BattleState`. `src/mods/Gen2Compat.lua` is the full table and
+publishes what it covers through `Gen2Compat.coverage(name)`, whose members are
+`backed`, `warned` or `absent`. A name with no adapter (`src.script.Commands`,
+`src.ui.OptionRows`) is reported against the mod that required it, and a member
+an adapter cannot back is absent or logs once rather than answering wrongly.
+
+Things no adapter can fix, all mod-side: a hardcoded version allow-list
+(`GameVersion.get() == "red" or ...`) excludes you from Gold by construction;
+Gold's builtin screen ids carry a `Gen2` prefix, so a string match on
+`"BoxMenu"` matches nothing there; a write to a field on a live Gen 2 menu
+instance is inert; and `map.warpAt` is a table on Gen 1 and a method on Gold,
+so indexing it raises. Each has a route that works on both generations, in
+`docs/preparing-your-mod-for-gen2.md`.
+
+Check it statically, then load it headless:
+
+```sh
+python3 tools/modkit.py gen2check mods/my_mod
+```
+
+```lua
+local run = T.sdk.loadMod("mods/my_mod", { generation = 2 })
+T.eq(run.mod and run.mod.state, "loaded",
+  "runs on gen 2: " .. tostring(run.mod and run.mod.skipReason))
+T.eq(#run.errors, 0, "and loads with no boot errors")
+```
+
+Assert the state, not only the error count: a gate skip is deliberately not an
+error, so `#run.errors == 0` passes for a mod that never ran a line.
+
+`gen2check` answers `will load`, `will load but degrade` or `will not work`,
+with a `MK4xx` finding per site and an `unresolved:` note, with a file and a
+line, for every reach a static scan could not follow. Neither substitutes for a
+real Gold boot.
+
+### 4b. Imported asset packs (`required_assets`)
+
+`required_imports` is a file *you* ask the player for and parse yourself. An
+**asset pack** is the other direction: the launcher's IMPORTERS tab runs an
+engine-owned importer over a dump the player supplies, and that importer
+exports a named pack of finished assets that any mod may consume. One dump,
+imported once, shared by every mod that declares it.
+
+The importers and the packs they export are the registry in
+`src/import/Importers.lua`. A pack has a `kind`, and the kind fixes what the
+files in it may be:
+
+| Kind | Files | Typical contents |
+| --- | --- | --- |
+| `sprite` | `.png` | sprite sheets |
+| `tileset` | `.png` | tile sheets |
+| `palette` | `.png`, `.lua` | palettes |
+| `font` | `.png` | glyph sheets |
+| `sfx` | `.wav`, `.ogg` | one file per effect |
+| `music` | `.ogg`, `.wav` | one file per track |
+| `sample` | `.wav`, `.ogg` | instrument samples |
+
+Packs are installation-wide, not per playthrough. They live at
+`asset_packs/<importer>/<pack>/`, next to a `pack.lua` the importer writes:
+
+```lua
+return {
+  format = 1,
+  importer = "lttp",
+  pack = "sprites",
+  kind = "sprite",
+  version = "1.2.0",
+  source = { name = "A Link to the Past (USA)", md5 = "...", size = 1048576 },
+  entries = {
+    ["link/walk_down"] = { file = "link/walk_down.png", size = 2048,
+      width = 16, height = 24, frames = 4 },
+  },
+}
+```
+
+`version` is the *export* version: bump it when the importer changes what it
+writes, so a mod can pin what it was built against. `source` records the dump
+the pack came from, which is how a pack built from a different regional dump
+is told apart from yours.
+
+Declare what you need in the manifest:
+
+```json
+"required_assets": [
+  { "importer": "lttp", "pack": "sprites", "version": ">=1.2.0" }
+],
+"optional_assets": [
+  { "importer": "lttp", "pack": "music" }
+]
+```
+
+A `required_assets` entry that is not installed, or that is installed at a
+version outside your range, fails the mod at load with a reason that points
+the player at the IMPORTERS tab. Your entry file never runs half-configured.
+An `optional_assets` entry is yours to feature-detect.
+
+Read them through `mod.packs`, which can only address packs you declared:
+
+```lua
+local info = mod.packs:info("lttp", "sprites")        -- kind, version, count
+for _, entry in ipairs(mod.packs:entries("lttp", "sprites")) do
+  print(entry.id, entry.width, entry.height, entry.frames)
+end
+local png = mod.packs:read("lttp", "sprites", "link/walk_down")
+```
+
+`:read` returns bytes, capped at 8 MiB per entry, and refuses an entry whose
+size does not match what the pack manifest recorded. `mod.packs:list()` answers
+for every pack you declared, installed or not, so a settings screen can say
+what is missing. No host path crosses out, and an undeclared importer or pack
+is refused the same way an undeclared import id is.
+
+Legal posture is unchanged and non-negotiable: no pack, and nothing derived
+from one, is ever redistributed. An importer reads a dump the player already
+owns, on their machine, into their own save directory.
+
+### 5. What a mod's code can reach
+
+Your code runs in a sandbox (`src/mods/Sandbox.lua`), not against the
+engine's globals. Every chunk you author gets it: `main.lua`, your
+`options_schema`, and anything you `load()` yourself.
+
+The globals the sandbox took away are still *reachable*, as compat
+stand-ins (`src/mods/LegacyCompat.lua`) that answer with the new API
+underneath. A mod written before the sandbox keeps working; it logs one
+warning per call it should migrate, and the mod manager lists them. What
+each stand-in actually does:
+
+| Pre-sandbox call | What it does now | Migrate to |
+| --- | --- | --- |
+| `io.open`, `io.lines`, `love.filesystem.read`/`lines`/`newFile` | reads your own shipped files, then your overlay, then `mod.storage` | `mod:read`, `mod.storage` |
+| `love.filesystem.write`/`append`, `io.open(…, "w")`, `os.remove`, `os.rename` | writes to a private per-mod overlay under `mod_compat/<your id>/` | `mod.storage` |
+| `love.filesystem.getDirectoryItems`/`getInfo` | your own directory plus your overlay | `mod:list`, `mod:info` |
+| `love.filesystem.getSaveDirectory` and friends | a virtual root; anything joined to it lands in your overlay | `mod.storage` |
+| `os.getenv` | `nil`, except home-like names, which answer with that same virtual root | nothing |
+| `love.filesystem.load`, `dofile`, `loadfile` | compiles the chunk into your sandbox | `require`, `mod:read` plus `load` |
+| `love.system` | `getOS`/`getPowerInfo`/`getProcessorCount` read through; clipboard and `openURL` do nothing | `mod.device:powerInfo()`, `mod.steps` |
+| `love.event` | passes through, except `quit`, which does nothing | `mod.events`, `mod.hooks` |
+| `love.mousemoved = fn` and the other callbacks | installs on the real `love` table, the way it always did | `mod.hooks`, `mod.events` |
+| `package` | an inert stub, so `package.path = …` does not crash | `require` |
+
+What has no stand-in, because there is nothing honest to reroute it to:
+
+| Still refused | Why |
+| --- | --- |
+| `love.thread` | a LÖVE thread is a fresh Lua state with the full standard library, which no environment-based sandbox in this state can reach. Use `mod.fetch` for background HTTP (`network`) or `mod.job` for background compute (`background`) — both run your code inside the sandbox instead of outside it |
+| `require("ffi")` | arbitrary C |
+| `debug`, `getfenv`, `setfenv` | each one undoes the sandbox from inside |
+| `io.popen`, `os.execute` | spawning a process |
+| `love.run`, `love.errorhandler` | the engine's own loop and its crash path |
+| replacing a `love` module table (`love.filesystem = {}`) | the engine reads those tables too |
+
+The rest of `love` passes through unchanged, so graphics, audio, timers and
+input work as they always have.
+
+Three consequences worth knowing before you write against it:
+
+- **Your globals are yours.** `_G` inside a mod is that mod's own table. Two
+  mods no longer share a namespace, and neither can reach the engine's. To
+  publish something to another mod, put it on `mod.exports` and let them
+  `mod.find("your_id").exports` — the channel that was always the intended
+  one. The same goes for the standard library: `string`, `table` and `math`
+  are per-mod copies, so patching one is a local decision.
+- **Paths cannot climb.** `mod:read`, `mod:list`, `mod:info`, `mod.assets:path`
+  and `mod.assets:image` join to your own directory, and `..`, absolute paths
+  and drive letters are refused. So are `entry` and `options_schema` in your
+  manifest. `mod:list("assets")` is the sandboxed `getDirectoryItems` for a
+  folder you shipped; `mod:info` tells file from directory so a walk can
+  recurse.
+- **Ship source, not bytecode.** A precompiled entry file is refused.
+
+`permissions` in the manifest is still a disclosure the manager shows the
+player. `network` gates `require("socket")` and friends plus `mod.fetch`
+(non-blocking HTTP), and `background` gates `mod.job` (compute on a worker
+thread). Those two are the sanctioned ways to work off the main thread now
+that `love.thread` is refused. There is no
+permission that grants raw filesystem access, because no mod needs one:
+everything a mod legitimately writes is already scoped by
+`mod.storage` or the asset-transform derived root.
+
+If your mod used one of the rerouted globals, the fix is almost always
+`mod.storage`. The overlay is a compatibility floor, not a second storage
+system: it is not scoped per playthrough, it does not migrate, and it is
+the first thing that will be dropped once the mods on the index have
+moved off it. Open an issue if you have a case `mod.storage` does not
+cover.
+
+### 6. `mod.card`
 
 The manifest is the *engine's* contract: identity, load order, dependencies,
-permissions, profile. The card is the *human-facing* one: who made this,
+permissions, profile (see [Manifest specification](docs/modding.md#manifest-specification-manifestjson)).
+The card is the *human-facing* one: who made this,
 what it changes, what it does not do yet. It is never read by the loader's
 merge — only by tooling and the manager's detail pane — so an absent or
 malformed card can never break a load.
@@ -159,7 +442,7 @@ Two fields deserve their own note:
   distributed mod never carries ROM-derived bytes, not even in its preview
   images.
 
-### 5. Tags
+### 7. Tags
 
 Lowercase kebab strings, open vocabulary. The showcase generator
 lowercases and de-dupes. A recommended starting set: `beginner`,
@@ -217,12 +500,15 @@ registry or a new schema field lands with its catalog entry in the same PR
 and the generator runs clean:
 
 ```sh
-luajit tools/gen_registry_docs.lua                 # in-repo default
-luajit tools/gen_registry_docs.lua ../project.wiki # the wiki checkout
+luajit tools/gen_registry_docs.lua                 # docs/modding/reference/registries.md
+luajit tools/gen_registry_docs.lua ../project.wiki # Reference-Registries.md in a wiki checkout
 ```
 
-The prose reference lives in the GitHub wiki; the generated pages are
-written into a checkout of it, so they cannot drift from the engine.
+With no argument it writes inside the repo, which is the copy `python3
+tools/modkit.py docs` regenerates and `--out` copies from. Pass a directory
+(or set `POKEPORT_DOCS_DIR`) to write the wiki's flat page name into a wiki
+checkout instead. The prose reference lives in the GitHub wiki; both copies
+come off `src/mods/Schemas.lua`, so neither can drift from the engine.
 
 ### 5. Deprecation etiquette
 

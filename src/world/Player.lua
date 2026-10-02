@@ -30,6 +30,11 @@ local TURN_FRAMES = 4
 -- run well past it even before the OS batches the touch events, so the
 -- overlay gets a longer window than a physical pad (#415).
 local TOUCH_TURN_FRAMES = 8
+-- home/overworld.asm:41-44
+local LOOP_FRAMES = 2
+-- engine/overworld/spinners.asm:23-49, home/copy2.asm:62-91
+local SPIN_ITER_FRAMES = LOOP_FRAMES + 4
+Player.SPIN_ITER_FRAMES = SPIN_ITER_FRAMES
 
 function Player.new(data, cx, cy, facing)
   local self = setmetatable({}, Player)
@@ -110,6 +115,36 @@ function Player:turnWindow()
   return frames
 end
 
+-- the bicycle doubles walking speed (8 frames per step); movement.speed
+-- lets a mod multiply or replace that (running shoes, dash, etc.)
+-- DoBikeSpeedup is skipped mid-hop -- home/overworld.asm:283
+function Player:stepLength(dir)
+  local Game = require("src.core.Game")
+  local save = Game.save
+  local onBike = (save and save.onBike and not self.ledgeHop) or false
+  local frames = onBike and self.bikeStepFrames or self.stepFrames or STEP_FRAMES
+  -- held, so those three cost a walking step -- home/overworld.asm:377
+  dir = dir or self.facing
+  local slope = onBike and self.slopeMap and dir ~= "down" or false
+  if slope then frames = self.stepFrames or STEP_FRAMES end
+  -- home/overworld.asm:268-273
+  if self.spinning and not self.spinFrames then
+    frames = math.floor(tonumber(frames) or STEP_FRAMES) / LOOP_FRAMES * SPIN_ITER_FRAMES
+  end
+  if Runtime.wantsHook("movement.speed") then
+    frames = Runtime.call("movement.speed", function(f) return f end, frames, {
+      onBike = onBike,
+      slope = slope and true or false,
+      dir = dir,
+      surfing = self.surfing and true or false,
+      player = self,
+      input = Game.input,
+      save = save,
+    })
+  end
+  return math.max(1, math.floor(tonumber(frames) or STEP_FRAMES))
+end
+
 -- Attempt to start a step; returns "moved"|"turned"|"blocked"|nil.
 function Player:tryMove(dir, map, entities)
   if self.moving or self.inputLocked then return nil end
@@ -145,22 +180,7 @@ function Player:tryMove(dir, map, entities)
   self.moving = true
   self.bumpFrames = nil -- a real step supersedes any in-place bonk
   self.progress = 0
-  -- the bicycle doubles walking speed (8 frames per step); movement.speed
-  -- lets a mod multiply or replace that (running shoes, dash, etc.)
-  local Game = require("src.core.Game")
-  local save = Game.save
-  local frames = (save and save.onBike) and self.bikeStepFrames
-                 or self.stepFrames or STEP_FRAMES
-  if Runtime.wantsHook("movement.speed") then
-    frames = Runtime.call("movement.speed", function(f) return f end, frames, {
-      onBike = save and save.onBike or false,
-      surfing = self.surfing and true or false,
-      player = self,
-      input = Game.input,
-      save = save,
-    })
-  end
-  self.stepFramesCur = math.max(1, math.floor(tonumber(frames) or STEP_FRAMES))
+  self.stepFramesCur = self:stepLength(dir)
   return "moved"
 end
 
@@ -177,6 +197,17 @@ function Player:update()
   if self.turnTimer > 0 then
     self.turnTimer = self.turnTimer - 1
   end
+  if self.spinning then
+    self.spinTimer = (self.spinTimer or 0) + 1
+    -- engine/overworld/player_animations.asm:298
+    if self.spinHolds then
+      self.spinHold = (self.spinHold or 0) - 1
+      while self.spinHold <= 0 and (self.spinStep or 0) < #self.spinHolds - 1 do
+        self.spinStep = (self.spinStep or 0) + 1
+        self.spinHold = self.spinHolds[self.spinStep + 1]
+      end
+    end
+  end
   if self.spinFrames then
     self.spinFrames = self.spinFrames - 1
     if self.spinFrames <= 0 then
@@ -184,6 +215,12 @@ function Player:update()
       self.spinDrop = nil
       self.spinRise = nil -- teleport-out departure lift (#196)
       self.spinning = false
+      self.spinHolds = nil
+      self.spinStep = nil
+      self.spinHold = nil
+      self.spinRiseFrom = nil
+      self.spinDropSteps = nil
+      self.spinImageIndex = nil
     end
   end
   -- wall-bonk walk-in-place (issue #230): while pushing into a wall the
@@ -226,7 +263,16 @@ function Player:facingCell()
   return Collision.target(self.cellX, self.cellY, self.facing)
 end
 
+-- UpdatePlayerSprite jumps to .notMoving while BIT_FONT_LOADED is set
+-- -- engine/overworld/movement.asm:57
+local function textBoxUp()
+  local stack = require("src.core.Game").stack
+  local top = stack and stack.top and stack:top()
+  return top ~= nil and not top.isOverworld
+end
+
 function Player:walkPhase()
+  if textBoxUp() then return 0 end
   -- moving, the land-frame after a completed step, or an active wall-bonk
   -- (issue #230) animate; a standing sprite otherwise
   if not self.moving and not self.stepLanded
@@ -238,7 +284,31 @@ function Player:walkPhase()
   return (p >= 4 and p < 12) and 1 or 0
 end
 
+-- The surf bob is sampled by pose() (draw code) but must run at the fixed
+-- logic rate: it used to tick once per pose() call, so a 144Hz display
+-- bobbed 2.4x too fast and the battle-transition wipe, which draws the
+-- player twice a frame, doubled it.  It now advances by the number of
+-- Game:step logic steps since the last pose(), i.e. exactly once per step at
+-- 60Hz and never twice for one step.  Without a running Game (headless
+-- callers) there is no step clock and each call advances once, as before.
+function Player:advanceBob()
+  local Game = package.loaded["src.core.Game"]
+  local step = type(Game) == "table" and Game.logicStep or nil
+  local ticks = 1
+  if step then
+    local last = self.bobStep
+    ticks = last and step - last or 1
+    self.bobStep = step
+  end
+  if ticks > 0 then
+    self.bobTimer = ((self.bobTimer or 0) + ticks) % 32
+  end
+  return self.bobTimer or 0
+end
+
 local SPIN_ORDER = { "down", "left", "up", "right" }
+-- constants/sprite_data_constants.asm:3
+local IMAGE_FACING = { [0] = "down", [1] = "up", [2] = "left", [3] = "right" }
 
 -- What this frame renders to: the sheet, where it sits, which way it faces
 -- and how far through a step it is.  Shared by the 2D draw below and by a
@@ -247,11 +317,6 @@ local SPIN_ORDER = { "down", "left", "up", "right" }
 --
 -- The last return says the player is mid-ledge-hop, which is what the 2D
 -- path draws the ground shadow from and a 3D path turns into vertical lift.
---
--- This ADVANCES the surf-bob and spinner timers, so exactly one of pose()
--- and draw() may run per frame -- and draw() is written in terms of pose()
--- to keep that true by construction.  (hopFrames counts down in
--- Player:update, on the fixed step, so it is safe to read here.)
 function Player:pose()
   local py = self.py
   local hopping = false
@@ -264,20 +329,39 @@ function Player:pose()
     py = py - math.floor(10 * math.sin(t * math.pi) + 0.5)
     hopping = true
   elseif self.surfing then
-    self.bobTimer = ((self.bobTimer or 0) + 1) % 32
+    self:advanceBob()
     py = py + (self.bobTimer < 16 and 0 or 1)
   end
+  -- engine/overworld/player_animations.asm:453
+  py = py + (self.fishShakeDy or 0)
   local facing = self.facing
   local phase = self:walkPhase()
   -- alternate walk cycles mirror the up/down frame; derived from the
   -- fixed-rate animation clock so the bike's shorter steps don't double
   -- the leg cadence
   local flip = math.floor((self.animClock or 0) / 16) % 2 == 1
-  if self.spinning then
-    -- spinner tiles whirl the sprite on its standing pose, one facing
-    -- per frame (LoadSpinnerArrowTiles runs every OverworldLoop frame)
-    self.spinTimer = (self.spinTimer or 0) + 1
-    facing = SPIN_ORDER[self.spinTimer % 4 + 1]
+  if self.spinning and self.spinHolds then
+    -- engine/overworld/player_animations.asm:279
+    local step = self.spinStep or 0
+    facing = SPIN_ORDER[step % 4 + 1]
+    phase, flip = 0, false
+    -- engine/overworld/player_animations.asm:286
+    local img = self.spinImageIndex
+    if img then
+      local frame = img % 4
+      facing = IMAGE_FACING[math.floor(img / 4) % 4]
+      phase, flip = frame % 2, frame == 3
+    end
+    -- engine/overworld/player_animations.asm:319
+    if self.spinRiseFrom and step > self.spinRiseFrom then
+      py = py - (step - self.spinRiseFrom) * 16
+    elseif self.spinDropSteps then
+      local left = self.spinDropSteps - step
+      if left > 0 then py = py - left * 16 end
+    end
+  elseif self.spinning then
+    -- spinners.asm:1-11, home/overworld.asm:41-44, :268-272
+    facing = SPIN_ORDER[math.floor((self.spinTimer or 0) / SPIN_ITER_FRAMES) % 4 + 1]
     phase, flip = 0, false
     -- teleport arrivals spin the sprite down into place
     -- (EnterMapAnim PlayerSpinWhileMovingDown)
@@ -292,6 +376,8 @@ function Player:pose()
       py = py - math.floor((total - self.spinFrames) * 24 / total)
     end
   end
+  -- engine/overworld/player_animations.asm:204
+  if self.holeSink then py = py + 8 end
   -- RodResponse (engine/items/item_effects.asm) zeroes wWalkBikeSurfState
   -- across FishingAnim, so casting from the water shows the on-foot sheet
   local sprite = (self.fishing and self.sprite)
@@ -335,8 +421,13 @@ function Player:draw(camX, camY)
   local fishTile = self.fishing and self.fishTiles and self.fishTiles[facing]
   if fishTile then
     sprite:draw(px, py, camX, camY, facing, 0, false, true)
-    sprite:drawTile(fishTile, math.floor(px - camX),
-                    math.floor(py - camY) - 4 + 8, facing == "right")
+    -- The fishing pose replaces the bottom 8-pixel tile.  Use the sprite's
+    -- actual anchored frame origin so larger/custom sheets keep the pose at
+    -- their feet instead of falling back to the vanilla 16x16 top-left.
+    local sx, sy = sprite:getScreenOrigin(px, py, camX, camY)
+    sprite:drawTile(fishTile, sx,
+                    sy + math.max(0, sprite.frameHeight - 8),
+                    facing == "right")
     return
   end
   sprite:draw(px, py, camX, camY, facing, phase, flip)

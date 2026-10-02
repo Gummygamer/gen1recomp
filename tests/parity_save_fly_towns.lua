@@ -21,6 +21,14 @@ local FlyMenu = require("src.ui.FlyMenu")
 -- loadData() hands back the crosswalk set GenSave wants ({pokemon, moves,
 -- items, maps, eventFlags}) and installs the charmap as a side effect
 local cwData = assert(SaveConvert.loadData(), "save-convert crosswalk data")
+-- home/overworld.asm:2016 (#1691)
+local stampMapWindow = loadfile("tests/fixture_data/map_window.lua")()
+local function stampAll(d)
+  for mapId in pairs((d or {}).maps or {}) do stampMapWindow(d, mapId) end
+end
+stampAll(cwData)
+stampAll(Data)
+
 local O = GenSave.OFFSETS
 
 -- ------------------------------------------------------------------
@@ -98,7 +106,9 @@ end
 -- ------------------------------------------------------------------
 
 local fresh = SaveData.newGame({ playerName = "RED", rivalName = "BLUE" })
-fresh.flags = { EVENT_GOT_POKEDEX = true, EVENT_GOT_STARTER = true }
+-- ram/wram.asm:2074-2078
+fresh.flags = { EVENT_GOT_POKEDEX = true, EVENT_GOT_STARTER = true,
+                EVENT_CHOSE_CHARMANDER = true }
 fresh.money = 54321
 local base = GenSave.encode(fresh, cwData, nil)
 eq(#base, GenSave.SAVE_SIZE, "baseline image is 32768 bytes")

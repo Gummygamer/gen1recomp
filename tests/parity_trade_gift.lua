@@ -98,9 +98,13 @@ for _, modname in ipairs({ "data.scripts.story", "data.scripts.story2",
               check(WIRED[idx] == flag,
                     ("%s/%s: trade %s pairs with %s"):format(
                       mapId, const, tostring(idx), tostring(flag)))
-              check(not seen[idx],
-                    ("trade index %s wired by only one NPC"):format(tostring(idx)))
-              seen[idx] = true
+              -- one NPC per index PER VERSION: Route 18 gate wires slot 6
+              -- twice on purpose (Red's YOUNGSTER/MARC, Yellow's COOK/SPIKE;
+              -- pokeyellow/scripts/Route18Gate2F.asm, #651) -- each version's
+              -- map only spawns its own NPC, so a same-map twin is fine
+              check(not seen[idx] or seen[idx] == mapId,
+                    ("trade index %s wired by only one NPC per version"):format(tostring(idx)))
+              seen[idx] = mapId
             end
           end
         end
@@ -116,9 +120,12 @@ check(not seen[3], "unused CHIKUCHIKU trade (index 3) stays unwired")
 -- === harness: run a talk script headless, recording show_text ids ===
 local shown = {}
 local origShow = Commands.show_text
-Commands.show_text = function(ctx, textId, subs)
+-- forward extraOpts too: Commands.ask rides show_text's 4th argument
+-- (opts.choice, so the YES/NO box pops over the still-visible question);
+-- dropping it here would strand every prompt on the NO branch
+Commands.show_text = function(ctx, textId, subs, ...)
   table.insert(shown, textId)
-  return origShow(ctx, textId, subs)
+  return origShow(ctx, textId, subs, ...)
 end
 
 -- pressFn returns the Input.pressed table for this frame (default: A)
@@ -222,16 +229,16 @@ check(runScript("VERMILION_TRADE_HOUSE", "TEXT_VERMILIONTRADEHOUSE_LITTLE_GIRL")
       "DUX post-trade script completes")
 shownIs({ "_AfterTrade3Text" }, "DUX uses the happy dialogset")
 
--- === 9) Celadon Eevee: no confirm prompt, AskName then GotMonText,
---         ball hidden (GivePokemon -> AddPartyMon AskName; script still
---         prints GotMonText after the silent give_pokemon row) ===
+-- === 9) Celadon Eevee: no confirm prompt, GotMonText then AskName,
+--         ball hidden (GivePokemon -> SetPokedexOwnedFlag prints GotMonText
+--         before AddPartyMon's AskName) ===
 local EEVEE_MAP, EEVEE_BALL =
   "CELADON_MANSION_ROOF_HOUSE", "CELADONMANSION_ROOF_HOUSE_EEVEE_POKEBALL"
 local EEVEE_TEXT = "TEXT_CELADONMANSION_ROOF_HOUSE_EEVEE_POKEBALL"
 Game.save = SaveData.newGame()
 check(runScript(EEVEE_MAP, EEVEE_TEXT), "Eevee ball script completes")
-shownIs({ "_DoYouWantToNicknameText", "_GotMonText" },
-        "Eevee gives immediately (nickname ask, then GotMonText)")
+shownIs({ "_GotMonText", "_DoYouWantToNicknameText" },
+        "Eevee gives immediately (GotMonText, then nickname ask)")
 eq(#Game.save.party, 1, "Eevee joins the party")
 eq(Game.save.party[1].species, "EEVEE", "gift species is EEVEE")
 eq(Game.save.party[1].level, 25, "Eevee is level 25")
@@ -254,13 +261,13 @@ shownIs({}, "old save: silent")
 eq(#Game.save.party, 0, "old save: no Eevee re-gift")
 eq(toggleOf(EEVEE_MAP, EEVEE_BALL), false, "old save: leftover ball hidden")
 
--- === 11) GivePokemon party full, box has room: AskName + SentToBoxText
---         (SendNewMonToBox), then script GotMonText; ball hidden ===
+-- === 11) GivePokemon party full, box has room: GotMonText, then AskName
+--         + SentToBoxText (SendNewMonToBox); ball hidden ===
 Game.save = SaveData.newGame()
 for i = 1, 6 do Game.save.party[i] = Pokemon.new(Data, "PIDGEY", 5) end
 check(runScript(EEVEE_MAP, EEVEE_TEXT), "full-party Eevee script completes")
-shownIs({ "_DoYouWantToNicknameText", "_SentToBoxText", "_GotMonText" },
-        "full-party gift: nickname, sent-to-box, then GotMonText")
+shownIs({ "_GotMonText", "_DoYouWantToNicknameText", "_SentToBoxText" },
+        "full-party gift: GotMonText, nickname, then sent-to-box")
 eq(#Game.save.party, 6, "full-party gift leaves party size at 6")
 local Boxes = require("src.pokemon.Boxes")
 local boxed = false

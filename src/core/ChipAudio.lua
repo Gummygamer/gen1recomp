@@ -21,7 +21,9 @@ local ChipSynth = require("src.core.ChipSynth")
 
 local ChipAudio = {}
 
-local SAMPLE_RATE = ChipSynth.SAMPLE_RATE
+local function sampleRate()
+  return ChipSynth.SAMPLE_RATE
+end
 local MUSIC_BUFFER_SAMPLES = ChipSynth.MUSIC_BUFFER_SAMPLES
 local MUSIC_BUFFER_COUNT = ChipSynth.MUSIC_BUFFER_COUNT
 
@@ -66,39 +68,14 @@ local pendingBuf -- a current-gen buffer popped from the worker but not yet
 -- the jingle ends.
 local musicHeld = false
 
--- ---------------------------------------------------------------------------
--- playback device loss
---
--- Windows can invalidate the output device under a running game: a headset or
--- monitor unplugged, a sleep/resume cycle, or the default device changing.
--- OpenAL Soft's WASAPI mixer thread then fails GetCurrentPadding, prints
---   AL lib: (EE) ALCwasapiPlayback_mixerProc: Failed to get padding: 0x88890004
--- (0x88890004 is AUDCLNT_E_DEVICE_INVALIDATED), calls
--- ALCdevice::handleDisconnect, and breaks out of its mixer loop.  Every voice
--- is stopped and every Source reads as not playing forever after.  LOVE 11.5
--- exposes no playback-device API (no love.audio.setPlaybackDevice in this
--- engine build), so the device cannot be re-opened in-process and a fresh
--- process is the only guaranteed recovery.
---
--- What this module can do is stop pretending: quit hammering Source:play
--- against a dead device every frame, say plainly in the log what happened
--- instead of leaving a bare AL lib line on stderr, and mark the song ended so
--- Music stops re-cuing into a silence the player cannot wait out.  The latch
--- deliberately survives a song change -- Music.restoreMap plays the map theme
--- again as soon as a stream stops, and clearing it there would rebuild the
--- exact retry storm this exists to prevent.  recoverDevice() is the one way
--- back, and a still-dead device simply re-latches after the same budget.
--- ---------------------------------------------------------------------------
+local suspended = false
 
--- Source:play against a disconnected device returns without erroring, so the
--- only signal is that the Source still reads as stopped afterwards.  A few
--- such frames in a row is a render stall (this whole function exists for
--- those); this many is an output that is not coming back on its own.  Sized to
--- outlast a Bluetooth headset or exclusive-mode device waking up (~1.5s).
-local DEVICE_LOST_AFTER_ATTEMPTS = 90
-local playAttempts = 0
-local deviceLost = false
-local deviceLostLogged = false
+local STATS = os.getenv("POKEPORT_AUDIO_STATS") == "1"
+local statFrames, statUnderruns, statRestarts = 0, 0, 0
+local statDepthMin, statDepthSum, statDepthFrames = nil, 0, 0
+local statWorkerJit, statWorkerXrt = nil, nil
+local statXrtSum, statXrtCount, statXrtMax = 0, 0, nil
+local lastCosted
 
 -- ---------------------------------------------------------------------------
 -- worker management
@@ -106,6 +83,16 @@ local deviceLostLogged = false
 
 local worker, cmdCh, outCh
 local workerReady -- nil = untried, true = running, false = unavailable
+
+-- SFX/cry prewarm state (see "one-shot effects" below): results come back on
+-- their own channel so a music stop/clear never drops them
+local fxCh
+local fxEpoch = 0 -- bumped by invalidate: drops results from a stale def
+local fxReady = {}    -- key -> SoundData | false (renders to nothing)
+local fxPending = {}  -- key -> true while a request is in flight
+local fxReadyCount = 0
+local FX_READY_MAX = 64
+local drainEffects, dropEffects
 
 local function ensureWorker()
   if workerReady ~= nil then return workerReady end
@@ -134,19 +121,14 @@ end
 -- play so a hot-reloaded dataset (or a mod's audio) always reaches the worker
 local function slimAudio(data)
   local audio = data.audio or {}
-  -- NX-only: resolve the versioned cache prefix on the main thread and hand
-  -- it to the worker, which runs in a fresh Lua state without GameVersion.
-  local programPrefix
-  if require("src.core.Platform").isNX() then
-    local prefix = require("src.core.GameVersion").cachePrefix()
-    if prefix ~= "" then programPrefix = prefix end
-  end
   return {
     programFile = audio.programFile,
-    programPrefix = programPrefix,
+    programPrefix = require("src.core.WorkerFs").prefix(),
     bankOrder = audio.bankOrder,
     waveBanks = audio.waveBanks,
     noiseHeaders = audio.noiseHeaders,
+    generation = audio.generation,
+    drumkits = audio.drumkits,
   }
 end
 
@@ -175,22 +157,70 @@ end
 
 -- The queue is deep (MUSIC_BUFFER_COUNT, ~6s) for stall tolerance, but
 -- synthesizing all of it on the frame a song starts renders ~6s of audio at
--- once.  Cap how many buffers each fill renders; playback drains ~1 buffer
--- every ~11 frames while update() tops up a few per frame, so the deep queue
--- still ramps to full within a fraction of a second.
+-- once.  A (re)start renders MUSIC_FILL_INITIAL whole buffers so playback has
+-- lookahead; after that each update() renders a flat slice of samples into a
+-- staging buffer and queues it once all MUSIC_BUFFER_SAMPLES are in.  Whole
+-- 8192-sample buffers rendered on the frame a queue slot freed (every ~11
+-- frames) read as a periodic stutter; ~1024 samples per 60 Hz tick
+-- (playback drains ~735) keeps the per-frame cost flat while the queue still
+-- creeps up to full.  Below MUSIC_FILL_LOW_WATER queued buffers (a long
+-- stall, or update() called well under 60 Hz) a tick renders a whole buffer's
+-- worth so the queue cannot run dry.  The sample stream is unchanged: every
+-- buffer is still MUSIC_BUFFER_SAMPLES consecutive engine samples, and a
+-- buffer begun before the song ended is completed exactly as before.
 local MUSIC_FILL_INITIAL = 4
-local MUSIC_FILL_PER_CALL = 3
+local MUSIC_FILL_TICK_SAMPLES = 1024 -- at 44100 Hz; scaled with the rate
+local MUSIC_FILL_LOW_WATER = 2
 
-local function fillSync(limit)
-  local music = currentMusic
-  if not music or not music.engine or music.engine:finished() then return end
-  limit = limit or MUSIC_FILL_PER_CALL
-  local free = music.source:getFreeBufferCount()
-  while free > 0 and limit > 0 and not music.engine:finished() do
-    music.source:queue(ChipSynth.soundData(music.engine, MUSIC_BUFFER_SAMPLES, 2))
-    free = free - 1
-    limit = limit - 1
+local function tickSamples()
+  return math.max(256,
+    math.floor(MUSIC_FILL_TICK_SAMPLES * sampleRate() / 44100 + 0.5))
+end
+
+-- render up to `budget` samples of the fallback song, queueing each staging
+-- buffer as it fills.  A new buffer is only begun while the Source has a free
+-- slot and the song has not finished (the old whole-buffer loop's gates).
+local function renderSync(music, budget)
+  while budget > 0 do
+    if not music.staging then
+      if music.engine:finished() then return end
+      local ok, free = pcall(music.source.getFreeBufferCount, music.source)
+      if not ok or type(free) ~= "number" or free <= 0 then return end
+      music.staging = ChipSynth.newBuffer(MUSIC_BUFFER_SAMPLES, 2)
+      music.stagingFill = 0
+    end
+    local count = math.min(budget, MUSIC_BUFFER_SAMPLES - music.stagingFill)
+    ChipSynth.renderInto(music.engine, music.staging, music.stagingFill,
+                         count, 2)
+    music.stagingFill = music.stagingFill + count
+    budget = budget - count
+    if music.stagingFill >= MUSIC_BUFFER_SAMPLES then
+      local sd = music.staging
+      music.staging, music.stagingFill = nil, 0
+      if not pcall(music.source.queue, music.source, sd) then return end
+    end
   end
+end
+
+-- `buffers`: render that many whole buffers now (song start / restart);
+-- omitted: one per-frame tick
+local function fillSync(buffers)
+  if suspended then return end
+  local music = currentMusic
+  if not music or not music.engine then return end
+  if not music.staging and music.engine:finished() then return end
+  local budget
+  if buffers then
+    budget = buffers * MUSIC_BUFFER_SAMPLES - (music.stagingFill or 0)
+  else
+    budget = tickSamples()
+    local ok, free = pcall(music.source.getFreeBufferCount, music.source)
+    if ok and type(free) == "number"
+        and MUSIC_BUFFER_COUNT - free < MUSIC_FILL_LOW_WATER then
+      budget = MUSIC_BUFFER_SAMPLES
+    end
+  end
+  renderSync(music, budget)
 end
 
 local function playMusicSync(data, header, allowLoops)
@@ -200,13 +230,13 @@ local function playMusicSync(data, header, allowLoops)
                            { allowLoops = allowLoops })
   if not ok then return nil, engine end
   local ok2, source = pcall(
-    love.audio.newQueueableSource, SAMPLE_RATE, 16, 2, MUSIC_BUFFER_COUNT)
+    love.audio.newQueueableSource, sampleRate(), 16, 2, MUSIC_BUFFER_COUNT)
   if not ok2 then return nil, source end
   ChipAudio.stopMusic()
   currentMusic = { source = source, engine = engine, threaded = false,
                    started = true, finished = false }
   fillSync(MUSIC_FILL_INITIAL)
-  if not musicHeld then source:play() end
+  if not musicHeld then pcall(source.play, source) end
   return source
 end
 
@@ -215,6 +245,24 @@ end
 -- ---------------------------------------------------------------------------
 
 local musicGen = 0
+-- bumps when SOUND flips so already-queued PCM (old pan) is dropped rather
+-- than playing out the ~6s stall-tolerance queue (#1471)
+local stereoEpoch = 0
+
+local MUSIC_PREROLL = 4
+ChipAudio.MUSIC_PREROLL = MUSIC_PREROLL
+
+local function queuedBuffers(source)
+  local ok, free = pcall(source.getFreeBufferCount, source)
+  if not ok or type(free) ~= "number" then return nil end
+  return MUSIC_BUFFER_COUNT - free
+end
+
+local function readyToStart(m)
+  local queued = queuedBuffers(m.source)
+  if not queued then return false end
+  return queued >= (m.preroll or 1) or (m.finished and queued > 0)
+end
 
 function ChipAudio.playMusic(data, header, allowLoops)
   if not ensureWorker() then
@@ -227,7 +275,7 @@ function ChipAudio.playMusic(data, header, allowLoops)
   if not ok then return nil, engine end
   -- build the new source before tearing the old song down
   local ok2, source = pcall(
-    love.audio.newQueueableSource, SAMPLE_RATE, 16, 2, MUSIC_BUFFER_COUNT)
+    love.audio.newQueueableSource, sampleRate(), 16, 2, MUSIC_BUFFER_COUNT)
   if not ok2 then return nil, source end
   ChipAudio.stopMusic()
   musicGen = musicGen + 1
@@ -235,10 +283,14 @@ function ChipAudio.playMusic(data, header, allowLoops)
   cmdCh:push({ cmd = "play", gen = gen, header = header,
                allowLoops = allowLoops, audio = slimAudio(data),
                channelVolumes = ChipSynth.getChannelVolumes(),
-               channelPitches = ChipSynth.getChannelPitches() })
+               channelPitches = ChipSynth.getChannelPitches(),
+               stereo = ChipSynth.getStereo(),
+               sampleRate = sampleRate(),
+               stereoEpoch = stereoEpoch })
   currentMusic = { source = source, gen = gen, threaded = true,
-                   started = false, finished = false }
-  -- playback starts in update() once the first buffer arrives (~1 frame)
+                   started = false, finished = false,
+                   stereoEpoch = stereoEpoch,
+                   preroll = (allowLoops ~= false) and MUSIC_PREROLL or 1 }
   return source
 end
 
@@ -246,44 +298,9 @@ local function pushChannelMix()
   if workerReady and cmdCh then
     cmdCh:push({ cmd = "channelMix",
                  volumes = ChipSynth.getChannelVolumes(),
-                 pitches = ChipSynth.getChannelPitches() })
+                 pitches = ChipSynth.getChannelPitches(),
+                 stereo = ChipSynth.getStereo() })
   end
-end
-
--- Start a Source and confirm it took.  Source:play never errors on a
--- disconnected device, so "still not playing afterwards" is the only evidence.
-local function startSource(source)
-  pcall(source.play, source)
-  local ok, playing = pcall(source.isPlaying, source)
-  return ok and playing == true
-end
-
-local function reportDeviceLost()
-  if deviceLostLogged then return end
-  deviceLostLogged = true
-  require("src.core.Logger").warn(
-    "playback device was lost; music is silent until audio output returns "
-      .. "(restart the game if it does not)")
-end
-
--- One restart attempt that did not stick.  Returns true once the pattern says
--- the output device is gone rather than merely starved of buffers, and marks
--- the song ended so Music moves on instead of re-cuing over it.
-local function playAttemptFailed(m)
-  playAttempts = playAttempts + 1
-  if not deviceLost and playAttempts < DEVICE_LOST_AFTER_ATTEMPTS then
-    return false
-  end
-  if not deviceLost then
-    deviceLost = true
-    reportDeviceLost()
-  end
-  -- Remember WHY this song stopped.  A song that ran out is over for good, but
-  -- one silenced by a lost device must be resumable: recoverDevice() clears
-  -- this and playback is tried again, which is how a replugged headset gets
-  -- its music back without a song change.
-  m.finished, m.finishedByDeviceLoss = true, true
-  return true
 end
 
 -- move finished buffers from the worker into the Source; start playback once
@@ -296,39 +313,109 @@ local function updateThreaded()
     return
   end
   while true do
-    local free = m.source:getFreeBufferCount()
+    local okFree, free = pcall(m.source.getFreeBufferCount, m.source)
+    if not okFree or type(free) ~= "number" then return end
     local buf = pendingBuf
     if buf then pendingBuf = nil else buf = outCh:pop() end
     if not buf then break end
     if buf.gen ~= m.gen then
       -- stale buffer from a superseded song: drop it
+    elseif buf.stereoEpoch ~= nil and m.stereoEpoch ~= nil
+        and buf.stereoEpoch ~= m.stereoEpoch then
+      -- stale pan mix from before a live SOUND toggle (#1471)
     elseif buf.done then
       m.finished = true
     elseif buf.error then
       require("src.core.Logger").warn("chip audio: %s", tostring(buf.error))
       m.finished = true
     elseif buf.sd then
+      if buf.jit ~= nil then statWorkerJit = buf.jit end
+      if type(buf.xrt) == "number" and buf ~= lastCosted then
+        lastCosted = buf
+        statWorkerXrt = buf.xrt
+        statXrtSum = statXrtSum + buf.xrt
+        statXrtCount = statXrtCount + 1
+        if statXrtMax == nil or buf.xrt > statXrtMax then
+          statXrtMax = buf.xrt
+        end
+      end
       if free > 0 then
-        m.source:queue(buf.sd)
+        if not pcall(m.source.queue, m.source, buf.sd) then return end
       else
         pendingBuf = buf -- Source full; hold this one for next frame
         break
       end
     end
   end
-  if not m.started and not musicHeld then
-    if deviceLost then
-      -- the output is gone; do not leave another stream dangling in silence
-      m.started = true
-      m.finished, m.finishedByDeviceLoss = true, true
-    elseif (MUSIC_BUFFER_COUNT - m.source:getFreeBufferCount()) > 0 then
-      m.started = true
-      if not startSource(m.source) then playAttemptFailed(m) end
-    end
+  if not m.started and not musicHeld and readyToStart(m) then
+    pcall(function() m.source:play() end)
+    m.started = true
   end
 end
 
+local function noteStats(m)
+  if not m.started or m.finished then return end
+  statFrames = statFrames + 1
+  local depth = m.source and queuedBuffers(m.source) or nil
+  if depth then
+    statDepthSum = statDepthSum + depth
+    statDepthFrames = statDepthFrames + 1
+    if statDepthMin == nil or depth < statDepthMin then statDepthMin = depth end
+  end
+  if depth == 0 then statUnderruns = statUnderruns + 1 end
+  if STATS and statFrames % 60 == 0 then
+    require("src.core.Logger").info(
+      "chipaudio: depth=%d/%d out=%d underruns=%d restarts=%d rate=%d",
+      depth or -1, MUSIC_BUFFER_COUNT,
+      (m.threaded and outCh) and outCh:getCount() or -1,
+      statUnderruns, statRestarts, sampleRate())
+  end
+end
+
+function ChipAudio.stats()
+  local m = currentMusic
+  local depth = (m and m.source) and queuedBuffers(m.source) or nil
+  local worker
+  if workerReady == nil then worker = "none"
+  elseif workerReady == false then worker = "sync"
+  elseif statWorkerJit == true then worker = "jit"
+  elseif statWorkerJit == false then worker = "interp"
+  else worker = "starting" end
+  local average = statDepthFrames > 0
+    and (statDepthSum / statDepthFrames) or nil
+  local stats = {
+    rate = sampleRate(),
+    worker = worker,
+    depth = depth,
+    depthMax = MUSIC_BUFFER_COUNT,
+    depthMin = statDepthMin,
+    depthAvg = average,
+    frames = statFrames,
+    underruns = statUnderruns,
+    restarts = statRestarts,
+    xrt = statWorkerXrt,
+    xrtAvg = statXrtCount > 0 and (statXrtSum / statXrtCount) or nil,
+    xrtMax = statXrtMax,
+    buffers = statXrtCount,
+  }
+  local function num(value, places)
+    if type(value) ~= "number" then return "-" end
+    return string.format("%." .. places .. "f", value)
+  end
+  stats.line = string.format(
+    "rate=%d worker=%s depth=%s/%d min=%s avg=%s underruns=%d restarts=%d "
+      .. "xrt=%s/%s/%s n=%d",
+    stats.rate, worker, depth and tostring(depth) or "-", MUSIC_BUFFER_COUNT,
+    statDepthMin and tostring(statDepthMin) or "-", num(average, 1),
+    statUnderruns, statRestarts,
+    num(statWorkerXrt, 3), num(stats.xrtAvg, 3), num(statXrtMax, 3),
+    statXrtCount)
+  return stats
+end
+
 function ChipAudio.update()
+  if suspended then return end
+  if fxCh then drainEffects() end
   local m = currentMusic
   if not m then return end
   if m.threaded then
@@ -336,76 +423,33 @@ function ChipAudio.update()
   else
     fillSync()
   end
+  noteStats(m)
 end
 
 -- Recover from a queue underrun caused by a long render stall.  Called after
 -- Music has handled intentional fanfare pauses, so it never fights the normal
--- pause/resume behavior.  Once the device is known to be gone it stops
--- retrying entirely: an unbounded per-frame Source:play against a
--- disconnected WASAPI device cannot succeed and hides the real diagnosis.
+-- pause/resume behavior.
 function ChipAudio.ensureMusicPlaying()
+  if suspended then return end
   local m = currentMusic
   if not m or m.finished or musicHeld then return end
-  if deviceLost then
-    m.finished, m.finishedByDeviceLoss = true, true
-    return
-  end
   if m.threaded then
     if not m.started then return end
-    local ok, playing = pcall(m.source.isPlaying, m.source)
-    if not ok then return end
-    if playing then
-      playAttempts = 0
-    elseif (MUSIC_BUFFER_COUNT - m.source:getFreeBufferCount()) > 0 then
-      if startSource(m.source) then
-        playAttempts = 0
-      else
-        playAttemptFailed(m)
-      end
+    local ok, playing = pcall(function() return m.source:isPlaying() end)
+    if not ok or playing then return end
+    if readyToStart(m) then
+      pcall(function() m.source:play() end)
+      statRestarts = statRestarts + 1
     end
   else
     if not m.engine or m.engine:finished() then return end
     local ok, playing = pcall(m.source.isPlaying, m.source)
-    if not ok then return end
-    if playing then
-      playAttempts = 0
-    else
+    if ok and not playing then
       fillSync(MUSIC_FILL_INITIAL)
-      if startSource(m.source) then
-        playAttempts = 0
-      else
-        playAttemptFailed(m)
-      end
+      pcall(m.source.play, m.source)
+      statRestarts = statRestarts + 1
     end
   end
-end
-
--- How many failed restarts count as a lost device.  Exposed so a host (or a
--- test) can reason about the budget instead of hard-coding it.
-ChipAudio.DEVICE_LOST_AFTER_ATTEMPTS = DEVICE_LOST_AFTER_ATTEMPTS
-
--- True once repeated restart attempts have shown the output device is gone.
--- Hosts read this to offer a restart instead of leaving the player in silence.
-function ChipAudio.deviceLost()
-  return deviceLost
-end
-
--- Drop the lost-device latch so playback is tried again: called when audio
--- output plausibly returned (a window regaining focus after a resume, or an
--- explicit player retry).  A still-dead device re-latches after the same
--- budget, so this cannot loop.
-function ChipAudio.recoverDevice()
-  if not deviceLost then return false end
-  deviceLost = false
-  playAttempts = 0
-  -- Undo only the stop the latch itself caused, so a song that genuinely ended
-  -- during the silence is not resurrected.
-  local m = currentMusic
-  if m and m.finishedByDeviceLoss then
-    m.finished, m.finishedByDeviceLoss = false, false
-  end
-  ChipAudio.ensureMusicPlaying()
-  return true
 end
 
 -- Silence the song for the length of a fanfare and start whatever was held
@@ -428,6 +472,7 @@ end
 local forceAwaitingFirstBuffer -- test-only override (see _simulate*)
 
 function ChipAudio.awaitingFirstBuffer()
+  if suspended then return false end
   if forceAwaitingFirstBuffer then return true end
   local m = currentMusic
   if not (m and m.threaded and not m.started and not m.finished) then
@@ -440,12 +485,6 @@ function ChipAudio.awaitingFirstBuffer()
 end
 
 function ChipAudio.stopMusic()
-  -- A deliberate stop (song change, menu, NEW GAME) ends one attempt streak,
-  -- so an occasional underrun in an earlier song cannot contribute to a later
-  -- device-loss verdict.  The latch itself is deliberately NOT cleared here:
-  -- Music.restoreMap re-plays the map theme the moment a stream stops, and
-  -- clearing it would restart the retry storm this module exists to stop.
-  playAttempts = 0
   if currentMusic and currentMusic.source then
     pcall(currentMusic.source.stop, currentMusic.source)
   end
@@ -463,6 +502,7 @@ end
 function ChipAudio.invalidate()
   ChipAudio.stopMusic()
   ChipSynth.invalidateBanks()
+  dropEffects()
   if workerReady and cmdCh then cmdCh:push({ cmd = "invalidate" }) end
 end
 
@@ -474,7 +514,115 @@ function ChipAudio.shutdown()
   if workerReady and cmdCh then cmdCh:push({ cmd = "quit" }) end
   if worker then pcall(function() worker:wait() end) end
   worker, cmdCh, outCh = nil, nil, nil
-  workerReady = false
+  workerReady = nil
+  dropEffects()
+  fxCh = nil
+end
+
+function ChipAudio.currentSource()
+  return currentMusic and currentMusic.source
+end
+
+function ChipAudio.setSuspended(flag)
+  suspended = not not flag
+end
+
+function ChipAudio.isSuspended()
+  return suspended
+end
+
+function ChipAudio.rebuildPlayback()
+  local m = currentMusic
+  if not m then return true end
+  if not (love.audio and love.audio.newQueueableSource) then return false end
+  local ok, source = pcall(
+    love.audio.newQueueableSource, sampleRate(), 16, 2, MUSIC_BUFFER_COUNT)
+  if not ok or not source then return false end
+  pendingBuf = nil
+  local old = m.source
+  m.source = source
+  m.started = false
+  if old then pcall(old.stop, old) end
+  if not m.threaded then
+    fillSync(MUSIC_FILL_INITIAL)
+    if not musicHeld then pcall(source.play, source) end
+    m.started = true
+  end
+  return true
+end
+
+function ChipAudio.setStereo(enabled)
+  enabled = not not enabled
+  if ChipSynth.getStereo() == enabled then return end
+  ChipSynth.setStereo(enabled)
+  stereoEpoch = stereoEpoch + 1
+  local m = currentMusic
+  if m and m.engine then
+    ChipSynth.applyStereo(m.engine)
+    -- a half-rendered fallback buffer holds the previous pan mix (#1471)
+    m.staging, m.stagingFill = nil, 0
+  end
+  if workerReady and cmdCh then
+    cmdCh:push({ cmd = "channelMix",
+                 volumes = ChipSynth.getChannelVolumes(),
+                 pitches = ChipSynth.getChannelPitches(),
+                 stereo = enabled,
+                 stereoEpoch = stereoEpoch })
+  end
+  if not m then return end
+  pendingBuf = nil
+  if outCh then outCh:clear() end
+  m.stereoEpoch = stereoEpoch
+  -- QueueableSource cannot unqueue; swap so the ~6s stall-tolerance buffers
+  -- (mixed under the previous pan) do not have to play out first (#1471)
+  if not love.audio then return end
+  local ok, source = pcall(
+    love.audio.newQueueableSource, sampleRate(), 16, 2, MUSIC_BUFFER_COUNT)
+  if not ok or not source then return end
+  local old = m.source
+  m.source = source
+  m.started = false
+  if old then pcall(old.stop, old) end
+  if not m.threaded then
+    fillSync(MUSIC_FILL_INITIAL)
+    if not musicHeld then pcall(source.play, source) end
+    m.started = true
+  end
+end
+
+function ChipAudio.getStereo()
+  return ChipSynth.getStereo()
+end
+
+local envRate = os.getenv("POKEPORT_AUDIO_RATE")
+
+function ChipAudio._setEnvRateForTest(value)
+  envRate = value
+end
+
+function ChipAudio.selectSampleRate(options)
+  local forced = tonumber(envRate)
+  if forced and forced >= 8000 and forced <= 48000 then
+    return math.floor(forced)
+  end
+  local tier = require("src.core.Performance")
+    .resolve(options and options.performance)
+  if tier == "low" then return 22050 end
+  local osName = love and love.system and love.system.getOS
+    and love.system.getOS() or nil
+  if osName == "Android" and tier ~= "high" then return 22050 end
+  return 44100
+end
+
+function ChipAudio.setSampleRate(rate)
+  local before = sampleRate()
+  if ChipSynth.setSampleRate(rate) == before then return false end
+  ChipAudio.stopMusic()
+  return true
+end
+
+function ChipAudio.applyOptions(options)
+  return ChipAudio.setSampleRate(ChipAudio.selectSampleRate(options))
 end
 
 -- Runtime mix for one hardware channel (1..4).  Takes effect on the next
@@ -532,48 +680,192 @@ Assets.register(ChipAudio.invalidate)
 -- one-shot effects (SFX, cries, low-health alarm): synchronous static Sources
 -- ---------------------------------------------------------------------------
 
+-- Prewarm (#first-cry hitch): the first play of an SFX/cry synthesizes its
+-- whole PCM on the main thread (a cry is ~10-25 ms of Lua synthesis, a long
+-- jingle 150-350 ms).  ChipAudio.prewarmSfx / prewarmCry hand that render to
+-- the music worker ahead of time -- e.g. while a battle transition runs, for
+-- the two species about to cry -- and the next newSfx/newCry with the same
+-- def, modifiers and channel mix takes the finished SoundData instead of
+-- rendering.  Playback timing is unchanged: a play never waits on the worker
+-- (a request still in flight is rendered synchronously as before and its
+-- late result dropped), and the worker runs the same ChipSynth code with the
+-- same rate/mix, so the PCM is identical.  No worker (headless, love.thread
+-- unavailable or dead): prewarm is a no-op and plays render as before.
+
+local function effectKey(data, header, options)
+  if type(header) ~= "table" then return nil end
+  local volumes = ChipSynth.getChannelVolumes()
+  local pitches = ChipSynth.getChannelPitches()
+  -- table identities: a reloaded def (or dataset) is a new table
+  return table.concat({
+    tostring(data and data.audio), tostring(header.chip or header),
+    tostring(options.frequencyOffset), tostring(options.frameTicks),
+    tostring(options.plainFrames), tostring(options.cryLength),
+    tostring(options.maxSeconds),
+    sampleRate(), ChipSynth.getStereo() and 1 or 0,
+    volumes[1], volumes[2], volumes[3], volumes[4],
+    pitches[1], pitches[2], pitches[3], pitches[4], fxEpoch,
+  }, "|")
+end
+
+function drainEffects()
+  if not fxCh then return end
+  while true do
+    local result = fxCh:pop()
+    if not result then return end
+    if result.epoch == fxEpoch and fxPending[result.key] then
+      fxPending[result.key] = nil
+      if result.error then
+        require("src.core.Logger").warn("chip audio prewarm: %s",
+          tostring(result.error))
+      elseif fxReadyCount < FX_READY_MAX then
+        fxReady[result.key] = result.sd or false
+        fxReadyCount = fxReadyCount + 1
+      end
+    end
+  end
+end
+
+function dropEffects()
+  fxEpoch = fxEpoch + 1
+  fxReady, fxPending, fxReadyCount = {}, {}, 0
+  if fxCh then fxCh:clear() end
+end
+
+local function requestEffect(data, header, options)
+  if not ensureWorker() or not workerAlive() then return false end
+  local key = effectKey(data, header, options)
+  if not key then return false end
+  drainEffects()
+  if fxReady[key] ~= nil or fxPending[key] then return true end
+  fxCh = fxCh or love.thread.getChannel("chipaudio_fx")
+  local pushed = pcall(cmdCh.push, cmdCh, {
+    cmd = "effect", key = key, epoch = fxEpoch, header = header,
+    options = {
+      frequencyOffset = options.frequencyOffset,
+      frameTicks = options.frameTicks,
+      plainFrames = options.plainFrames,
+      cryLength = options.cryLength,
+      maxSeconds = options.maxSeconds,
+    },
+    audio = slimAudio(data),
+    channelVolumes = ChipSynth.getChannelVolumes(),
+    channelPitches = ChipSynth.getChannelPitches(),
+    stereo = ChipSynth.getStereo(),
+    sampleRate = sampleRate(),
+  })
+  if not pushed then return false end
+  fxPending[key] = true
+  return true
+end
+
+-- a finished prewarm for exactly this render, or nil
+local function takeEffect(data, header, options)
+  if not fxCh then return nil end
+  local key = effectKey(data, header, options)
+  if not key then return nil end
+  drainEffects()
+  local sd = fxReady[key]
+  if sd ~= nil then
+    fxReady[key] = nil
+    fxReadyCount = fxReadyCount - 1
+    return sd
+  end
+  -- about to render it here; the worker's copy would arrive unused
+  fxPending[key] = nil
+  return nil
+end
+
 local function renderEffect(data, header, options)
-  local sd = ChipSynth.renderEffectData(data, header, options)
+  local sd = takeEffect(data, header, options)
+  if sd == nil then sd = ChipSynth.renderEffectData(data, header, options) end
   if not sd then return nil end
   return love.audio.newSource(sd, "static")
 end
 
-function ChipAudio.newSfx(data, name, pitch, tempo, header)
-  header = header or data.audio.sfx[name]
-  return renderEffect(data, header, {
+local function sfxOptions(pitch, tempo, plainFrames)
+  return {
     frequencyOffset = pitch or 0,
     frameTicks = 0x80 + (tempo or 0x80),
-  })
+    plainFrames = plainFrames,
+  }
+end
+
+local function cryDef(data, species, resolved)
+  return resolved or (data.audio.cries and data.audio.cries[species])
+end
+
+local function cryOptions(cry)
+  return { frequencyOffset = cry.pitch, cryLength = cry.length }
+end
+
+function ChipAudio.newSfx(data, name, pitch, tempo, header, plainFrames)
+  header = header or data.audio.sfx[name]
+  return renderEffect(data, header, sfxOptions(pitch, tempo, plainFrames))
 end
 
 -- `resolved` is a {header|chip, pitch, length} def the caller already worked
 -- out -- a derived cry borrowing another species' header with its own
 -- modifiers, which no registry lookup under `species` could find
 function ChipAudio.newCry(data, species, resolved)
-  local cry = resolved or (data.audio.cries and data.audio.cries[species])
+  local cry = cryDef(data, species, resolved)
   if not cry then return nil end
-  return renderEffect(data, cry.chip and cry or cry.header, {
-    frequencyOffset = cry.pitch,
-    cryLength = cry.length,
-  })
+  return renderEffect(data, cry.chip and cry or cry.header, cryOptions(cry))
+end
+
+-- Same arguments as newSfx / newCry; returns true when a render was queued
+-- on the worker (or is already queued / done), false when there is no worker
+-- to do it.  Never renders on the calling thread.
+function ChipAudio.prewarmSfx(data, name, pitch, tempo, header, plainFrames)
+  header = header or (data.audio and data.audio.sfx and data.audio.sfx[name])
+  if not header then return false end
+  return requestEffect(data, header, sfxOptions(pitch, tempo, plainFrames))
+end
+
+function ChipAudio.prewarmCry(data, species, resolved)
+  local cry = data.audio and cryDef(data, species, resolved)
+  if not cry then return false end
+  local header = cry.chip and cry or cry.header
+  if not header then return false end
+  return requestEffect(data, header, cryOptions(cry))
+end
+
+-- test hook: prewarm bookkeeping
+function ChipAudio._effectStateForTest()
+  local pending = 0
+  for _ in pairs(fxPending) do pending = pending + 1 end
+  return { ready = fxReadyCount, pending = pending, epoch = fxEpoch }
 end
 
 -- Two channels for the same reason ChipSynth.renderEffectData renders stereo:
 -- a mono Source is spatialized by OpenAL at the listener position and spreads
 -- over every output an interface has (#626).  The siren itself is unchanged,
 -- both channels carry the same sample.
+-- PlayDanger (audio/engine.asm:531) counts one frame per call and resets with
+-- `cp 30 / jr c, .noreset`, so the cycle is frames 0..29 and the buffer holds
+-- exactly two of them.  DangerSoundHigh goes in on the `and a / jr z, .begin`
+-- frame 0 and DangerSoundLow on the `cp 16 / jr z, .halfway` frame 16, so the
+-- high tone owns 0..15 and the low tone 16..29.
 function ChipAudio.newLowHealthAlarm()
-  local samples = math.floor(SAMPLE_RATE * 62 / 60)
+  local SAMPLE_RATE = sampleRate()
+  local samples = math.floor(SAMPLE_RATE * 60 / 60)
   local data = love.sound.newSoundData(samples, SAMPLE_RATE, 16, 2)
+  local pointer = ChipSynth._int16Pointer(data)
   local phase = 0
   for index = 0, samples - 1 do
-    local frame = math.floor(index * 60 / SAMPLE_RATE) % 31
-    local register = frame < 11 and 0x750 or 0x6EE
+    local frame = math.floor(index * 60 / SAMPLE_RATE) % 30
+    local register = frame < 16 and 0x750 or 0x6EE
     local frequency = 131072 / (2048 - register)
     phase = (phase + frequency / SAMPLE_RATE) % 1
     local value = (phase < 0.5 and 1 or -1) * 0.25
-    data:setSample(index, 1, value)
-    data:setSample(index, 2, value)
+    if pointer then
+      -- same int16 setSample stores (ChipSynth bulk PCM writes)
+      pointer[index * 2] = value * 32767
+      pointer[index * 2 + 1] = value * 32767
+    else
+      data:setSample(index, 1, value)
+      data:setSample(index, 2, value)
+    end
   end
   return love.audio.newSource(data, "static")
 end
@@ -581,6 +873,19 @@ end
 -- ---------------------------------------------------------------------------
 -- test hooks (headless): synchronous synthesis straight through ChipSynth
 -- ---------------------------------------------------------------------------
+
+function ChipAudio._setAudioStatsForTest(flag)
+  STATS = not not flag
+  statFrames, statUnderruns, statRestarts = 0, 0, 0
+  statDepthMin, statDepthSum, statDepthFrames = nil, 0, 0
+  statWorkerJit, statWorkerXrt = nil, nil
+  statXrtSum, statXrtCount, statXrtMax, lastCosted = 0, 0, nil, nil
+end
+
+function ChipAudio._audioStatsForTest()
+  return { frames = statFrames, underruns = statUnderruns,
+           restarts = statRestarts }
+end
 
 -- Force the "threaded, first buffer not yet queued" window so Music's
 -- playOnce / pendingRestore race can be asserted without love.thread.
@@ -598,10 +903,11 @@ end
 
 function ChipAudio._renderMusicForTest(data, header, seconds)
   local engine = ChipSynth.newEngine(data, header, { allowLoops = true })
-  return ChipSynth.soundData(engine, math.floor(seconds * SAMPLE_RATE), 2)
+  return ChipSynth.soundData(engine, math.floor(seconds * sampleRate()), 2)
 end
 
 function ChipAudio._renderMusicChannelForTest(data, header, seconds, number)
+  local SAMPLE_RATE = sampleRate()
   local engine = ChipSynth.newEngine(data, header, { allowLoops = true })
   local samples = math.floor(seconds * SAMPLE_RATE)
   local result = love.sound.newSoundData(samples, SAMPLE_RATE, 16, 1)
@@ -662,7 +968,7 @@ function ChipAudio._renderSfxForTest(data, header, seconds)
     sfx = true,
     allowLoops = false,
   })
-  return ChipSynth.soundData(engine, math.floor(seconds * SAMPLE_RATE), 1)
+  return ChipSynth.soundData(engine, math.floor(seconds * sampleRate()), 1)
 end
 
 return ChipAudio

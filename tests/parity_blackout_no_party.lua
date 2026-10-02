@@ -35,6 +35,13 @@ local WILD_SONG = Data.audio.battle.wild
 -- every song request in order: "the theme was never restored" and "the theme
 -- was never started" have to read differently.  Music.playMap still sets the
 -- state Music.restoreMap reads, so the real restore path is under test.
+-- singletons this file stands doubles on; the originals go back at the tail,
+-- or a later suite in the same process inherits them (a stubbed startWarpTo
+-- eats every warp after this one)
+local realPlay, realPlayBattle = Music.play, Music.playBattle
+local realStartWarpTo = OW.startWarpTo
+local realEvents = Runtime.events
+
 local songs = {}
 Music.play = function(_, song) songs[#songs + 1] = song end
 local function lastSong() return songs[#songs] end
@@ -133,8 +140,9 @@ if box and box.onDone then box.onDone() end
 eq(result(), "lose", "onFinish gets \"lose\", so afterBattle blacks out")
 eq(Game.save.party[1].hp, full, "the party is revived at the heal point")
 eq(Game.save.money, 1500, "half the money is lost, as on any blackout")
-check(warp ~= nil and warp.map == "VIRIDIAN_POKECENTER",
-      "and the player is warped to the last heal point")
+-- engine/events/black_out.asm:39-43
+check(warp ~= nil and warp.map == "VIRIDIAN_CITY",
+      "and the player is warped outside the last heal point (#2077)")
 -- the brick: before #425 the party was still at 0 HP here, so this second
 -- encounter took the same exit, and so did every one after it
 local ow2 = newWorld(MAP)
@@ -159,5 +167,9 @@ check(getmetatable(Game.stack:top()) ~= TextBox,
 eq(labResult, "lose", "it still finishes as a loss")
 eq(Game.save.money, 3000, "no money is lost in the lab")
 eq(warp, nil, "and the player stays in the lab for OaksLabRivalEndBattleScript")
+
+OW.startWarpTo = realStartWarpTo
+Music.play, Music.playBattle = realPlay, realPlayBattle
+Runtime.install(realEvents, Runtime.hooks)
 
 S.finish()

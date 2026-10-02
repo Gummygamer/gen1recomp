@@ -9,7 +9,9 @@ local ERROR_LOG = "lua-error.log"
 local ERROR_LOG_ROTATED = "lua-error.log.1"
 local ERROR_LOG_MAX = 32 * 1024
 local FLUSH_INTERVAL = 1.0
-local RING_SIZE = 64
+local RING_SIZE = 256
+local FOCUS_LOG = "pad-reconcile.log"
+local FOCUS_LOG_MAX = 256 * 1024
 
 local enabled = nil
 local buffer = {}
@@ -114,11 +116,94 @@ function SwitchDiagnostics.identityOverlay()
   return identityLine
 end
 
+local function now()
+  return love and love.timer and love.timer.getTime and love.timer.getTime() or 0
+end
+
 function SwitchDiagnostics.onEvent(kind, payload)
   if not SwitchDiagnostics.isEnabled() then return end
   bufCount = bufCount + 1
   local slot = ((bufCount - 1) % RING_SIZE) + 1
-  buffer[slot] = ("%s %s"):format(tostring(kind), encodePayload(payload))
+  buffer[slot] = ("t=%.3f %s %s"):format(now(), tostring(kind), encodePayload(payload))
+end
+
+local function ringLines(lines)
+  local start = math.max(1, bufCount - RING_SIZE + 1)
+  for i = start, bufCount do
+    local slot = ((i - 1) % RING_SIZE) + 1
+    if buffer[slot] then lines[#lines + 1] = buffer[slot] end
+  end
+  return lines
+end
+
+local SNAPSHOT_BUTTONS = {
+  "a", "b", "x", "y", "back", "start", "leftshoulder", "rightshoulder",
+  "dpup", "dpdown", "dpleft", "dpright",
+}
+local SNAPSHOT_AXES = { "leftx", "lefty", "triggerleft", "triggerright" }
+
+local function padSnapshot(j)
+  local parts = {}
+  local function call(name, ...)
+    local fn = j[name]
+    if type(fn) ~= "function" then return nil end
+    local ok, v = pcall(fn, j, ...)
+    if ok then return v end
+    return nil
+  end
+  parts[#parts + 1] = "name=" .. tostring(redactString(tostring(call("getName"))))
+  parts[#parts + 1] = "guid=" .. tostring(call("getGUID"))
+  parts[#parts + 1] = "connected=" .. tostring(call("isConnected"))
+  parts[#parts + 1] = "isGamepad=" .. tostring(call("isGamepad"))
+  if call("isGamepad") then
+    local down = {}
+    for _, button in ipairs(SNAPSHOT_BUTTONS) do
+      if call("isGamepadDown", button) then down[#down + 1] = button end
+    end
+    parts[#parts + 1] = "down=" .. table.concat(down, ",")
+    for _, axis in ipairs(SNAPSHOT_AXES) do
+      local v = call("getGamepadAxis", axis)
+      if type(v) == "number" then parts[#parts + 1] = ("%s=%.2f"):format(axis, v) end
+    end
+  end
+  return table.concat(parts, " ")
+end
+
+function SwitchDiagnostics.onPadReconcile()
+  if not SwitchDiagnostics.isEnabled() then return end
+  local filesystem = fs()
+  if not filesystem then return end
+  local lines = {
+    ("=== reconcile t=%.3f at=%s focus=%s"):format(now(), os.date("!%Y-%m-%dT%H:%M:%SZ"),
+      tostring(love and love.window and love.window.hasFocus and love.window.hasFocus())),
+    SwitchDiagnostics.identityOverlay(),
+  }
+  local js = love and love.joystick
+  local ok, list = false, nil
+  if js and js.getJoysticks then ok, list = pcall(js.getJoysticks) end
+  if ok and type(list) == "table" then
+    for i, j in ipairs(list) do
+      lines[#lines + 1] = ("pad%d %s"):format(i, padSnapshot(j))
+    end
+  end
+  lines[#lines + 1] = "--- last events"
+  ringLines(lines)
+  local existing = filesystem.read(FOCUS_LOG) or ""
+  if #existing > FOCUS_LOG_MAX then
+    filesystem.write(FOCUS_LOG .. ".1", existing)
+    existing = ""
+  end
+  filesystem.write(FOCUS_LOG, existing .. table.concat(lines, "\n") .. "\n")
+  SwitchDiagnostics.onEvent("reconcile", nil)
+  SwitchDiagnostics.maybeFlush(true)
+end
+
+local function osName()
+  local sys = love and love.system
+  if not (sys and sys.getOS) then return nil end
+  local ok, name = pcall(sys.getOS)
+  if ok then return name end
+  return nil
 end
 
 function SwitchDiagnostics.onJoystickEvent(kind, joystick, button, extra)
@@ -132,14 +217,125 @@ function SwitchDiagnostics.onJoystickEvent(kind, joystick, button, extra)
   if extra then
     for k, v in pairs(extra) do payload[k] = v end
   end
+  local PadHints = require("src.core.PadHints")
+  payload.hf = tostring(PadHints.hasFocus())
+  local fg = PadHints.foreground(osName())
+  if fg then payload.fg = fg end
   SwitchDiagnostics.onEvent(kind, payload)
 end
 
-function SwitchDiagnostics.logLuaError(msg)
+function SwitchDiagnostics.onFocus(f)
+  if not SwitchDiagnostics.isEnabled() then return end
+  local PadHints = require("src.core.PadHints")
+  local payload = {
+    f = tostring(f),
+    hasFocus = tostring(PadHints.hasFocus()),
+    visible = tostring(not PadHints.windowMinimized()),
+  }
+  local fg = PadHints.foreground(osName())
+  if fg then payload.fg = fg end
+  SwitchDiagnostics.onEvent("focus", payload)
+  SwitchDiagnostics.maybeFlush(true)
+end
+
+local function safeLabel(value)
+  if type(value) ~= "string" or value == "" then return nil end
+  return value:gsub("[%c]", " "):sub(1, 100)
+end
+
+local function modFolder(path)
+  if type(path) ~= "string" then return nil end
+  path = path:gsub("\\", "/"):gsub("^@", "")
+  -- src/mods is engine code, even when a traceback uses an absolute path.
+  if path:match("^src/mods/") then return nil end
+  local engineMods = path:find("/src/mods/", 1, true)
+  local userMods = path:find("/mods/", 1, true)
+  if engineMods and (not userMods or engineMods < userMods) then return nil end
+  local folder = path:match("^mods/([^/]+)/") or path:match("/mods/([^/]+)/")
+  if folder == "." or folder == ".." then return nil end
+  return folder
+end
+
+local function manifestAt(folder)
+  local filesystem = fs()
+  if not filesystem or not filesystem.read then return nil end
+  local raw = filesystem.read("mods/" .. folder .. "/manifest.json")
+  if not raw then return nil end
+  local okJson, Json = pcall(require, "src.link.Json")
+  if not okJson then return nil end
+  local ok, manifest = pcall(Json.decode, raw)
+  if ok and type(manifest) == "table" then return manifest end
+end
+
+local function modName(folder, id)
+  local filesystem = fs()
+  if not folder and filesystem and filesystem.getDirectoryItems then
+    for _, candidate in ipairs(filesystem.getDirectoryItems("mods") or {}) do
+      local manifest = manifestAt(candidate)
+      if manifest and manifest.id == id then
+        folder = candidate
+        break
+      end
+    end
+  end
+  local manifest = folder and manifestAt(folder)
+  id = safeLabel(manifest and manifest.id) or safeLabel(id) or safeLabel(folder) or "unknown"
+  local name = safeLabel(manifest and manifest.name)
+  if name and name ~= id then return ('mod "%s" (%s)'):format(name, id), name, id end
+  return ("mod %s"):format(id), id, id
+end
+
+local function sourcePath(line)
+  return line:match("^%s*(.-%.lua):%d+:")
+end
+
+local function modSource(folder, id)
+  local label, name, modId = modName(folder, id)
+  return "Likely source: " .. label,
+    { kind = "mod", name = name, id = modId }
+end
+
+local function engineSource()
+  return "Likely source: gen1recomp", { kind = "engine", name = "gen1recomp" }
+end
+
+function SwitchDiagnostics.errorSource(msg, traceback)
+  local firstLine = tostring(msg or ""):match("^[^\n]*") or ""
+  local path = sourcePath(firstLine)
+  local folder = modFolder(path)
+  if folder then return modSource(folder) end
+  if path then return engineSource() end
+
+  -- Error strings without a file can still have a mod frame in the traceback.
+  -- Engine dispatch frames can appear before that frame, so scan the trace.
+  for line in tostring(traceback or ""):gmatch("[^\n]+") do
+    path = sourcePath(line)
+    if path then
+      folder = modFolder(path)
+      if folder then return modSource(folder) end
+    end
+  end
+  local runtime = package.loaded["src.mods.Runtime"]
+  local id = runtime and (runtime.currentMod or runtime.modRequire)
+  if type(id) == "string" then return modSource(nil, id) end
+  return engineSource()
+end
+
+local function errorLogPath(filesystem)
+  local dir = filesystem.getSaveDirectory and filesystem.getSaveDirectory()
+  if type(dir) ~= "string" or dir == "" then return ERROR_LOG end
+  local last = dir:sub(-1)
+  local separator = dir:find("\\", 1, true) and "\\" or "/"
+  return dir .. ((last == "/" or last == "\\") and "" or separator) .. ERROR_LOG
+end
+
+function SwitchDiagnostics.logLuaError(msg, traceback)
   local filesystem = fs()
   if not filesystem then return nil end
 
-  local text = redactString(tostring(msg or "unknown error"))
+  local source, owner = SwitchDiagnostics.errorSource(msg, traceback)
+  local message = redactString(tostring(msg or "unknown error"))
+  local trace = traceback and redactString(tostring(traceback)) or nil
   local existing = filesystem.read(ERROR_LOG) or ""
   if #existing > ERROR_LOG_MAX then
     filesystem.write(ERROR_LOG_ROTATED, existing)
@@ -147,10 +343,18 @@ function SwitchDiagnostics.logLuaError(msg)
   end
 
   local stamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
-  local line = ("[%s] %s\n"):format(stamp, text)
-  filesystem.write(ERROR_LOG, existing .. line .. SwitchDiagnostics.identityOverlay() .. "\n")
+  local line = ("[%s] %s\n%s\n"):format(stamp, source, message)
+  if trace then line = line .. trace .. "\n" end
+  local path = errorLogPath(filesystem)
+  local written = filesystem.write(ERROR_LOG,
+    existing .. line .. "Error log: " .. path .. "\n"
+      .. SwitchDiagnostics.identityOverlay() .. "\n")
 
-  return "Details saved to lua-error.log in the save directory."
+  local report = { owner = owner, source = source, logPath = path,
+    details = message .. (trace and ("\n" .. trace) or ""),
+    saved = written and true or false }
+  if written then return "Error log: " .. path, source, report end
+  return "Could not save error log: " .. path, source, report
 end
 
 function SwitchDiagnostics.maybeFlush(force, now)
@@ -162,12 +366,7 @@ function SwitchDiagnostics.maybeFlush(force, now)
   local filesystem = fs()
   if not filesystem then return end
 
-  local lines = { SwitchDiagnostics.identityOverlay(), "---" }
-  local start = math.max(1, bufCount - RING_SIZE + 1)
-  for i = start, bufCount do
-    local slot = ((i - 1) % RING_SIZE) + 1
-    if buffer[slot] then lines[#lines + 1] = buffer[slot] end
-  end
+  local lines = ringLines({ SwitchDiagnostics.identityOverlay(), "---" })
   filesystem.write(LOG_FILE, table.concat(lines, "\n") .. "\n")
 end
 
@@ -220,6 +419,9 @@ function SwitchDiagnostics.probeAssets(version)
     "assets/generated/tilesets/reds_house.png",
     "assets/generated/sprites/red.png",
     "assets/generated/sprites/monster.png",
+    "data/generated/maps.lua",
+    "data/generated/oak_speech.lua",
+    "data/generated/font.lua",
   }
   for _, path in ipairs(samples) do
     local versioned = prefix ~= "" and (prefix .. path) or path
@@ -230,17 +432,29 @@ function SwitchDiagnostics.probeAssets(version)
       lines[#lines + 1] = "versioned=" .. probeInfo(filesystem, versioned)
     end
     lines[#lines + 1] = "resolve=" .. tostring(resolved)
-    lines[#lines + 1] = "newImage=" .. probeOpen("image", resolved)
-    lines[#lines + 1] = "newImageData=" .. probeOpen("imageData", resolved)
-    if prefix ~= "" and resolved ~= versioned then
-      lines[#lines + 1] = "newImage_versioned=" .. probeOpen("image", versioned)
-      lines[#lines + 1] = "newImageData_versioned=" .. probeOpen("imageData", versioned)
+    if path:sub(-4) == ".lua" then
+      local CacheFs = require("src.import.CacheFs")
+      local loaded, err = CacheFs.loadActive(path)
+      lines[#lines + 1] = "loadActive=" .. (loaded ~= nil and "ok"
+        or ("FAIL " .. tostring(err):gsub("%s+", " "):sub(1, 160)))
+    else
+      lines[#lines + 1] = "newImage=" .. probeOpen("image", resolved)
+      lines[#lines + 1] = "newImageData=" .. probeOpen("imageData", resolved)
+      if prefix ~= "" and resolved ~= versioned then
+        lines[#lines + 1] = "newImage_versioned=" .. probeOpen("image", versioned)
+        lines[#lines + 1] = "newImageData_versioned=" .. probeOpen("imageData", versioned)
+      end
     end
   end
 
   -- Shallow listing so we can see if the extract tree exists at all.
-  local roots = { "yellow", "blue", "assets", "yellow/assets/generated",
-    "yellow/assets/generated/sprites", "blue/assets/generated/sprites" }
+  local roots = { "yellow", "blue", "gold", "silver", "crystal", "assets",
+    "yellow/assets/generated",
+    "yellow/assets/generated/sprites", "blue/assets/generated/sprites",
+    "gold/assets/generated", "gold/assets/generated/sprites",
+    "gold/data/generated", "silver/assets/generated",
+    "silver/data/generated", "crystal/assets/generated",
+    "crystal/data/generated" }
   for _, dir in ipairs(roots) do
     local info = filesystem.getInfo(dir)
     if info and info.type == "directory" and filesystem.getDirectoryItems then

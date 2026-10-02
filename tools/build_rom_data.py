@@ -12,6 +12,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import shutil
 import sys
 from collections import deque
@@ -34,6 +35,28 @@ DATASETS = (
     "text", "field", "battle_anims",
 )
 
+# Sound is decoded by the Lua importer (src/import/RomExtractor.lua), not here,
+# so --clean must step around it rather than delete what it cannot rebuild.
+UNOWNED_DATA = ("audio.lua",)
+UNOWNED_ASSETS = ("audio",)
+
+
+def clean_generated(out_dir, assets_dir):
+    """Empty the generated dirs, keeping artifacts this tool never writes."""
+    kept = []
+    for path, spared in ((out_dir, UNOWNED_DATA), (assets_dir, UNOWNED_ASSETS)):
+        if not os.path.isdir(path):
+            continue
+        for name in os.listdir(path):
+            target = os.path.join(path, name)
+            if name in spared:
+                kept.append(target)
+            elif os.path.isdir(target):
+                shutil.rmtree(target)
+            else:
+                os.remove(target)
+    return kept
+
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSION_MANIFESTS = {
     "red": os.path.join(_TOOLS_DIR, "rom_manifest.json"),
@@ -53,6 +76,26 @@ GB_SHADES = (
     (85, 85, 85, 255),
     (0, 0, 0, 255),
 )
+
+
+def _apply_title_obp0(image):
+    """Title rOBP0=%11100000 ($E0): OBJ shades 1 and 2 → white, 3 → black.
+
+    Eye OAM is baked into the MEWMON-colored BG PNG; without this remap the
+    shade-1 glints become body yellow under the title palette
+    (pokeyellow engine/movie/title.asm after PlacePikachu).
+    """
+    pixels = image.load()
+    w, h = image.size
+    mid, dark = GB_SHADES[1][0], GB_SHADES[2][0]
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pixels[x, y]
+            if a == 0:
+                continue
+            if abs(r - mid) <= 2 or abs(r - dark) <= 2:
+                pixels[x, y] = GB_SHADES[0]
+    return image
 
 
 def _symbol(symbols, name):
@@ -90,6 +133,17 @@ def version_for_manifest(manifest, requested_version=None, manifest_explicit=Fal
             f"--version {requested_version} does not match manifest romSha1 "
             f"{rom_sha1} ({detected})")
     return detected or requested_version or "red"
+
+
+def detect_rom_version(path):
+    """Read a canonical ROM once and return its supported game version."""
+    rom = RomImage(path, None)
+    version = SHA1_TO_VERSION.get(rom.sha1)
+    if version is None:
+        expected = ", ".join(VERSION_SHA1[name] for name in VERSION_MANIFESTS)
+        raise ValueError(
+            f"unsupported ROM SHA-1 {rom.sha1}; expected one of {expected}")
+    return version, rom
 
 
 def extract_constants(manifest, out_dir):
@@ -968,12 +1022,20 @@ def extract_battle_anims(
                             f"{name}: tile {tile['tile']} is out of range "
                             f"for tileset {row['tileset']}")
 
+    # engine/battle/animations.asm:2418
+    delta_symbol = _symbol(symbols, "FallingObjects_DeltaXs")
+    falling_delta_xs = {
+        index: value for index, value in enumerate(rom.bytes(
+            delta_symbol.bank, delta_symbol.address, 64))
+    }
+
     out = {
         "tilesheets": tilesheets,
         "baseCoords": base_coords,
         "frameBlocks": frame_blocks,
         "subanims": subanims,
         "moveAnims": move_anims,
+        "fallingDeltaXs": falling_delta_xs,
     }
     util.write_lua(
         os.path.join(out_dir, "battle_anims.lua"), out,
@@ -1620,7 +1682,8 @@ def _text_glyph(value, charmap):
     if value in TEXT_GLYPH_OVERRIDES:
         return TEXT_GLYPH_OVERRIDES[value]
     glyph = charmap.get(str(value), f"{{BYTE:{value:02X}}}")
-    if glyph.startswith("<") and glyph.endswith(">"):
+    # home/text.asm:186
+    if re.match(r"^<[^<>]*>$", glyph):
         return "{" + glyph[1:-1] + "}"
     return glyph
 
@@ -1636,6 +1699,9 @@ def _decode_text_commands(rom, symbol, charmap, substitutions):
             if pending:
                 raise ValueError(
                     f"{symbol.name}: unused dynamic text substitutions")
+            # home/text.asm:221
+            if out:
+                out.append("{DONE}")
             return "".join(out)
         if command == 0:
             while True:
@@ -1647,6 +1713,9 @@ def _decode_text_commands(rom, symbol, charmap, substitutions):
                     if pending:
                         raise ValueError(
                             f"{symbol.name}: unused dynamic text substitutions")
+                    # constants/charmap.asm:19-20
+                    if value != 0x5F and out:
+                        out.append("{PROMPT}" if value == 0x58 else "{DONE}")
                     return "".join(out)
                 out.append(_text_glyph(value, charmap))
             continue
@@ -1736,6 +1805,17 @@ def extract_field(rom, symbols, manifest, out_dir, assets_dir):
         "title/copyright.png")
     raw_2bpp(
         "GameFreakLogoGraphics", 72, 8, "title/gamefreak_inc.png")
+    # Yellow NineTile (pokeyellow gfx/font.asm): final "9" of (c)1995-1999,
+    # parked in the 16 bytes between GameFreakLogoGraphics and TextBoxGraphics.
+    if _has_symbol(symbols, "GameFreakLogoGraphics") \
+       and _has_symbol(symbols, "TextBoxGraphics"):
+        gf = _symbol(symbols, "GameFreakLogoGraphics")
+        tb = _symbol(symbols, "TextBoxGraphics")
+        if tb.address == gf.address + 9 * 16 + 16:
+            nine_raw = rom.bytes(gf.bank, gf.address + 9 * 16, 16)
+            _save_png(
+                _decode_2bpp(nine_raw, 8, 8, False),
+                os.path.join(assets_dir, "title/nine.png"))
 
     # Yellow fixed Pikachu title (pret/pokeyellow title_yellow.asm): tilemap
     # composition over both tile banks -- PokemonLogoGraphics in vChars2
@@ -1836,11 +1916,32 @@ def extract_field(rom, symbols, manifest, out_dir, assets_dir):
                 (3, 24, 24, True), (2, 32, 24, True),
                 (0, 56, 16, False), (1, 64, 16, False),
                 (2, 56, 24, False), (3, 64, 24, False)):
-            eye = ob_clear[ob_index]
+            eye = ob_clear[ob_index].copy()
+            _apply_title_obp0(eye)
             if flip:
                 eye = eye.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
             pikachu.paste(eye, (px, py), eye)
         _save_png(pikachu, os.path.join(assets_dir, "title/pikachu.png"))
+
+        # Blink overlays (half/closed) — same OBP remap as open eyes.
+        eye_layout = (
+            (1, 24, 16, True), (0, 32, 16, True),
+            (3, 24, 24, True), (2, 32, 24, True),
+            (0, 56, 16, False), (1, 64, 16, False),
+            (2, 56, 24, False), (3, 64, 24, False),
+        )
+        # Re-compose blank-face pika for overlays (open eyes already baked).
+        blank_face = matte_color0(compose(13, 9, pika_cells))
+        for suffix, base in (("eyes_half", 4), ("eyes_closed", 8)):
+            overlay = Image.new("RGBA", (48, 16), (255, 255, 255, 0))
+            overlay.paste(blank_face.crop((24, 16, 72, 32)), (0, 0))
+            for ob_index, px, py, flip in eye_layout:
+                eye = ob_clear[base + ob_index].copy()
+                _apply_title_obp0(eye)
+                if flip:
+                    eye = eye.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                overlay.paste(eye, (px - 24, py - 16), eye)
+            _save_png(overlay, os.path.join(assets_dir, f"title/{suffix}.png"))
 
     falling_star = raw_2bpp(
         "FallingStar", 8, 8, "intro/falling_star.png",
@@ -2015,8 +2116,52 @@ def extract_field(rom, symbols, manifest, out_dir, assets_dir):
         _decode_2bpp(bytes(reordered), 40, 16),
         os.path.join(assets_dir, "credits/the_end.png"))
 
-    raw_2bpp(
-        "WorldMapTileGraphics", 32, 32, "townmap/tiles.png")
+    if _has_symbol(symbols, "SurfingPikachu1Graphics1"):
+        raw_2bpp("SurfingPikachu1Graphics1", 40, 104, "minigame/surf_1a.png", transparent=False)
+        raw_2bpp("SurfingPikachu1Graphics2", 128, 128, "minigame/surf_1b.png", transparent=True)
+        raw_2bpp("SurfingPikachu1Graphics3", 96, 96, "minigame/surf_1c.png", transparent=True)
+
+        beach_sym = _symbol(symbols, "SurfingMinigame_BeachIntroTilemap")
+        use_ctrl_sym = _symbol(symbols, "SurfingMinigame_UseControlPadTilemap")
+        to_surf_sym = _symbol(symbols, "SurfingMinigame_ToSurfRadTilemap")
+        title_sym = _symbol(symbols, "SurfingMinigame_TitleTilemap")
+        beach_intro = rom.bytes(beach_sym.bank, beach_sym.address, 240)
+        use_ctrl_pad = rom.bytes(use_ctrl_sym.bank, use_ctrl_sym.address, 15)
+        to_surf_rad = rom.bytes(to_surf_sym.bank, to_surf_sym.address, 13)
+        title_map = rom.bytes(title_sym.bank, title_sym.address, 72)
+        screen = [0xff] * (20 * 18)
+        for i in range(240):
+            screen[6 * 20 + i] = beach_intro[i]
+        for r in range(6):
+            for c in range(12):
+                screen[r * 20 + (4 + c)] = title_map[r * 12 + c]
+        for r in range(3):
+            for c in range(15):
+                screen[(7 + r) * 20 + (3 + c)] = 0xff
+        for i in range(15):
+            screen[7 * 20 + 3 + i] = use_ctrl_pad[i]
+        for i in range(13):
+            screen[9 * 20 + 4 + i] = to_surf_rad[i]
+
+        sym3 = _symbol(symbols, "SurfingPikachu1Graphics3")
+        raw_gfx3 = rom.bytes(sym3.bank, sym3.address, 144 * 16)
+        tiles = [_decode_2bpp(raw_gfx3[i*16:(i+1)*16], 8, 8) for i in range(144)]
+        blank = Image.new("RGBA", (8, 8), (255, 255, 255, 255))
+        title_bg = Image.new("RGBA", (160, 144), (255, 255, 255, 255))
+        for r in range(18):
+            for c in range(20):
+                t_id = screen[r * 20 + c]
+                if t_id == 0xff:
+                    tile_img = blank
+                elif t_id >= 0x80:
+                    idx = t_id - 0x80
+                    tile_img = tiles[idx] if idx < 144 else blank
+                else:
+                    idx = 128 + t_id
+                    tile_img = tiles[idx] if idx < 144 else blank
+                title_bg.paste(tile_img, (c * 8, r * 8))
+        _save_png(title_bg, os.path.join(assets_dir, "minigame/title_bg.png"))
+    raw_2bpp("WorldMapTileGraphics", 32, 32, "townmap/tiles.png")
     raw_1bpp(
         "TownMapCursor", 16, 16, "townmap/cursor.png",
         transparent=True)
@@ -2086,48 +2231,73 @@ def build(rom, symbols, manifest, out_dir, assets_dir, datasets):
     return results
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--rom", required=True,
         help="canonical US Pokemon Red, Blue, or Yellow ROM")
     parser.add_argument(
-        "--version", choices=sorted(VERSION_MANIFESTS), default="red",
-        help="select the shipped manifest for this version (default: red)")
+        "--version", choices=["auto", *sorted(VERSION_MANIFESTS)], default="auto",
+        help="select the shipped manifest for this version (default: detect from ROM)")
     parser.add_argument(
         "--manifest", default=None,
         help="explicit manifest path (overrides --version default path; "
              "RomImage hash still comes from the file's romSha1)")
-    parser.add_argument("--out", default="data/generated")
-    parser.add_argument("--assets", default="assets/generated")
+    parser.add_argument(
+        "--out", default=None,
+        help="generated data directory (default: version-specific cache path)")
+    parser.add_argument(
+        "--assets", default=None,
+        help="generated assets directory (default: version-specific cache path)")
     parser.add_argument("--clean", action="store_true")
     parser.add_argument(
         "--only", action="append", choices=DATASETS,
         help="build one dataset (repeatable); default builds all implemented")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     try:
         manifest_explicit = args.manifest is not None
-        manifest_path = resolve_manifest_path(args.version, args.manifest)
-        manifest = load_manifest(manifest_path)
-        version = version_for_manifest(
-            manifest, args.version, manifest_explicit=manifest_explicit)
-        expected_sha1 = manifest.get("romSha1") or VERSION_SHA1[version]
-        rom = RomImage(args.rom, expected_sha1)
+        requested_version = None if args.version == "auto" else args.version
+        if manifest_explicit:
+            manifest_path = resolve_manifest_path(
+                requested_version or "red", args.manifest)
+            manifest = load_manifest(manifest_path)
+            version = version_for_manifest(
+                manifest, requested_version, manifest_explicit=True)
+            expected_sha1 = manifest.get("romSha1") or VERSION_SHA1[version]
+            rom = RomImage(args.rom, expected_sha1)
+        elif requested_version is None:
+            version, rom = detect_rom_version(args.rom)
+            manifest_path = resolve_manifest_path(version, None)
+            manifest = load_manifest(manifest_path)
+            expected_sha1 = manifest.get("romSha1") or VERSION_SHA1[version]
+            if rom.sha1 != expected_sha1:
+                raise ValueError(
+                    f"unsupported ROM SHA-1 {rom.sha1}; expected {expected_sha1}")
+        else:
+            version = requested_version
+            manifest_path = resolve_manifest_path(version, None)
+            manifest = load_manifest(manifest_path)
+            version = version_for_manifest(manifest, version)
+            expected_sha1 = manifest.get("romSha1") or VERSION_SHA1[version]
+            rom = RomImage(args.rom, expected_sha1)
         symbols = SymbolTable(manifest["symbols"])
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    prefix = "" if version == "red" else version + os.sep
+    out_dir = args.out or prefix + os.path.join("data", "generated")
+    assets_dir = args.assets or prefix + os.path.join("assets", "generated")
     if args.clean:
-        for path in (args.out, args.assets):
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-    os.makedirs(args.out, exist_ok=True)
-    os.makedirs(args.assets, exist_ok=True)
+        kept = clean_generated(out_dir, assets_dir)
+        for path in kept:
+            print(f"kept {path} (not produced by this tool)")
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(assets_dir, exist_ok=True)
     datasets = tuple(args.only) if args.only else DATASETS
     try:
-        build(rom, symbols, manifest, args.out, args.assets, datasets)
+        build(rom, symbols, manifest, out_dir, assets_dir, datasets)
     except (ValueError, KeyError, IndexError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

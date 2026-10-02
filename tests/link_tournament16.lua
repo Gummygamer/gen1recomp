@@ -1,10 +1,12 @@
--- A full 16-player tournament, played out.
+-- A full 16-player bracket, played out through LinkBattle alone.
 --
 -- Sixteen distinct identities, six random Pokemon each, everyone mashing A,
 -- through every match of every round until one champion is left: 8 + 4 + 2 +
--- 1 = 15 real lockstep battles, each with the tournament match shape
+-- 1 = 15 real lockstep battles, each with the bracket match shape
 -- (turnLimit shot clock, keepNetOpen, forceLevel) plus a live spectator
--- rebuilding the same match from the relay's fan-out.
+-- rebuilding the same match from the relay's fan-out.  The bracket itself is
+-- fake transports here: this drives the arena battle path the launcher's
+-- rooms boot into, not any screen.
 --
 -- What this is actually checking, beyond "it finishes":
 --   * 15 consecutive lockstep matches agree turn by turn, so a desync is
@@ -181,6 +183,13 @@ local function playMatch(hostEntry, guestEntry, rnd, label)
   local function drive(side)
     local bt = side.bt
     if bt.result then return end
+    local top = side.game.stack:top()
+    if top and top.forceSwitch and top.party then
+      for i, mon in ipairs(top.party) do
+        if mon.hp > 0 then top.index = i break end
+      end
+      return
+    end
     if bt.phase ~= "menu" then side.menuFrames = 0 end
     if bt.phase == "moveSelect" then
       local usable = {}

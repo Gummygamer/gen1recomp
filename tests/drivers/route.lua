@@ -2348,7 +2348,7 @@ local DEFAULT_STOCK = { { "POTION", 10 } }
 --
 -- It does NOT follow the list convention cursorTo implements. On a list,
 -- up moves toward index 1; on a QuantityBox, up *increases* the count and
--- down decreases it, both wrapping around 1..max (QuantityBox.lua:29-33).
+-- down decreases it, both wrapping around 1..max (QuantityBox.lua:36-39).
 -- Handing it cursorTo therefore walked the wrong way and then oscillated
 -- between 1 and max forever, so buyItem gave up and bought nothing -- the
 -- exception being a target exactly one wrap below max, which is why the
@@ -2396,19 +2396,21 @@ local function sellItem(id)
       qtyTo(top().max or 1) -- the whole stack
       press("a")
       U.wait(6)
+      pressUntil(function() return isChoice() or isList() end, "a", 60)
     end
     if isChoice() then
       cursorTo("index", 1) -- YES
       press("a")
       U.wait(10)
     end
-    pressUntil(isList, "a", 20)
-    sold = ((G.save.inventory or {})[id] or 0) == 0
+    pressUntil(function() return isList() or isMenu() end, "a", 20)
+    sold =((G.save.inventory or {})[id] or 0) == 0
   end
   -- back out of the sell list to the BUY/SELL menu
-  for _ = 1, 10 do
+  for _ = 1, 60 do
     if isMenu() then break end
-    press("b")
+    local t = top()
+    if not (t and t.stay) then press("b") end
     U.wait(6)
   end
   return sold
@@ -2475,6 +2477,13 @@ local function buyItem(id, qty, where)
     say(("shop: could not reach the %s row"):format(id))
     return false
   end
+  local price = ((G.data.items or {})[id] or {}).price or 0
+  local afford = price > 0 and math.floor((G.save.money or 0) / price) or qty
+  if afford < 1 then
+    say(("shop: cannot afford one %s (¥%d of ¥%d)")
+        :format(id, G.save.money or 0, price))
+    return false
+  end
   press("a")
   U.wait(6)
   if not isQty() then
@@ -2482,8 +2491,7 @@ local function buyItem(id, qty, where)
     say(("shop: no quantity box opened for %s"):format(id))
     return false
   end
-  -- QuantityBox caps at .max (what we can afford), so never ask for more
-  local want = math.min(qty, top().max or qty)
+  local want = math.max(1, math.min(qty, top().max or qty, afford))
   if not qtyTo(want) then
     note("shop: could not set the quantity for " .. id, where)
     say(("shop: stuck setting %s quantity to %d on %s"):format(id, want,
@@ -2492,6 +2500,7 @@ local function buyItem(id, qty, where)
   end
   press("a")
   U.wait(6)
+  pressUntil(function() return isChoice() or isList() end, "a", 60)
   if isChoice() then
     if not cursorTo("index", 1) then return false end -- YES
     press("a")
@@ -2518,10 +2527,16 @@ end
 -- shopping spree that empties the wallet and then sits on the "not enough
 -- money" footer forever. B is the only safe key once a shop screen is up.
 local function closeShop()
-  for _ = 1, 40 do
-    if not (isList() or isQty() or isChoice() or isMenu()) then return true end
-    press("b")
-    U.wait(6)
+  for _ = 1, 80 do
+    local t = top()
+    if t and t.stay then
+      U.wait(6)
+    elseif not (isList() or isQty() or isChoice() or isMenu()) then
+      return true
+    else
+      press("b")
+      U.wait(6)
+    end
   end
   return false
 end
@@ -6350,7 +6365,8 @@ local function rideElevator(where, wantMap)
         if ow().map.id == m.id and p.cellX == sx and p.cellY == sy then
           faceDir(s[3])
           press("a")
-          if waitFor(isList, 60) then return true end
+          -- the prompt box types out first (engine/events/elevator.asm:2-3)
+          if waitFor(isList, 180) then return true end
         end
       end
     end
@@ -6366,7 +6382,7 @@ local function rideElevator(where, wantMap)
   local from = ow().map.id
   if not isList() and not pressPanel() then
     note("elevator: no floor menu", where)
-    say(("elevator on %s: the WHICH FLOOR? menu never opened"):format(from))
+    say(("elevator on %s: the floor list never opened"):format(from))
     return false
   end
   local idx
@@ -6504,10 +6520,7 @@ end
 -- to MR_FUJIS_HOUSE" however hard it searches. One FRESH_WATER opens every
 -- gate permanently.
 --
--- The machines are SIGNS (10,1) (11,1) (12,2), not clerks, so ops.shop
--- cannot drive them -- they open a plain ListMenu (data/scripts/story4.lua
--- vendingMachine) which stays up between purchases, showing a "popped out!"
--- box over itself each time.
+-- The machines are SIGNS (10,1) (11,1) (12,2), not clerks.
 --
 -- Buys several: one goes to the guards, and the roof's thirsty girl trades
 -- the others for TMs. Nothing later depends on those TMs, so a short bag or
@@ -6526,32 +6539,27 @@ function MANUAL.giveWater(where)
     note("giveWater: no vending machine here", where)
     return false
   end
-  -- a sign is read from the cell below it, facing up
-  if not ops.goto_({ x = sign.x, y = sign.y + 1 }) then
-    note("giveWater: cannot reach the vending machine", where)
-    return false
-  end
-  faceDir("up")
-  press("a")
-  U.wait(10)
-  if not waitFor(isList, 40) then
-    note("giveWater: the vending machine did not open", where)
-    say("giveWater: no vending menu appeared")
-    backOut()
-    return false
-  end
   local bought = 0
   for _ = 1, VENDING_WANT do
-    if not isList() then break end
-    cursorTo("index", 1) -- FRESH_WATER, the cheapest at 200
-    press("a")
-    U.wait(12)
-    -- the purchase (or "Not enough money") prints over the list; clear it
-    for _ = 1, 20 do
-      if isList() then break end
-      press("a")
-      U.wait(4)
+    if not ops.goto_({ x = sign.x, y = sign.y + 1 }) then
+      note("giveWater: cannot reach the vending machine", where)
+      break
     end
+    faceDir("up")
+    press("a")
+    U.wait(10)
+    if not pressUntil(isMenu, "a", 20) then
+      if bought == 0 then
+        note("giveWater: the vending machine did not open", where)
+        say("giveWater: no vending menu appeared")
+      end
+      backOut()
+      break
+    end
+    cursorTo("index", 1) -- FRESH WATER, the cheapest at 200
+    press("a")
+    U.wait(140)
+    mashUntilIdle()
     bought = bought + 1
   end
   backOut()

@@ -1,5 +1,5 @@
 -- Shared gamepad + raw joystick button tables for launcher and gameplay.
--- Hardware-measured NX overrides live in NX_* tables (see docs/switch-development.md).
+-- Hardware-measured NX overrides live in NX_* tables below.
 
 local GamepadMap = {}
 
@@ -8,6 +8,19 @@ GamepadMap.DEFAULT_GAMEPAD_BINDINGS = {
   dpup = "up", dpdown = "down", dpleft = "left", dpright = "right",
   a = "a", b = "b",
   start = "start", back = "select",
+}
+
+GamepadMap.TRIGGER_AXES = {
+  triggerleft = "triggerleft", lefttrigger = "triggerleft",
+  triggerright = "triggerright", righttrigger = "triggerright",
+}
+GamepadMap.TRIGGER_ON = 0.4
+GamepadMap.TRIGGER_OFF = 0.2
+
+GamepadMap.DEFAULT_PAD_ACTIONS = {
+  rightshoulder = "speedUp", triggerright = "speedUp",
+  leftshoulder = "speedDown", triggerleft = "speedDown",
+  -- FRLG: shoulders also drive l/r via Input dual-emit (see Input:gamepadpressed).
 }
 
 -- Switch: LÖVE/SDL labels south as "a" and east as "b", but Nintendo UX is
@@ -40,8 +53,10 @@ GamepadMap.NX_RAW_BUTTON_BINDINGS = {
 
 -- Raw index -> gamepad button *name* for RomImporter (then NX face swap applies).
 GamepadMap.RAW_TO_GAMEPAD_BUTTON = {
-  [1] = "a", [2] = "b",
+  [1] = "a", [2] = "b", [3] = "x", [4] = "y",
+  [5] = "leftshoulder", [6] = "rightshoulder",
   [7] = "back", [8] = "start", [9] = "back", [10] = "start",
+  [11] = "triggerleft", [12] = "triggerright",
 }
 
 GamepadMap.NX_RAW_TO_GAMEPAD_BUTTON = {
@@ -57,7 +72,10 @@ function GamepadMap._setForceNXForTests(v)
 end
 
 local function nxActive()
-  if GamepadMap._forceNXForTests then return true end
+  if GamepadMap._forceNXForTests == true then return true end
+  if GamepadMap._forceNXForTests == false and love and (love._os ~= "NX" and (not love.system or love.system.getOS() ~= "NX")) then
+    return false
+  end
   if love and love._os == "NX" then return true end
   if love and love.system and love.system.getOS() == "NX" then return true end
   return false
@@ -76,6 +94,20 @@ end
 
 function GamepadMap.mapGamepadButton(button)
   return GamepadMap.gamepadBindings()[button]
+end
+
+function GamepadMap.mapLauncherButton(button)
+  if nxActive() then
+    if button == "a" then return "b"
+    elseif button == "b" then return "a"
+    elseif button == "x" then return "y"
+    elseif button == "y" then return "x"
+    elseif button == "back" then return "select"
+    end
+  elseif button == "back" then
+    return "select"
+  end
+  return button
 end
 
 -- Select+face display chords (docs / Nintendo UX):
@@ -104,6 +136,17 @@ function GamepadMap.ignoreRawForJoystick(joystick)
     return joystick.isGamepad and joystick:isGamepad()
   end)
   return ok and isPad == true
+end
+
+-- conf.lua turns the mobile accelerometer-joystick off (#468), but guard the
+-- generic joystick path anyway: any sensor-style device that still reaches us
+-- has gravity pinning an axis past the deadzone, which would hide the touch
+-- overlay every instant and steer the player by tilt through the axis-1/2
+-- mapping (#459).  Real controllers arrive as SDL gamepads or named sticks,
+-- never as "* Accelerometer".
+function GamepadMap.isAccelerometer(joystick)
+  local name = joystick and joystick.getName and joystick:getName()
+  return name ~= nil and name:lower():find("accelerometer", 1, true) ~= nil
 end
 
 function GamepadMap.mapRawButton(index)

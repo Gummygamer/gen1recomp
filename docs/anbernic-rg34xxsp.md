@@ -40,6 +40,32 @@ Only the canonical 1 MiB US carts import:
 - Red: `ea9bcae617fdf159b045185467ae58b2e4a48b9a`
 - Blue: `d7037c83e1ae5b39bde3c30787637ba1d4c48ce2`
 
+## Updating
+
+The port updates itself from the launcher. When a newer release exists the
+footer chip reads **Update vX.Y.Z**: press it to download the new version, then
+press **Restart to update** to relaunch and start using it. Nothing inside the
+port folder is rewritten, so an update that fails or is interrupted still boots
+the version you already had.
+
+An update replaces the game's code and data. It cannot replace the LÖVE runtime
+the port ships, so a release that needs a newer runtime is applied differently:
+the chip then reads **Download port update** and saves
+`gen1recomp-<version>-rg34xxsp-stockos64-mod.zip` into
+
+```
+Roms/PORTS/gen1recomp/conf/love/pokemon-love2d/updates/
+```
+
+That case is finished on a computer — unzip the file and copy the
+`Gen1recomp.sh` and `gen1recomp/` it contains over the copies on the SD card,
+exactly as in [Install](#install) above. Your saves sit beside the game
+(`portable.txt`) and are untouched by either kind of update.
+
+The launcher exports `POKEPORT_RG34XXSP=1`, which is how the updater knows this
+is the RG34XXSP port and offers the matching port package rather than a desktop
+AppImage.
+
 ## Launcher controls
 
 | Input              | Action             |
@@ -54,16 +80,6 @@ In-game controls use the normal PortMaster / SDL pad map, rebindable under
 **OPTIONS → CONTROLS**.
 
 ## Notes
-
-**GBC FX is off on this device.** The launcher exports `POKEPORT_GBCFX=0`,
-which hides the GBC FX row from OPTIONS, pins the level to OFF, and clears a
-level carried over in an `options.lua` from another machine. The H700's Mali
-GPU is in the same class as the phone GPUs that compile that present pass and
-then show a black frame (issue #136), and `love.system.getOS()` reports
-`"Linux"` here, so the Android gate would not have caught it. Every other
-display option — COLORS, TILT, ZOOM, VOID FILL, MAX FPS — works normally. If
-your device turns out to handle the pass, launch with `POKEPORT_GBCFX=1` to
-put the row back.
 
 **PERFORMANCE defaults to LOW here.** The OPTIONS → PERFORMANCE tier defaults
 to AUTO, which reads this device as an ARM Linux handheld and resolves to

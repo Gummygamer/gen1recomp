@@ -14,6 +14,7 @@ if not Data.maps then Data:load() end
 require("src.render.Font").load(Data)
 
 local PaletteFX = require("src.render.PaletteFX")
+local GameVersion = require("src.core.GameVersion")
 local Sound = require("src.core.Sound")
 local DexEntryMenu = require("src.ui.DexEntryMenu")
 local EvolutionState = require("src.ui.EvolutionState")
@@ -23,6 +24,8 @@ local TradeAnim = require("src.ui.TradeAnim")
 
 local savedCry = Sound.playCry
 Sound.playCry = function() end
+local savedGameVersion = GameVersion.get()
+GameVersion.set("red")
 
 local function uiRects(draw)
   PaletteFX.clearTrueColor()
@@ -48,8 +51,13 @@ local game = {
 local dex = DexEntryMenu.new(game, "PIKACHU")
 check(dex.spriteTrueColor == true,
       "Pokedex keeps a Pokemon sprite's trueColor flag")
+-- engine/menus/pokedex.asm:500-506
+dex.picDelay = 0
 local dexRects = uiRects(function() dex:draw() end)
-local dx, dy = 8, math.max(0, 60 - dex.sprite:getHeight())
+-- engine/menus/pokedex.asm:503: the pic sits in the 7x7 window at (8,8)
+local dw, dh = dex.sprite:getDimensions()
+local dx = 8 + math.floor((8 - dw / 8) / 2) * 8
+local dy = 8 + (7 - dh / 8) * 8
 check(#dexRects == 1 and dexRects[1].x == dx and dexRects[1].y == dy
       and dexRects[1].w == dex.sprite:getWidth()
       and dexRects[1].h == dex.sprite:getHeight(),
@@ -60,6 +68,8 @@ check(evolving.oldSpriteTrueColor == true,
       "evolution keeps the current Pokemon sprite's trueColor flag")
 check(evolving.newSpriteTrueColor == true,
       "evolution keeps the evolved Pokemon sprite's trueColor flag")
+-- engine/movie/evolution.asm:40
+evolving.loading = nil
 local evoRects = uiRects(function() evolving:draw() end)
 local ex = math.floor((160 - evolving.oldSprite:getWidth()) / 2)
 local ey = math.max(8, 64 - evolving.oldSprite:getHeight())
@@ -93,6 +103,7 @@ local titleGame = {
            field = { title = { cycleSpecies = { "PIKACHU" } } } },
 }
 local title = TitleState.new(titleGame, {})
+title.phase, title.scy = "loop", 0
 local titleSprite, titleTrueColor = title:currentSprite()
 check(titleSprite and titleTrueColor,
       "title cache keeps a Pokemon sprite's trueColor flag")
@@ -123,5 +134,6 @@ check(#oakRects == 1 and oakRects[1].x == ox and oakRects[1].y == oy
 def.trueColor = savedTrueColor
 raichu.trueColor = savedRaichuTrueColor
 Sound.playCry = savedCry
+GameVersion.set(savedGameVersion)
 PaletteFX.clearTrueColor()
 S.finish()

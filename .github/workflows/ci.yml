@@ -12,10 +12,11 @@ name: ci
 #
 on:
   push:
-    # Integration branch + release branch. PRs already run via pull_request
-    # (any base); this list is only for post-merge push runs.
     branches: [dev, main]
+  # PRs into dev only: a dev -> main ship PR reuses the required checks the
+  # dev push already put on the same head SHA, so it needs no second run.
   pull_request:
+    branches: [dev]
 
 # a force-push while CI is mid-run should cancel the stale run, not queue
 concurrency:
@@ -94,8 +95,8 @@ jobs:
         if: github.repository == 'bryanthaboi/gen1recomp'
         uses: actions/upload-artifact@v7
         with:
-          name: gen1recomp-ios-ipa
-          path: dist/ios/gen1recomp.ipa
+          name: gen1recomp++-ios-ipa
+          path: dist/ios/gen1recomp++.ipa
           if-no-files-found: error
           retention-days: 7
       - name: clean up signing keychain
@@ -120,7 +121,7 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -Eq '^(scripts/build_switch\.sh$|scripts/switch/|docs/switch-.*\.md$|tests/switch_ci_workflows_test\.lua$|tests/switch_transfer_docs_test\.lua$|\.github/workflows/(ci|release|switch-artifact-comment)\.yml$|src/core/(NxAssetOverlay|Platform|GameVersion)\.lua$|src/import/CacheFs\.lua$|tests/engine/(assets_version_fallback|nx_generated_guard|nx_yellow_boot|switch_diagnostics)_test\.lua$|tests/engine/platform_nx)'; then
+          if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -Eq '^(scripts/build_switch\.sh$|scripts/switch/|docs/switch-.*\.md$|tests/switch_ci_workflows_test\.lua$|tests/switch_transfer_docs_test\.lua$|\.github/workflows/(ci|release|platform-artifact-comment)\.yml$|src/core/(NxAssetOverlay|Platform|GameVersion)\.lua$|src/import/CacheFs\.lua$|tests/engine/(assets_version_fallback|nx_generated_guard|nx_yellow_boot|switch_diagnostics|cache_fs_gold_nx_load)_test\.lua$|tests/engine/platform_nx)'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -151,6 +152,9 @@ jobs:
           luajit tests/engine/assets_version_fallback_test.lua
           luajit tests/engine/nx_generated_guard_test.lua
           luajit tests/engine/nx_yellow_boot_test.lua
+          luajit tests/engine/cache_fs_gold_nx_load_test.lua
+          luajit tests/engine/cache_fs_blue_mount_test.lua
+          luajit tests/engine/switch_diagnostics_test.lua
 
   switch-build:
     name: Switch fused build
@@ -181,9 +185,357 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  xbox-uwp-changes:
+    name: detect Xbox UWP changes
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.paths.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -Eq '^(ports/uwp/|scripts/build_xbox_uwp\.sh$|scripts/xbox-uwp/|scripts/pack_love\.sh$|\.github/workflows/(ci|release)\.yml$|src/core/Platform\.lua$|src/import/(CacheFs|LauncherView|RomImporter)\.lua$|src/update/Check\.lua$|tests/engine/(platform_nx|uwp_baseroms|uwp_native_picker)_test\.lua$|tests/rom_importer_double_pick_test\.lua$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  xbox-uwp-selftest:
+    name: Xbox UWP offline selftest
+    needs: xbox-uwp-changes
+    if: needs.xbox-uwp-changes.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Xbox UWP offline selftest
+        run: bash scripts/xbox-uwp/selftest_build_xbox_uwp.sh
+      - name: Build shared payload
+        run: |
+          scripts/pack_love.sh \
+            --output .bazinga/work/ci-game.love \
+            --listing .bazinga/work/ci-love-listing.txt \
+            --version 0.0.0
+      - name: Upload shared payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: gen1recomp-xbox-uwp-payload
+          path: .bazinga/work/ci-game.love
+          if-no-files-found: error
+          retention-days: 1
+
+  xbox-uwp-build:
+    name: Xbox UWP build
+    needs: [xbox-uwp-changes, xbox-uwp-selftest]
+    if: |
+      always()
+      && needs.xbox-uwp-changes.outputs.changed == 'true'
+      && needs.xbox-uwp-selftest.result == 'success'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download shared payload
+        uses: actions/download-artifact@v8
+        with:
+          name: gen1recomp-xbox-uwp-payload
+          path: .bazinga/work
+      - name: Build Xbox UWP package
+        shell: bash
+        run: |
+          bash scripts/build_xbox_uwp.sh \
+            --release \
+            --version 0.0.0 \
+            --game-love .bazinga/work/ci-game.love
+      - name: Upload Xbox UWP package
+        uses: actions/upload-artifact@v7
+        with:
+          name: gen1recomp-xbox-uwp
+          path: |
+            dist/xbox-uwp/gen1recomp-0.0.0-xbox-uwp.zip
+            dist/xbox-uwp/gen1recomp-0.0.0-xbox-uwp.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-arm64-changes:
+    name: detect Linux arm64 changes
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.paths.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -Eq '^(scripts/build_linux_arm64\.sh$|scripts/linux-arm64/|scripts/pack_love\.sh$|docs/linux-arm64-build\.md$|\.github/workflows/(ci|release)\.yml$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux-arm64-selftest:
+    name: Linux arm64 offline selftest
+    needs: linux-arm64-changes
+    if: needs.linux-arm64-changes.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Deliberately on x86_64: everything this gate checks (pins, the
+      # host-arch guard, the dependency exclude list, the AppRun fusion
+      # contract) is answerable without a container or an aarch64 machine,
+      # so the slow native job below only ever starts on a sane tree.
+      - name: Linux arm64 offline selftest
+        run: bash scripts/linux-arm64/selftest_build_linux_arm64.sh
+
+  linux-arm64-build:
+    name: Linux arm64 AppImage build
+    needs: [linux-arm64-changes, linux-arm64-selftest]
+    if: |
+      always()
+      && needs.linux-arm64-changes.outputs.changed == 'true'
+      && needs.linux-arm64-selftest.result == 'success'
+    # No fork restriction, unlike switch-build: this needs no secrets and no
+    # self-hosted hardware, just GitHub's free arm64 runner for public repos,
+    # so contributors get the same coverage on their own PRs.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the aarch64 AppImage
+        run: |
+          set -euo pipefail
+          scripts/build_linux_arm64.sh --version 0.0.0
+      # Shared with the release workflow so shipped images get the same
+      # self-contained / glibc-floor checks as PR builds.
+      - name: Verify the AppImage is self-contained and bullseye-compatible
+        run: bash scripts/linux-arm64/verify_appimage.sh dist/linux-arm64/gen1recomp-0.0.0-linux-arm64.AppImage
+      - name: Upload the AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: gen1recomp-linux-arm64
+          path: |
+            dist/linux-arm64/gen1recomp-0.0.0-linux-arm64.AppImage
+            dist/linux-arm64/gen1recomp-0.0.0-linux-arm64.AppImage.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-flatpak-changes:
+    name: detect Linux Flatpak changes
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.paths.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -Eq '^(scripts/build_flatpak\.sh$|flatpak/|scripts/pack_love\.sh$|docs/linux-flatpak\.md$|\.github/workflows/(ci|release)\.yml$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux-flatpak-build:
+    name: Linux Flatpak build
+    needs: linux-flatpak-changes
+    if: needs.linux-flatpak-changes.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install flatpak-builder deps
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder elfutils imagemagick
+      - name: Build Flatpak bundle
+        run: |
+          set -euo pipefail
+          scripts/build_flatpak.sh --version 0.0.0
+      - name: Upload the Flatpak
+        uses: actions/upload-artifact@v7
+        with:
+          name: gen1recomp-linux-flatpak
+          path: |
+            dist/flatpak/gen1recomp-0.0.0-linux.flatpak
+            dist/flatpak/gen1recomp-0.0.0-linux.flatpak.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  desktop-builds:
+    name: macOS, Windows, and Linux x86_64 builds
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: install desktop build tools
+        run: |
+          brew install imagemagick squashfs
+          love_zip="$RUNNER_TEMP/love-11.5-macos.zip"
+          curl -fL --retry 2 --connect-timeout 15 \
+            "https://github.com/love2d/love/releases/download/11.5/love-11.5-macos.zip" \
+            -o "$love_zip"
+          love_root="$RUNNER_TEMP/love-11.5"
+          rm -rf "$love_root"
+          mkdir -p "$love_root"
+          unzip -q "$love_zip" -d "$love_root"
+          love_app="$(find "$love_root" -maxdepth 2 -type d -name 'love.app' -print -quit)"
+          [ -d "$love_app" ] || { echo "LÖVE.app was not found"; exit 1; }
+          echo "LOVE_APP=$love_app" >> "$GITHUB_ENV"
+      - name: build desktop packages
+        run: scripts/build.sh all --version 0.0.0 --no-notarize
+      - name: upload macOS artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gen1recomp-macos
+          path: dist/mac/gen1recomp-macos.zip
+          if-no-files-found: error
+          retention-days: 7
+      - name: upload Windows artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gen1recomp-win64
+          path: dist/win/gen1recomp-win64.zip
+          if-no-files-found: error
+          retention-days: 7
+      - name: upload Linux x86_64 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gen1recomp-linux-x86_64
+          path: |
+            dist/linux/gen1recomp-linux-x86_64.AppImage
+            dist/linux/gen1recomp-linux-x86_64.AppImage.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  android-build:
+    name: Android APK build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          # The action's default package list is "tools platform-tools".
+          # Google's repository no longer serves the legacy `tools`
+          # package, so the default install now fails inside the action
+          # ("Failed to find package 'tools'") before any step of this
+          # repository's runs.  Everything the build needs is installed
+          # by the step below.
+          packages: platform-tools
+      - name: install Android build dependencies
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;25.2.9519653"
+      - name: build Android APK
+        run: scripts/build_android.sh --version 0.0.0
+      - name: upload Android artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gen1recomp-android-apk
+          path: dist/android/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  rg34xxsp-build:
+    name: RG34XXSP PortMaster build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: build RG34XXSP package
+        run: ./build-rg34xxsp.sh --version 0.0.0
+      - name: upload RG34XXSP artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gen1recomp-rg34xxsp
+          path: dist/rg34xxsp/gen1recomp-rg34xxsp-stockos64-mod.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-arm-sbc-build:
+    name: Linux ARM SBC PortMaster build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: build Linux ARM SBC package
+        env:
+          GEN1RECOMP_SOURCE_DIR: ${{ github.workspace }}
+        run: ./build-linux-arm-sbc.sh --version 0.0.0
+      - name: upload Linux ARM SBC artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gen1recomp-linux-arm-sbc
+          path: dist/linux-arm-sbc/gen1recomp-sbc-portmaster.zip
+          if-no-files-found: error
+          retention-days: 7
+
   headless:
     name: headless suites (no ROM)
     runs-on: ubuntu-latest
+    needs: headless-groups
+    if: ${{ always() }}
+    steps:
+      - name: require every headless group to pass
+        env:
+          HEADLESS_RESULT: ${{ needs.headless-groups.result }}
+        run: |
+          if [ "$HEADLESS_RESULT" != "success" ]; then
+            echo "Headless groups finished with $HEADLESS_RESULT" >&2
+            exit 1
+          fi
+
+  headless-groups:
+    name: headless / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: engine
+            name: engine
+          - group: gen2
+            name: Gen 2
+          - group: save-codecs
+            name: save codecs
+          - group: save-records
+            name: Gen 3 save records
+          - group: save-world
+            name: Gen 3 save world
+          - group: save-editor
+            name: save editor
+          - group: mods
+            name: mod tools
+          - group: game3
+            name: Gen 3 runtime
     steps:
       - uses: actions/checkout@v7
 
@@ -193,18 +545,20 @@ jobs:
       - name: install luajit
         run: sudo apt-get update && sudo apt-get install -y luajit
 
+      - name: install Pillow
+        run: python3 -m pip install --upgrade pillow
+
       - name: interpreter version
         run: luajit -v
 
-      - name: run every ROM-free tier
-        run: ./scripts/test.sh
+      - name: run ROM-free group
+        run: ./scripts/test.sh --group "${{ matrix.group }}"
 
   fixture-dataset:
     name: fixture dataset integrity
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update && sudo apt-get install -y luajit
       - run: python3 -m pip install --upgrade pillow
 
       # the fixture PNGs are committed (they are 8x8 placeholders, not
@@ -225,13 +579,8 @@ jobs:
           print(f"\n{len(paths)} fixture assets valid")
           PY
 
-      # the fingerprint golden is the parity tripwire; prove it still
-      # matches the dataset on a clean checkout
-      - name: fingerprint gate
-        run: luajit tests/engine/gate_fingerprint.lua
-
-      - name: parity-guarantee meta-test
-        run: luajit tests/engine/gate_meta_coverage.lua
+      # the fingerprint parity gates (gate_fingerprint / gate_meta_coverage)
+      # run in the headless job via run_engine; this job only guards the PNGs
 
   # Only the differ is under test here, and the job is named for that.  The
   # capture half of the golden pipeline does not exist: a POKEPORT_DRIVER
@@ -319,3 +668,24 @@ jobs:
           if [ "$found" = "0" ]; then
             echo "no committed mods to lint"
           fi
+
+  luacheck:
+    name: engine lint (luacheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install luacheck
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y lua5.4 liblua5.4-dev luarocks
+          sudo luarocks install luacheck || sudo apt-get install -y lua-check
+          luacheck --version
+
+      - name: luacheck gate (undefined globals, unreachable code)
+        run: ./scripts/lint.sh --gate
+
+      - name: luacheck full report (advisory)
+        continue-on-error: true
+        run: ./scripts/lint.sh
