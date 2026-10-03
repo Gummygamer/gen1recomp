@@ -7,6 +7,23 @@ It is presentational: the map, the scripts, the collision and the save are
 untouched. Walk, talk, battle and warp exactly as before; only the world pass
 is drawn differently.
 
+## Requirements
+
+This mod needs the Gen 3 render-pipeline seam in the engine: `Display.drawFieldPlane`
+calling `Pipelines.drawWorld`, `Game3` installing `Pipelines`, and
+`render_pipelines` kept off `Schemas.GEN3`'s drop list. Without it the mod loads
+but its pipeline is dropped on a FireRed / LeafGreen boot and nothing changes.
+
+The seam is in commit `bb7973d1` of
+[Gummygamer/gen1recomp](https://github.com/Gummygamer/gen1recomp) (branch `dev`);
+`docs/modding.md` there documents the Gen 3 ctx under "Pipelines on FireRed and
+LeafGreen". A stock upstream build does not have it yet.
+
+## Installing
+
+Download the `.zip` from a release and use **MODS > Import mod .zip** in the game,
+or copy this folder to `mods/voxel_frlg/` (manifest.json at its top level).
+
 ## Using it
 
 - **OPTIONS > EXTRAS > VOXEL** cycles OFF / 15 / 35 / 50 / 65 -- the angle in
