@@ -13,8 +13,8 @@ This mod needs the Gen 3 render-pipeline seam in the engine: `Display.drawFieldP
 calling `Pipelines.drawWorld`, `Game3` installing `Pipelines`, and
 `render_pipelines` kept off `Schemas.GEN3`'s drop list. Without it the mod loads
 but its pipeline is dropped on a FireRed / LeafGreen boot and nothing changes.
-Day/night also reads `ctx.outdoor`, `ctx.mapType` and `ctx.weather`; on a build
-without them everything is lit like an interior.
+Day/night also reads `ctx.outdoor`, `ctx.mapType` and `ctx.weather`, added in
+commit `29edec3a`; on a build without them everything is lit like an interior.
 
 The seam is in commit `bb7973d1` of
 [Gummygamer/gen1recomp](https://github.com/Gummygamer/gen1recomp) (branch `dev`);
