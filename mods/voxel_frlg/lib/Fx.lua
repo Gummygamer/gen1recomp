@@ -9,7 +9,8 @@
 -- the quad is depth-tested like everything else.
 --
 -- Rain, snow, fog and sandstorm are screen-space in the original, so they go
--- over the finished scene unprojected.
+-- over the finished scene unprojected -- and so does the dark-cave (Flash)
+-- mask, a hole around the view's centre, which the camera keeps on the player.
 
 local V = ...
 local Gfx = V.require("Gfx")
@@ -77,8 +78,9 @@ function Fx.draw(ctx)
   Gfx.depthBias(0)
 end
 
--- Weather over the finished scene, which is `target` (a w x h canvas).
-function Fx.weather(ctx, target, w, h)
+-- Screen-space layers over the finished scene, which is `target` (a w x h
+-- canvas): weather, then the Flash mask.
+function Fx.screen(ctx, target, w, h)
   if not target then return end
   love.graphics.push("all")
   love.graphics.setCanvas(target)
@@ -86,6 +88,7 @@ function Fx.weather(ctx, target, w, h)
   love.graphics.scale(w / ctx.viewW, h / ctx.viewH)
   love.graphics.setBlendMode("alpha")
   pcall(ctx.drawFx, "weather")
+  pcall(ctx.drawFx, "flash")
   love.graphics.pop()
 end
 

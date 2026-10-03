@@ -28,7 +28,7 @@ returns, falling back to the flat draw when it returns nil.
 | --- | --- |
 | `lib/Terrain.lua` | meshes the metatile grid into chunks of columns, one mesh per atlas and layer |
 | `lib/Actors.lua` | has the engine draw each actor into an atlas slot, stands the slot up as a card |
-| `lib/Fx.lua` | lays the engine's 2D ground effects on the map; draws weather over the scene |
+| `lib/Fx.lua` | lays the engine's 2D ground effects on the map; draws weather and the Flash mask over the scene |
 | `lib/Gfx.lua` | the shader, the colour + depth canvas, the camera |
 
 The mod requires no engine module: everything it needs comes through the ctx.
@@ -44,7 +44,6 @@ tall. Tune `Terrain.RUN_HEIGHT`.
 
 - Tall grass lies at the avatar's feet instead of over them: a card cannot be
   overdrawn by a ground effect.
-- Dark caves (Flash) draw lit; the flat game's circular mask is not projected.
 - No reflections, shadows or day/night; the water is the engine's own animated
   tiles on a sunken column.
 - Emerald is not claimed: it shares FieldView but this has only been run on

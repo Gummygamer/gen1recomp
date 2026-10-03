@@ -99,7 +99,7 @@ local function drawWorld(ctx)
   Fx.draw(ctx)
   Actors.draw(list, groundAt(ctx), math.rad((90 - tilt) * 0.8))
   local scene = Gfx.finish()
-  Fx.weather(ctx, scene, sw, sh)
+  Fx.screen(ctx, scene, sw, sh)
   return scene
 end
 

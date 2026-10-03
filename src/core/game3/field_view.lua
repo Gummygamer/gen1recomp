@@ -1869,6 +1869,7 @@ end
 --              feet (it cannot be drawn over a card's feet, so it lies at them),
 --              the door-opening animation, weather that sits below the actors
 --   "weather"  rain, snow, fog and sandstorm, over everything
+--   "flash"    the dark-cave mask (Flash), over everything, centred on the view
 function FieldView.drawPipelineFx(frame, which)
   love.graphics.setColor(1, 1, 1, 1)
   local camX, camY, w, h = frame.camX, frame.camY, frame.viewW, frame.viewH
@@ -1883,6 +1884,9 @@ function FieldView.drawPipelineFx(frame, which)
   elseif which == "weather" then
     local FieldWeather = modFieldWeather()
     if FieldWeather and FieldWeather.draw then FieldWeather.draw(camX, camY, w, h) end
+  elseif which == "flash" then
+    -- the dark-cave mask: a hole around the view's centre, which is the player
+    drawFlashMask(w, h)
   end
   love.graphics.setColor(1, 1, 1, 1)
 end

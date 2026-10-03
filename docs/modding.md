@@ -735,7 +735,7 @@ battle transition wipe, shops and menus draw flat, as they do under TILT.
 | `ctx.tileset(pair)` | the atlas a pair draws from |
 | `ctx.actors()` | the sorted actors as `{ x, y, kind, over, ref }`, `(x, y)` being the foot point in world pixels |
 | `ctx.drawActor(actor, ox, oy)` | have the engine draw one actor with its cell's top-left at `(ox, oy)` of the current canvas, so OW sprites, palettes and walk phases are never reimplemented |
-| `ctx.drawFx(which)` | the engine's 2D field effects in view coordinates: `"ground"` (door animations, tall grass, weather below the actors) and `"weather"` (screen-space rain, snow, fog) |
+| `ctx.drawFx(which)` | the engine's 2D field effects in view coordinates: `"ground"` (door animations, tall grass, weather below the actors) and `"weather"` (screen-space rain, snow, fog) and `"flash"` (the dark-cave mask, centred on the player) |
 
 A cell is `{ mid, pair, slot, ts, void, coll, elev, behavior, behaviorName,
 class, hasUnder, hasOver }`. `ts` is the pair's atlas (`image`, `overImage`,

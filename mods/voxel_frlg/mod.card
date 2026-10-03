@@ -16,7 +16,6 @@ return {
     },
     known = {
       "tall grass lies at the avatar's feet instead of over them",
-      "dark caves draw lit: the Flash mask is not projected",
       "FireRed and LeafGreen only; Emerald is not claimed (untested there)",
     },
   },
