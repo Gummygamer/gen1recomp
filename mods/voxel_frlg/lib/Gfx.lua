@@ -36,14 +36,19 @@ local SHADER = [[
   uniform vec3 fogColor;
   uniform vec2 fogRange;       // x = where haze starts, y = where it is total
   uniform float cutoff;        // alpha below this is discarded, not blended
+  uniform float soft;          // 1 = blend by alpha instead (shadows)
   vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     vec4 p = Texel(tex, tc);
+    float f = clamp((vDist - fogRange.x) / max(fogRange.y - fogRange.x, 1.0), 0.0, 1.0);
+    if (soft > 0.5) {
+      // a shadow fades out into the haze with everything else
+      return vec4(p.rgb * color.rgb, p.a * color.a * (1.0 - f * f));
+    }
     // alpha-tested rather than blended: a sprite or an eave never writes its
     // transparent texels into the depth buffer, so it cannot cut a hole in
     // what stands behind it
     if (p.a < cutoff) discard;
     vec3 rgb = p.rgb * color.rgb;
-    float f = clamp((vDist - fogRange.x) / max(fogRange.y - fogRange.x, 1.0), 0.0, 1.0);
     return vec4(mix(rgb, fogColor, f * f), 1.0);
   }
 #endif
@@ -130,6 +135,7 @@ function Gfx.begin(w, h, vp, eye, sky, fogNear, fogFar)
   pcall(sh.send, sh, "fogRange", { fogNear, fogFar })
   pcall(sh.send, sh, "cutoff", 0.5)
   pcall(sh.send, sh, "depthBias", 0)
+  pcall(sh.send, sh, "soft", 0)
   return true
 end
 
@@ -139,6 +145,14 @@ end
 function Gfx.depthBias(bias)
   local sh = Gfx.shader()
   if sh then pcall(sh.send, sh, "depthBias", bias or 0) end
+end
+
+-- Blend by alpha, testing depth but not writing it, for what is drawn next (a
+-- shadow); pass false to go back to the alpha-tested opaque draws.
+function Gfx.soft(on)
+  local sh = Gfx.shader()
+  if sh then pcall(sh.send, sh, "soft", on and 1 or 0) end
+  love.graphics.setDepthMode("lequal", not on)
 end
 
 -- Close the pass and hand back its colour canvas.

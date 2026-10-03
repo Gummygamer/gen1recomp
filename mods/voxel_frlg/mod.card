@@ -15,7 +15,7 @@ return {
       "VOXEL options row under EXTRAS and hotkey 6 (OFF / 15 / 35 / 50 / 65 degrees)",
     },
     known = {
-      "tall grass lies at the avatar's feet instead of over them",
+      "no day/night or lighting; the camera does not rotate because movement is map-relative",
       "FireRed and LeafGreen only; Emerald is not claimed (untested there)",
     },
   },

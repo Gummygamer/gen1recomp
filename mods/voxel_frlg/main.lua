@@ -97,6 +97,7 @@ local function drawWorld(ctx)
   if not Gfx.begin(sw, sh, vp, eye, SKY, dist * 1.6, dist * 5.5) then return nil end
   Terrain.draw(chunks)
   Fx.draw(ctx)
+  Actors.shadows(list, groundAt(ctx))
   Actors.draw(list, groundAt(ctx), math.rad((90 - tilt) * 0.8))
   local scene = Gfx.finish()
   Fx.screen(ctx, scene, sw, sh)

@@ -44,7 +44,7 @@ returns, falling back to the flat draw when it returns nil.
 | piece | what it does |
 | --- | --- |
 | `lib/Terrain.lua` | meshes the metatile grid into chunks of columns, one mesh per atlas and layer |
-| `lib/Actors.lua` | has the engine draw each actor into an atlas slot, stands the slot up as a card |
+| `lib/Actors.lua` | has the engine draw each actor into an atlas slot, stands the slot up as a card, and drops a soft shadow under it |
 | `lib/Fx.lua` | lays the engine's 2D ground effects on the map; draws weather and the Flash mask over the scene |
 | `lib/Gfx.lua` | the shader, the colour + depth canvas, the camera |
 
@@ -54,15 +54,24 @@ The mod requires no engine module: everything it needs comes through the ctx.
 
 Nothing in a metatile says how tall it is, so a solid cell stands as tall as the
 structure it belongs to, measured by the run of solid cells down its column: one
-cell deep (a fence, a sign) is low, two (a tree) medium, three or more (a house)
-tall. Tune `Terrain.RUN_HEIGHT`.
+cell deep (a fence, a sign) is low, two medium, three or more (a tree, a house)
+tall. A walkable cell whose over layer belongs to the solid cell south of it (a
+tree's canopy, a roof's top edge) counts as part of that structure. Tune
+`Terrain.RUN_HEIGHT`.
+
+## What carries over from the flat game
+
+- Tall grass draws over the avatar's legs, and the shoreline reflection of a
+  character on a pond's edge appears, because the engine draws both as actors
+  and ground effects that this mod places in the scene.
+- Door animations, weather and the Flash cave mask too.
 
 ## Known limits
 
-- Tall grass lies at the avatar's feet instead of over them: a card cannot be
-  overdrawn by a ground effect.
-- No reflections, shadows or day/night; the water is the engine's own animated
-  tiles on a sunken column.
+- No day/night or lighting; shading is a fixed face shade plus the soft blob
+  shadow under each character.
+- The camera does not rotate: movement is map-relative (up is always north), so
+  a rotated view would make the controls disagree with the picture.
 - Emerald is not claimed: it shares FieldView but this has only been run on
   FireRed and LeafGreen.
 

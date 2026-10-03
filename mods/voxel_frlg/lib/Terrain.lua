@@ -34,8 +34,9 @@ Terrain.HEIGHT = {
   ledge = 0,
   water = -3,
 }
-Terrain.RUN_HEIGHT = { 8, 14, 22 }     -- by run length, 1 / 2 / 3 or more
--- an over layer on a walkable cell is an overhead sheet (a canopy, a gate)
+Terrain.RUN_HEIGHT = { 8, 14, 18, 22 }     -- by run length, 1 / 2 / 3 / 4 or more
+-- an over layer on walkable ground with nothing solid south of it is an
+-- overhead sheet held above it (a gate, a bridge)
 Terrain.OVERHEAD = 18
 
 -- Face shade: top full, the sides step down so a block reads as solid.
@@ -68,8 +69,13 @@ function Terrain.invalidate()
   lastEpoch = nil
 end
 
-local function isSolid(class)
-  return class == "wall" or class == "void"
+-- A cell stands up if it is solid, or if it is the overhang of something solid:
+-- a tree's canopy and a roof's top edge are walkable cells whose over layer
+-- belongs to the structure just south of them.  Left as a sheet at a fixed
+-- height they float, with a hairline of ground showing under the edge, so they
+-- join the structure instead.
+local function isSolid(c)
+  return c.class == "wall" or c.class == "void" or c.attached == true
 end
 
 -- Build one chunk.  Reads a skirt around it: one cell either side so the
@@ -110,17 +116,26 @@ local function build(ctx, cx0, cy0)
       end
     end
   end
+  -- overhangs, swept south to north so a two-row overhang chains
+  for y = top + rows - 2, top, -1 do
+    for x = x0 - 1, x0 + CHUNK do
+      local c, south = info[idx(x, y)], info[idx(x, y + 1)]
+      if c and south and c.class == "ground" and c.hasOver and isSolid(south) then
+        c.attached = true
+      end
+    end
+  end
   -- column heights, for the cells whose tops get drawn and their neighbours
   local function runHeight(x, y)
     local run = 1
     for d = 1, RUN_REACH do
       local c = info[idx(x, y - d)]
-      if not (c and isSolid(c.class)) then break end
+      if not (c and isSolid(c)) then break end
       run = run + 1
     end
     for d = 1, RUN_REACH do
       local c = info[idx(x, y + d)]
-      if not (c and isSolid(c.class)) then break end
+      if not (c and isSolid(c)) then break end
       run = run + 1
     end
     return Terrain.RUN_HEIGHT[math.min(run, #Terrain.RUN_HEIGHT)]
@@ -129,7 +144,7 @@ local function build(ctx, cx0, cy0)
     for x = x0 - 1, x0 + CHUNK do
       local c = info[idx(x, y)]
       if c then
-        c.h = isSolid(c.class) and runHeight(x, y) or (Terrain.HEIGHT[c.class] or 0)
+        c.h = isSolid(c) and runHeight(x, y) or (Terrain.HEIGHT[c.class] or 0)
       end
     end
   end

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0
+
+- A soft shadow under every character and NPC, so cards no longer read as
+  floating.
+- Tree canopies and roof edges (walkable cells whose over layer belongs to the
+  solid cell south of them) now join the structure instead of floating above it
+  as a sheet; this removes a hairline of ground that showed under their edge,
+  and trees stand taller (a tree is now as tall as a three-cell structure).
+- The Flash cave mask is drawn over the scene.
+- Tall grass over the feet and shoreline reflections were checked and already
+  work: both are drawn by the engine as actors and ground effects.
+
 ## 0.1.0
 
 First release.
