@@ -1372,7 +1372,7 @@ local function monWrite(target, registry)
     else
       if not num and type(value.index) == "number" and index ~= EMPTY_INDEX then
         num = value.index
-        index.num[id], index.id[num] = id, id
+        index.num[id], index.id[num] = num, id
         index.ids[#index.ids + 1] = id
       end
       if num then writeMon(target, t, num, value) end
@@ -1427,7 +1427,7 @@ local function moveWrite(target, registry)
     else
       if not num and type(value.index) == "number" and index ~= EMPTY_INDEX then
         num = value.index
-        index.num[id], index.id[num] = id, id
+        index.num[id], index.id[num] = num, id
         index.ids[#index.ids + 1] = id
       end
       if num then
@@ -1481,7 +1481,7 @@ local function itemWrite(target, registry)
     else
       if not num and type(value.index) == "number" and index ~= EMPTY_INDEX then
         num = value.index
-        index.num[id], index.id[num] = id, id
+        index.num[id], index.id[num] = num, id
         index.ids[#index.ids + 1] = id
       end
       if num then
