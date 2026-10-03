@@ -39,8 +39,11 @@ Terrain.RUN_HEIGHT = { 8, 14, 18, 22 }     -- by run length, 1 / 2 / 3 / 4 or mo
 -- overhead sheet held above it (a gate, a bridge)
 Terrain.OVERHEAD = 18
 
--- Face shade: top full, the sides step down so a block reads as solid.
-local SHADE = { top = 1, south = 0.88, east = 0.78, west = 0.72, north = 0.62 }
+-- Which face a quad is, carried in the vertex alpha (see the shader): the
+-- lighting works out how much sun each one catches.  + 8 marks a building wall
+-- whose windows may light up at night.
+local FACE = { top = 0, south = 1, east = 2, west = 3, north = 4 }
+local WINDOW = 8
 
 local chunks = {}        -- key -> { x, y, meshes = { {mesh, ts, layer} }, complete }
 local cellCache = {}     -- key -> the fields a build reads from one cell
@@ -160,11 +163,12 @@ local function build(ctx, cx0, cy0)
     return b
   end
 
-  -- one quad: four corners { x, y, z, u, v }, one shade
-  local function quad(b, c1, c2, c3, c4, shade)
+  -- one quad: four corners { x, y, z, u, v }, which face it is
+  local function quad(b, c1, c2, c3, c4, face)
     local v = b.verts
+    local code = face / 16
     for _, c in ipairs({ c1, c2, c3, c4 }) do
-      v[#v + 1] = { c[1], c[2], c[3], c[4], c[5], shade, shade, shade, 1 }
+      v[#v + 1] = { c[1], c[2], c[3], c[4], c[5], 1, 1, 1, code }
     end
     Gfx.pushQuad(b.map, b.quads)
     b.quads = b.quads + 1
@@ -189,12 +193,16 @@ local function build(ctx, cx0, cy0)
         local h = c.h
         local u0, v0, u1, v1 = uvRect(c.ts, c.slot)
         local under = bucket(c.ts, c.pair, "u")
+        -- only the SIDE of a building's own wall has windows: a roof is not
+        -- glass (a Poke Mart's is blue), a tree or a rock has no panes, and the
+        -- pond's blue is not glass
+        local win = (c.class == "wall" and not c.attached) and WINDOW or 0
 
         -- top face: the metatile's own art, seen from above
         quad(under,
           { wx, h, wz, u0, v0 }, { wx + CELL, h, wz, u1, v0 },
           { wx + CELL, h, wz + CELL, u1, v1 }, { wx, h, wz + CELL, u0, v1 },
-          SHADE.top)
+          FACE.top)
 
         -- the over layer: an overhead sheet above walkable ground, a decal
         -- laid on the top of a solid
@@ -208,11 +216,11 @@ local function build(ctx, cx0, cy0)
           quad(ob,
             { wx, oh, wz, u0, v0 }, { wx + CELL, oh, wz, u1, v0 },
             { wx + CELL, oh, wz + CELL, u1, v1 }, { wx, oh, wz + CELL, u0, v1 },
-            SHADE.top)
+            FACE.top)
         end
 
         -- sides: wherever the next cell is lower, stand the art on end
-        local function side(nx, ny, shade, a, b2, c3, d)
+        local function side(nx, ny, face, a, b2, c3, d)
           local n = info[idx(x0 + lx + nx, y0 + ly + ny)]
           local nh = n and n.h or h
           if nh < h then
@@ -220,21 +228,21 @@ local function build(ctx, cx0, cy0)
             local function pt(p, y, u, v) return { p[1], y, p[2], u, v } end
             quad(under,
               pt(a, h, u0, v0), pt(b2, h, u1, v0),
-              pt(c3, nh, u1, v1), pt(d, nh, u0, v1), shade)
+              pt(c3, nh, u1, v1), pt(d, nh, u0, v1), face + win)
           end
         end
         -- south face: left to right as the camera sees it
-        side(0, 1, SHADE.south,
+        side(0, 1, FACE.south,
           { wx, wz + CELL }, { wx + CELL, wz + CELL },
           { wx + CELL, wz + CELL }, { wx, wz + CELL })
         -- east face: south edge to north edge is left to right from outside
-        side(1, 0, SHADE.east,
+        side(1, 0, FACE.east,
           { wx + CELL, wz + CELL }, { wx + CELL, wz },
           { wx + CELL, wz }, { wx + CELL, wz + CELL })
-        side(-1, 0, SHADE.west,
+        side(-1, 0, FACE.west,
           { wx, wz }, { wx, wz + CELL },
           { wx, wz + CELL }, { wx, wz })
-        side(0, -1, SHADE.north,
+        side(0, -1, FACE.north,
           { wx + CELL, wz }, { wx, wz },
           { wx, wz }, { wx + CELL, wz })
       end

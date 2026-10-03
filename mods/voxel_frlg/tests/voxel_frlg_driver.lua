@@ -4,6 +4,8 @@
 --   * the mod loads clean and registers its pipeline;
 --   * hotkey 6 walks the ladder and the level is written to options.pipelines;
 --   * turning TILT on switches the pipeline off;
+--   * the TIME pipeline (day/night) is registered, hotkey 7 walks its ladder,
+--     and a pinned NIGHT frame is darker and bluer than a pinned DAY one;
 --   * with the pipeline on, the world frame really is the 3D scene (it differs
 --     from the flat frame, is not blank, and is not just the flat frame
 --     shifted) and returns to the flat frame when switched off.
@@ -67,6 +69,19 @@ local function differ(a, b, tol)
     end
   end
   return d / math.max(n, 1)
+end
+
+-- Mean luminance of a frame, 0..1.
+local function luma(a)
+  local sum, n = 0, 0
+  for y = 0, a:getHeight() - 1, 4 do
+    for x = 0, a:getWidth() - 1, 4 do
+      local r, g, b = a:getPixel(x, y)
+      sum = sum + 0.299 * r + 0.587 * g + 0.114 * b
+      n = n + 1
+    end
+  end
+  return sum / math.max(n, 1)
 end
 
 -- Distinct coarse colours in a frame: a blank or one-colour frame has one or two.
@@ -164,6 +179,41 @@ return function(game)
     "switching off returns the flat frame (%.1f%% differ, vs %.0f%% for the 3D one)",
     back * 100, d * 100))
   check(not Pipelines.eligible(ID), "and the pipeline is no longer eligible")
+
+  -- ------------------------------------------------------------ day / night
+  local TIME = "voxel_frlg_time"
+  check(Pipelines.get(TIME) ~= nil, "the " .. TIME .. " pipeline is registered")
+  check(Pipelines.maxLevel(TIME) == 6, "the time ladder is REAL, CYCLE, DAY, DUSK, NIGHT, DAWN, OFF")
+  Pipelines.setLevel(TIME, 0)
+  game:keypressed("7")
+  U.wait(2)
+  check(Pipelines.level(TIME) == 1, "hotkey 7 steps the time ladder")
+  Pipelines.setLevel(ID, 2)
+  Pipelines.setLevel(TIME, 2)             -- DAY
+  U.wait(60)
+  check(U.shot(game, DIR .. "/day.png"), "captured a pinned DAY frame")
+  Pipelines.setLevel(TIME, 4)             -- NIGHT
+  U.wait(60)
+  check(U.shot(game, DIR .. "/night.png"), "captured a pinned NIGHT frame")
+  local day, night = load(DIR .. "/day.png"), load(DIR .. "/night.png")
+  if check(day and night, "the day and night frames decode") then
+    local ld, ln = luma(day), luma(night)
+    check(ln < ld * 0.75, string.format("night is darker than day (%.2f vs %.2f)", ln, ld))
+    -- bluer: the share of blue in the frame rises after dark
+    local function blueShare(a)
+      local rs, bs = 0, 0
+      for y = 0, a:getHeight() - 1, 8 do
+        for x = 0, a:getWidth() - 1, 8 do
+          local r, _, b = a:getPixel(x, y)
+          rs, bs = rs + r, bs + b
+        end
+      end
+      return bs / math.max(rs + bs, 1e-6)
+    end
+    check(blueShare(night) > blueShare(day) + 0.04, "and bluer")
+  end
+  Pipelines.setLevel(ID, 0)
+  Pipelines.setLevel(TIME, 0)
 
   finish()
 end

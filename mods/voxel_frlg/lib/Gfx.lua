@@ -8,6 +8,7 @@
 
 local V = ...
 local Mat4 = V.require("Mat4")
+local Sky = V.require("Sky")
 
 local Gfx = {}
 
@@ -37,6 +38,24 @@ local SHADER = [[
   uniform vec2 fogRange;       // x = where haze starts, y = where it is total
   uniform float cutoff;        // alpha below this is discarded, not blended
   uniform float soft;          // 1 = blend by alpha instead (shadows)
+  uniform vec3 ambient;        // the light every face gets
+  uniform vec3 sunColor;       // the sun's (after dark, the moon's) colour
+  uniform vec3 sunDir;         // unit, toward the light
+  uniform float lamps;         // 0 = day .. 1 = windows fully lit
+  uniform vec3 lampColor;
+
+  // Vertex alpha carries WHICH FACE a surface is, not transparency: 0 top,
+  // 1 south, 2 east, 3 west, 4 north, 5 a character card -- plus 8 when the
+  // surface is a building wall whose windows may light up.  16 steps across
+  // the byte, so it survives the round trip exactly.
+  vec3 faceNormal(float code) {
+    if (code < 0.5) return vec3(0.0, 1.0, 0.0);
+    if (code < 1.5) return vec3(0.0, 0.0, 1.0);
+    if (code < 2.5) return vec3(1.0, 0.0, 0.0);
+    if (code < 3.5) return vec3(-1.0, 0.0, 0.0);
+    return vec3(0.0, 0.0, -1.0);
+  }
+
   vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
     vec4 p = Texel(tex, tc);
     float f = clamp((vDist - fogRange.x) / max(fogRange.y - fogRange.x, 1.0), 0.0, 1.0);
@@ -48,7 +67,27 @@ local SHADER = [[
     // transparent texels into the depth buffer, so it cannot cut a hole in
     // what stands behind it
     if (p.a < cutoff) discard;
-    vec3 rgb = p.rgb * color.rgb;
+
+    float code = floor(color.a * 16.0 + 0.5);
+    bool windowWall = code >= 8.0;
+    if (windowWall) code -= 8.0;
+    vec3 light;
+    if (code > 4.5) {
+      // a card faces the camera, so it takes a fair share of the sun
+      light = ambient + sunColor * 0.7;
+    } else {
+      light = ambient + sunColor * max(dot(faceNormal(code), sunDir), 0.0);
+    }
+    vec3 rgb = p.rgb * light;
+
+    // Lit windows.  Nothing in a metatile says which pixels are glass, but
+    // FireRed's panes are the one saturated light blue on a building, so a
+    // blue-dominant texel on a wall lights up with the lamps.
+    if (windowWall && lamps > 0.01) {
+      float glass = step(0.34, p.b - p.r) * step(0.5, p.b) * step(0.05, p.b - p.g);
+      float lum = dot(p.rgb, vec3(0.299, 0.587, 0.114));
+      rgb = mix(rgb, lampColor * (0.7 + 0.55 * lum), lamps * 0.92 * glass);
+    }
     return vec4(mix(rgb, fogColor, f * f), 1.0);
   }
 #endif
@@ -106,10 +145,10 @@ function Gfx.camera(focus, tilt, dist, fov, aspect)
   return Mat4.mul(proj, Mat4.lookAt(eye, focus, up)), eye
 end
 
--- Open the pass: bind a w x h colour canvas with a depth buffer, clear it to
--- `sky`, and set the scene shader.  Returns false (and leaves the canvas
--- unbound) when any of it will not build.
-function Gfx.begin(w, h, vp, eye, sky, fogNear, fogFar)
+-- Open the pass: bind a w x h colour canvas with a depth buffer, paint the sky
+-- (`env`, from Time.env), and set the scene shader and its light.  Returns
+-- false (and leaves the canvas unbound) when any of it will not build.
+function Gfx.begin(w, h, vp, eye, focus, env, fogNear, fogFar, scale, time)
   local sh = Gfx.shader()
   if not sh then return false end
   if not (held and held.w == w and held.h == h) then
@@ -124,18 +163,27 @@ function Gfx.begin(w, h, vp, eye, sky, fogNear, fogFar)
     pcall(love.graphics.setCanvas)
     return false
   end
-  love.graphics.clear(sky[1], sky[2], sky[3], 1, true, true)
+  local hz = env.horizon
+  love.graphics.clear(hz[1], hz[2], hz[3], 1, true, true)
+  -- the sky goes down while a rectangle is still just a rectangle: before the
+  -- depth mode and the scene shader are set
+  pcall(Sky.paint, w, h, Sky.horizon(vp, eye, focus, h), env, scale or 1, time or 0)
   love.graphics.setDepthMode("lequal", true)
   love.graphics.setMeshCullMode("none")
   love.graphics.setShader(sh)
   love.graphics.setColor(1, 1, 1, 1)
   pcall(sh.send, sh, "vp", "row", vp)
   pcall(sh.send, sh, "eye", eye)
-  pcall(sh.send, sh, "fogColor", { sky[1], sky[2], sky[3] })
+  pcall(sh.send, sh, "fogColor", { hz[1], hz[2], hz[3] })
   pcall(sh.send, sh, "fogRange", { fogNear, fogFar })
   pcall(sh.send, sh, "cutoff", 0.5)
   pcall(sh.send, sh, "depthBias", 0)
   pcall(sh.send, sh, "soft", 0)
+  pcall(sh.send, sh, "ambient", env.ambient)
+  pcall(sh.send, sh, "sunColor", env.sun)
+  pcall(sh.send, sh, "sunDir", env.dir)
+  pcall(sh.send, sh, "lamps", env.lamps)
+  pcall(sh.send, sh, "lampColor", { 1.0, 0.82, 0.48 })
   return true
 end
 

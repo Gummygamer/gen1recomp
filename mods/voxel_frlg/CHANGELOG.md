@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+
+- **Day and night.** A TIME row (OPTIONS > EXTRAS, hotkey 7): REAL clock
+  (default), CYCLE (a day in twenty minutes), pinned DAY / DUSK / NIGHT / DAWN,
+  or OFF for the old fixed daylight.
+- **Lighting.** Surfaces are lit by a sun that crosses the sky east to west and
+  by the moon after dark, per face, with ambient light, so tops, fronts and
+  sides read as solid. Sun colour, ambient, sky and haze follow keyframes for
+  dawn, morning, noon, golden hour, dusk and night.
+- A sky gradient, stars, and the sun or moon on its arc (visible on the steeper
+  rungs, where the camera sees past the map's edge).
+- After dark, windows on buildings light up. Rain, snow, ash and fog dim the day
+  and put the lamps on early.
+- Interiors and caves are lit neutrally with a black sky whatever the hour.
+- Needs the engine ctx's `outdoor`, `mapType` and `weather` (same seam commit
+  range as 0.2.0; see the README's Requirements).
+
 ## 0.2.0
 
 - A soft shadow under every character and NPC, so cards no longer read as

@@ -1,7 +1,7 @@
 {
   "id": "VOXEL_FRLG",
   "name": "Voxel Overworld (FireRed / LeafGreen)",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "api": 2,
   "entry": "main.lua",
   "profile": "content",
@@ -16,6 +16,6 @@
   "conflicts": [],
   "permissions": [],
   "affects_link": false,
-  "description": "The FireRed and LeafGreen overworld as a 3D diorama: every metatile extruded into real geometry, walked by a depth-buffered tilted camera, with the characters standing up as sprite cards. Presentational only -- it changes what the map looks like, never where anybody stands.",
+  "description": "The FireRed and LeafGreen overworld as a 3D diorama: every metatile extruded into real geometry, walked by a depth-buffered tilted camera, with the characters standing up as sprite cards, lit by a sun and moon that follow the time of day. Presentational only -- it changes what the map looks like, never where anybody stands.",
   "github": "Gummygamer/gen1recomp-voxel-frlg"
 }

@@ -18,6 +18,7 @@ local Actors = {}
 -- cell) and 32 px above the cell for tall sprites.
 local CELL = 16
 local SLOT = 64
+local CARD = 5 / 16        -- the face code a character card carries (see Gfx's shader)
 local CELL_X, CELL_Y = 24, 32
 local COLS, ROWS = 8, 8
 local MAX = COLS * ROWS
@@ -65,7 +66,7 @@ local function shadowTexture()
 end
 
 -- `groundAt(x, z)` answers the column top under a point.  Water gets none.
-function Actors.shadows(list, groundAt)
+function Actors.shadows(list, groundAt, strength)
   local img = shadowTexture()
   if not img then return end
   local verts, map, n = {}, {}, 0
@@ -76,10 +77,10 @@ function Actors.shadows(list, groundAt)
       if gy >= 0 then
         gy = gy + 0.12
         local hw, hh = SHADOW_W / 2 - 1, SHADOW_H / 2
-        verts[#verts + 1] = { gx - hw, gy, gz - hh, 0, 0, 1, 1, 1, 1 }
-        verts[#verts + 1] = { gx + hw, gy, gz - hh, 1, 0, 1, 1, 1, 1 }
-        verts[#verts + 1] = { gx + hw, gy, gz + hh, 1, 1, 1, 1, 1, 1 }
-        verts[#verts + 1] = { gx - hw, gy, gz + hh, 0, 1, 1, 1, 1, 1 }
+        verts[#verts + 1] = { gx - hw, gy, gz - hh, 0, 0, 1, 1, 1, strength }
+        verts[#verts + 1] = { gx + hw, gy, gz - hh, 1, 0, 1, 1, 1, strength }
+        verts[#verts + 1] = { gx + hw, gy, gz + hh, 1, 1, 1, 1, 1, strength }
+        verts[#verts + 1] = { gx - hw, gy, gz + hh, 0, 1, 1, 1, 1, strength }
         Gfx.pushQuad(map, n)
         n = n + 1
       end
@@ -157,7 +158,7 @@ function Actors.draw(list, groundAt, lean)
         -- px in [0, SLOT] across, py in [0, SLOT] down the slot
         local across = px - SLOT / 2
         local up = (CELL_Y + CELL - py)    -- pixels above the foot
-        return { fx + across, fy + uy * up, fz + uz * up, u, v, 1, 1, 1, 1 }
+        return { fx + across, fy + uy * up, fz + uz * up, u, v, 1, 1, 1, CARD }
       end
       verts[#verts + 1] = pt(0, 0, u0, v0)
       verts[#verts + 1] = pt(SLOT, 0, u1, v0)

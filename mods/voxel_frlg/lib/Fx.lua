@@ -61,10 +61,10 @@ function Fx.draw(ctx)
   local x0, z0 = ctx.camX, ctx.camY
   local x1, z1 = x0 + ctx.viewW, z0 + ctx.viewH
   local verts = {
-    { x0, LIFT, z0, 0, 0, 1, 1, 1, 1 },
-    { x1, LIFT, z0, 1, 0, 1, 1, 1, 1 },
-    { x1, LIFT, z1, 1, 1, 1, 1, 1, 1 },
-    { x0, LIFT, z1, 0, 1, 1, 1, 1, 1 },
+    { x0, LIFT, z0, 0, 0, 1, 1, 1, 0 },
+    { x1, LIFT, z0, 1, 0, 1, 1, 1, 0 },
+    { x1, LIFT, z1, 1, 1, 1, 1, 1, 0 },
+    { x0, LIFT, z1, 0, 1, 1, 1, 1, 0 },
   }
   if mesh then
     mesh:setVertices(verts)

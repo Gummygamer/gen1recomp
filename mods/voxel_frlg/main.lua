@@ -40,6 +40,7 @@ local Gfx = V.require("Gfx")
 local Terrain = V.require("Terrain")
 local Actors = V.require("Actors")
 local Fx = V.require("Fx")
+local Time = V.require("Time")
 
 -- ------- the ladder
 --
@@ -48,9 +49,19 @@ local Fx = V.require("Fx")
 local LABELS = { "OFF", "15", "35", "50", "65" }
 local ANGLE = { [1] = 15, [2] = 35, [3] = 50, [4] = 65 }
 local FOV = math.rad(35)
-local SKY = { 0.55, 0.74, 0.95 }
 
 local state = { tilt = 35 }
+
+-- ------- time of day
+--
+-- Its own tiny pipeline, because that is how the engine gives a mode an OPTIONS
+-- row, a hotkey and persistence: the registry has no other home for a setting.
+-- It draws nothing (its worldPresent is the identity and never even runs while
+-- the level is 0); what matters is that update() is handed the level every
+-- frame, which is the mode of the clock.
+local TIME_LABELS = { "REAL", "CYCLE", "DAY", "DUSK", "NIGHT", "DAWN", "OFF" }
+local TIME_MODES = { [0] = "real", "cycle", "day", "dusk", "night", "dawn", "off" }
+local timeMode = "real"
 
 -- The scene canvas's size in FRAMEBUFFER pixels.  ctx.width / ctx.height are
 -- the window in LOVE units, but the engine composites a pipeline's canvas at
@@ -82,6 +93,7 @@ local function drawWorld(ctx)
   local list = Actors.render(ctx)
   Fx.render(ctx)
 
+  local env = Time.env(Time.hours(timeMode), ctx.outdoor and ctx.mapType ~= 5, ctx.weather)
   local tilt = state.tilt
   local focus = { ctx.camX + ctx.viewW / 2, 0, ctx.camY + ctx.viewH / 2 }
   local dist = (ctx.viewH / 2) / math.tan(FOV / 2)
@@ -94,15 +106,34 @@ local function drawWorld(ctx)
   local ry = math.ceil(ctx.viewH / 32 * lean * 1.3) + 3
   local chunks = Terrain.visible(ctx, focus[1] / 16, focus[3] / 16 - ry * 0.25, rx, ry)
 
-  if not Gfx.begin(sw, sh, vp, eye, SKY, dist * 1.6, dist * 5.5) then return nil end
+  if not Gfx.begin(sw, sh, vp, eye, focus, env, dist * 1.6, dist * 5.5,
+      sw / ctx.viewW, love.timer.getTime()) then
+    return nil
+  end
   Terrain.draw(chunks)
   Fx.draw(ctx)
-  Actors.shadows(list, groundAt(ctx))
+  Actors.shadows(list, groundAt(ctx), env.shadow)
   Actors.draw(list, groundAt(ctx), math.rad((90 - tilt) * 0.8))
   local scene = Gfx.finish()
   Fx.screen(ctx, scene, sw, sh)
   return scene
 end
+
+mod.content.render_pipelines:register("voxel_frlg_time", {
+  label = "TIME",
+  levels = TIME_LABELS,
+  hotkey = "7",
+  priority = 10,
+  -- the identity: a registry record must have a draw stage, and this one has
+  -- nothing to draw
+  worldPresent = function(canvas) return canvas end,
+  update = function(dt, level)
+    timeMode = TIME_MODES[level] or "real"
+    -- the clock runs whatever the level, so a CYCLE keeps its time through
+    -- menus, battles and a stretch with the mode off
+    Time.update(dt, timeMode)
+  end,
+})
 
 mod.content.render_pipelines:register("voxel_frlg", {
   label = "VOXEL",
@@ -116,6 +147,8 @@ mod.content.render_pipelines:register("voxel_frlg", {
   available = function() return Gfx.available() end,
 
   update = function(dt, level)
+    -- the clock runs whatever the level, so a CYCLE keeps its time through
+    -- menus, battles and a stretch with the mode off
     local target = ANGLE[level]
     if target then
       state.tilt = state.tilt + (target - state.tilt) * math.min(1, dt * 8)
@@ -130,5 +163,6 @@ mod.content.render_pipelines:register("voxel_frlg", {
     Terrain.invalidate()
     Actors.invalidate()
     Fx.invalidate()
+    V.require("Sky").invalidate()
   end,
 })

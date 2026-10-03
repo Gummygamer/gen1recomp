@@ -22,6 +22,7 @@
 -- collision, movement, scripts or the save.
 
 local FieldView = require("src.core.game3.field_view")
+local Dataset = require("src.core.game3.dataset")
 local Pipelines = require("src.render.Pipelines")
 local Zoom = require("src.render.Zoom")
 
@@ -30,9 +31,10 @@ local FieldPipeline = {}
 local CELL = 16
 FieldPipeline.CELL = CELL
 
-local Map, NativeTileset, CollPermissions, MB, Interaction
+local Map, NativeTileset, CollPermissions, MB, Interaction, FieldWeather
 local function lazy()
   if Map then return end
+  FieldWeather = package.loaded["src.core.game3.field_weather"] or require("src.core.game3.field_weather")
   Map = package.loaded["src.core.game3.map"] or require("src.core.game3.map")
   NativeTileset = require("src.core.game3.tileset_native")
   CollPermissions = require("src.core.CollPermissions")
@@ -115,6 +117,12 @@ function FieldPipeline.context(game, Renderer, pipelineId)
     viewW = frame.viewW, viewH = frame.viewH,
     px = frame.px, py = frame.py, facing = frame.facing,
     cellSize = CELL,
+    -- where the player is standing, for a pipeline that lights the scene: the
+    -- map's type (pokefirered MAP_TYPE_*), whether it is open sky, and the
+    -- field weather id (src/core/game3/weather.lua), 0 for none
+    mapType = tonumber(mapDef.mapType),
+    outdoor = Dataset.isOutdoorMapType(mapDef.mapType),
+    weather = tonumber(FieldWeather and FieldWeather.getWeather and FieldWeather.getWeather()) or 0,
   }
 
   -- Changes whenever geometry built from cells must be rebuilt: a metatile

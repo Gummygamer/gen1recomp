@@ -10,12 +10,15 @@ return {
       "with VOXEL on, the overworld draws as 3D geometry instead of flat tiles",
       "occlusion comes from a depth buffer rather than an OAM-priority sort",
       "turning VOXEL on switches TILT off, and turning TILT on switches VOXEL off",
+      "outdoors the scene is lit by a sun (and moon) that moves with the time of day; interiors and caves are lit neutrally",
     },
     added = {
       "VOXEL options row under EXTRAS and hotkey 6 (OFF / 15 / 35 / 50 / 65 degrees)",
+      "TIME options row under EXTRAS and hotkey 7 (REAL / CYCLE / DAY / DUSK / NIGHT / DAWN / OFF): day/night with sun and moon lighting, a sky, stars and lit windows at night",
     },
     known = {
-      "no day/night or lighting; the camera does not rotate because movement is map-relative",
+      "lighting is per face with no cast shadows; window glow is a colour heuristic",
+      "the camera does not rotate because movement is map-relative",
       "FireRed and LeafGreen only; Emerald is not claimed (untested there)",
     },
   },

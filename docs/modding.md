@@ -730,6 +730,7 @@ battle transition wipe, shops and menus draw flat, as they do under TILT.
 | `ctx.width`, `ctx.height`, `ctx.scale`, `ctx.level` | as above |
 | `ctx.camX`, `ctx.camY`, `ctx.viewW`, `ctx.viewH` | the flat view: top-left in world pixels, and its size in game pixels |
 | `ctx.px`, `ctx.py`, `ctx.facing` | the player's pixel position and facing |
+| `ctx.mapType`, `ctx.outdoor`, `ctx.weather` | the map's type (`MAP_TYPE_*`), whether it is open sky (town, city, route, ocean route), and the field weather id (`0` for none), for a pipeline that lights the scene |
 | `ctx.mapId`, `ctx.epoch` | the map; `epoch` changes whenever geometry built from cells must be rebuilt (a metatile write, a tileset reload, a connection change) |
 | `ctx.cell(x, y)` | one metatile in current-map cell coordinates (negative and past-the-edge cells read the connected maps, then the border). Returns a **reused** table, or `nil` while its atlas is still streaming in |
 | `ctx.tileset(pair)` | the atlas a pair draws from |
