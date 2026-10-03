@@ -72,23 +72,24 @@ local function layerPresence(ts, slot)
     presence[ts] = byTs
   end
   local hit = byTs[slot]
-  if hit then return hit[1], hit[2] end
-  local function occupied(data)
-    if not data then return false end
+  if hit then return hit[1], hit[2], hit[3] end
+  local function pixels(data)
+    if not data then return 0 end
     local cols = ts.cols
     local sx, sy = (slot % cols) * CELL, math.floor(slot / cols) * CELL
+    local n = 0
     for y = sy, sy + CELL - 1 do
       for x = sx, sx + CELL - 1 do
         local _, _, _, a = data:getPixel(x, y)
-        if a and a > 0 then return true end
+        if a and a > 0 then n = n + 1 end
       end
     end
-    return false
+    return n
   end
-  local under = occupied(ts.imageData)
-  local over = occupied(ts.overImageData)
-  byTs[slot] = { under, over }
-  return under, over
+  local overN = pixels(ts.overImageData)
+  local under, over = pixels(ts.imageData) > 0, overN > 0
+  byTs[slot] = { under, over, overN }
+  return under, over, overN
 end
 
 local cellOut = {}
@@ -155,14 +156,14 @@ function FieldPipeline.context(game, Renderer, pipelineId)
     local behaviors = Interaction.behaviors[pair]
     local behavior = behaviors and behaviors[mid]
     local behaviorName = behavior and MB.nameOf(behavior) or nil
-    local underOn, overOn = layerPresence(ts, slot)
+    local underOn, overOn, overN = layerPresence(ts, slot)
     local c = cellOut
     c.mid, c.pair, c.slot, c.ts = mid, pair, slot, ts
     c.void = isVoid
     c.coll, c.elev = coll, elev
     c.behavior, c.behaviorName = behavior, behaviorName
     c.class = classify(coll, behaviorName, isVoid)
-    c.hasUnder, c.hasOver = underOn, overOn
+    c.hasUnder, c.hasOver, c.overPixels = underOn, overOn, overN
     return c
   end
 

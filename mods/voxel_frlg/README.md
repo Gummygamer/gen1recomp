@@ -49,7 +49,7 @@ returns, falling back to the flat draw when it returns nil.
 
 | piece | what it does |
 | --- | --- |
-| `lib/Terrain.lua` | meshes the metatile grid into chunks of columns, one mesh per atlas and layer |
+| `lib/Terrain.lua` | meshes the metatile grid into chunks: boxes for buildings and rock, standing sprite cards for trees and other props |
 | `lib/Actors.lua` | has the engine draw each actor into an atlas slot, stands the slot up as a card, and drops a soft shadow under it |
 | `lib/Fx.lua` | lays the engine's 2D ground effects on the map; draws weather and the Flash mask over the scene |
 | `lib/Gfx.lua` | the shader (lighting, haze, lit windows), the colour + depth canvas, the camera |
@@ -58,14 +58,25 @@ returns, falling back to the flat draw when it returns nil.
 
 The mod requires no engine module: everything it needs comes through the ctx.
 
-### Column heights
+### Boxes and props
 
-Nothing in a metatile says how tall it is, so a solid cell stands as tall as the
-structure it belongs to, measured by the run of solid cells down its column: one
-cell deep (a fence, a sign) is low, two medium, three or more (a tree, a house)
-tall. A walkable cell whose over layer belongs to the solid cell south of it (a
-tree's canopy, a roof's top edge) counts as part of that structure. Tune
-`Terrain.RUN_HEIGHT`.
+Nothing in a metatile says how tall it is or what it is, so solid cells are
+classified from the map and the art:
+
+- **Boxes.** A solid structure is as tall as the run of solid cells down its
+  column: one deep (a fence, a counter) is low, two medium, three or more (a
+  house, a cliff) tall. A walkable cell whose over layer is the structure's
+  overhang (a roof's top edge) joins it. Tune `Terrain.RUN_HEIGHT`.
+- **Props.** Outdoors, short solid things (three cells or fewer: boulders,
+  signs, bushes, small trees) and anything green or ground-coloured (trees,
+  the gaps between trunks, however deep the grove) are not boxed: a box repeats
+  one tile across every face and reads as a cube. They stand as sprite cards
+  instead, like the characters, leaning toward the camera, with the tileset's
+  ground colour keyed away so the tree is a tree and not a green square. The
+  border of an outdoor map is treated the same way.
+- **Standing on things.** A character on a solid cell (a Poke Ball on a lab
+  table, a scientist behind a counter) stands on top of its column rather than
+  inside it.
 
 ## Day, night and lighting
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1
+
+- **Trees are trees.** Trees, bushes, boulders, signs and the whole border of
+  an outdoor map were extruded into boxes with one tile repeated on every face,
+  so they read as cubes. They now stand as sprite cards, leaning toward the
+  camera like the characters, with the tileset's ground colour keyed away.
+  Buildings and rock walls stay solid boxes.
+- **Sprites no longer vanish.** An actor standing on a cell classed as solid (the
+  Poke Balls on Oak's lab table, a scientist behind a counter, an NPC at a
+  museum display) was swallowed by the column; it now stands on top of it.
+- Needs the engine ctx's `overPixels` on a cell (commit after `29edec3a`; see
+  the README's Requirements).
+
 ## 0.3.0
 
 - **Day and night.** A TIME row (OPTIONS > EXTRAS, hotkey 7): REAL clock

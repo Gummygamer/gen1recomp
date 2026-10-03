@@ -76,12 +76,7 @@ local function sceneSize(ctx)
 end
 
 local function groundAt(ctx)
-  return function(x, z)
-    local c = ctx.cell(math.floor(x / 16), math.floor(z / 16))
-    if not c then return 0 end
-    if c.class == "water" then return Terrain.HEIGHT.water end
-    return 0
-  end
+  return function(x, z) return Terrain.heightAt(ctx, x, z) end
 end
 
 local function drawWorld(ctx)
@@ -111,6 +106,7 @@ local function drawWorld(ctx)
     return nil
   end
   Terrain.draw(chunks)
+  Terrain.drawProps(chunks, math.rad((90 - tilt) * 0.8))
   Fx.draw(ctx)
   Actors.shadows(list, groundAt(ctx), env.shadow)
   Actors.draw(list, groundAt(ctx), math.rad((90 - tilt) * 0.8))

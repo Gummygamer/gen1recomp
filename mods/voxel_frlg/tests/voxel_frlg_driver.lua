@@ -122,7 +122,10 @@ return function(game)
   check(Pipelines.get(ID) ~= nil, "the " .. ID .. " pipeline is registered")
   check(Pipelines.maxLevel(ID) == 4, "the ladder is OFF + four angles")
   if not Pipelines.get(ID) then return finish() end
-  check(Pipelines.eligible(ID) == false, "off by default")
+  -- a save that already had it switched on (a copied options file) starts above
+  -- 0, so this checks that OFF really is off rather than assuming a fresh save
+  Pipelines.setLevel(ID, 0)
+  check(Pipelines.eligible(ID) == false, "level 0 is off")
 
   -- ---------------------------------------------------------------- hotkey
   Pipelines.setLevel(ID, 0)

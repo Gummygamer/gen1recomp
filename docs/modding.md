@@ -739,7 +739,7 @@ battle transition wipe, shops and menus draw flat, as they do under TILT.
 | `ctx.drawFx(which)` | the engine's 2D field effects in view coordinates: `"ground"` (door animations, tall grass, weather below the actors) and `"weather"` (screen-space rain, snow, fog) and `"flash"` (the dark-cave mask, centred on the player) |
 
 A cell is `{ mid, pair, slot, ts, void, coll, elev, behavior, behaviorName,
-class, hasUnder, hasOver }`. `ts` is the pair's atlas (`image`, `overImage`,
+class, hasUnder, hasOver, overPixels }`. `ts` is the pair's atlas (`image`, `overImage`,
 `cols`); the metatile's art is the 16x16 rectangle at slot
 `(slot % cols, floor(slot / cols))`. **Re-read `ts.image` every frame**: the
 engine swaps animated atlases (water, flowers) under the same pair. `class` is

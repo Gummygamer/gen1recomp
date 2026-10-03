@@ -9,6 +9,7 @@ return {
     changed = {
       "with VOXEL on, the overworld draws as 3D geometry instead of flat tiles",
       "occlusion comes from a depth buffer rather than an OAM-priority sort",
+      "trees, bushes, boulders and signs stand as sprite cards instead of boxes; buildings and rock stay solid",
       "turning VOXEL on switches TILT off, and turning TILT on switches VOXEL off",
       "outdoors the scene is lit by a sun (and moon) that moves with the time of day; interiors and caves are lit neutrally",
     },
