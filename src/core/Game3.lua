@@ -333,6 +333,16 @@ function Game3:_loadMods(opts)
   -- launcher preloaded (every enabled mod's lang/strings.lua, whatever game
   -- it targets) stayed in place for the whole FireRed session.
   lazyReq("src.core.Strings").load(self.data)
+  -- Rendering pipelines (src/render/Pipelines.lua): point the engine half at this
+  -- boot's merged dataset -- Gen 1's is the Data singleton, which a Gen 3 boot
+  -- never fills -- and restore the ladder the player left in options.pipelines.
+  -- After the merge, so a mod's record is already in data.render_pipelines.
+  -- Display.drawFieldPlane is where drawWorld runs (src/core/game3/field_pipeline.lua).
+  do
+    local Pipelines = lazyReq("src.render.Pipelines")
+    Pipelines.install(self.data)
+    Pipelines.applyOptions(self.options)
+  end
   local okC, Gen3Compat = pcall(lazyReq, "src.mods.Gen3Compat")
   if okC and type(Gen3Compat) == "table" and Gen3Compat.applyMerged then
     local okA, err = pcall(Gen3Compat.applyMerged, self)
@@ -733,6 +743,8 @@ function Game3:update(dt)
   if self._audioAccum > 0.25 then self._audioAccum = 0 end
   local okT, errT = pcall(function() lazyReq("src.render.Tilt").update(dt) end)
   if not okT then s9log("tilt", errT) end
+  local okP, errP = pcall(function() lazyReq("src.render.Pipelines").update(dt) end)
+  if not okP then s9log("pipelines", errP) end
   pcall(function() lazyReq("src.core.DiscordPresence").update(dt) end)
   Game3.stepGC()
 end
@@ -834,6 +846,26 @@ function Game3:draw()
   end
 end
 
+-- A mod's render pipeline claims its hotkey LAST, so it can never shadow an
+-- engine display key however it is declared (the order Game and Game2 keep).
+-- Gen 3's overworld is not a state: free roam is "field phase, nothing on the
+-- UI stack, no script holding the field", which is zoomGateOK's own test, so
+-- the gate answers the way Zoom's does -- the player cannot flip a display
+-- mode mid-warp or mid-cutscene.
+function Game3:_pipelineHotkey(hk)
+  if not hk then return false end
+  local Pipelines = lazyReq("src.render.Pipelines")
+  if #Pipelines.list() == 0 then return false end
+  local gate = self:zoomGateOK() and self or nil
+  if not Pipelines.hotkey(hk, gate, gate) then return false end
+  if type(self.options) == "table" then
+    Pipelines.syncOptions(self.options)
+    lazyReq("src.render.Tilt").setLevel(self.options.tilt or 0)
+    self:writeOptions()
+  end
+  return true
+end
+
 function Game3:_hotkey(key)
   local hk = Input.hotkeyKey(key)
   if key == "f1" then
@@ -859,6 +891,16 @@ function Game3:_hotkey(key)
       Tilt.cycle()
       if type(self.options) == "table" then
         self.options.tilt = Tilt.level
+        -- tilt and a mod's world pipeline are two answers to the same
+        -- question; turning tilt on switches the pipeline off (Pipelines does
+        -- the same the other way round)
+        if Tilt.level > 0 then
+          local Pipelines = lazyReq("src.render.Pipelines")
+          for _, entry in ipairs(Pipelines.list()) do
+            if entry.def.drawWorld then Pipelines.setLevel(entry.id, 0) end
+          end
+          Pipelines.syncOptions(self.options)
+        end
         self:writeOptions()
       end
     end
@@ -873,6 +915,8 @@ function Game3:_hotkey(key)
         self:writeOptions()
       end
     end
+    return true
+  elseif self:_pipelineHotkey(hk) then
     return true
   elseif key == "-" or key == "kp-" then
     self:zoomStep(-1)

@@ -671,7 +671,10 @@ Schemas.GEN3 = {
   growth_rates = false, type_chart = false,
   rulesets = false, transitions = false, field = false,
   text_pointers = false, link_fields = false,
-  battle_sprite_scales = false, render_pipelines = false,
+  battle_sprite_scales = false,
+  -- render_pipelines keeps the shared Gen 1 target: Game3:_loadMods calls
+  -- Pipelines.install on this boot's dataset AFTER the merge and
+  -- Display.drawFieldPlane runs drawWorld (src/core/game3/field_pipeline.lua).
   font = false, audio = false, music = false, sfx = false, cries = false,
   map_songs = false, screens = false, tokens = false,
   held_items = false, phone_contacts = false, decorations = false,

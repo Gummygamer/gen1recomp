@@ -713,6 +713,43 @@ Three rules worth knowing:
 Returning `nil` from `drawWorld` is a normal answer meaning "not this
 frame"; the engine draws the vanilla world instead.
 
+### Pipelines on FireRed and LeafGreen
+
+The registry works on Gen 3 too (`games = { "frlg" }` in the manifest). Gen 3
+draws its field through a 240x160 tile blitter rather than a canvas of Gen 1
+objects, so its `ctx` is **data about the field**, not drawing hooks: a 3D mode
+cannot reuse the flat blit, and a mod never has to `require` an engine module.
+`Display.drawFieldPlane` builds it (`src/core/game3/field_pipeline.lua`), and
+`drawWorld` still returns one window-resolution canvas (size it with
+`love.graphics.getPixelDimensions()`, as on Gen 1) or `nil` to fall back. A
+battle transition wipe, shops and menus draw flat, as they do under TILT.
+
+| field | meaning |
+| --- | --- |
+| `ctx.gen` | `3` |
+| `ctx.width`, `ctx.height`, `ctx.scale`, `ctx.level` | as above |
+| `ctx.camX`, `ctx.camY`, `ctx.viewW`, `ctx.viewH` | the flat view: top-left in world pixels, and its size in game pixels |
+| `ctx.px`, `ctx.py`, `ctx.facing` | the player's pixel position and facing |
+| `ctx.mapId`, `ctx.epoch` | the map; `epoch` changes whenever geometry built from cells must be rebuilt (a metatile write, a tileset reload, a connection change) |
+| `ctx.cell(x, y)` | one metatile in current-map cell coordinates (negative and past-the-edge cells read the connected maps, then the border). Returns a **reused** table, or `nil` while its atlas is still streaming in |
+| `ctx.tileset(pair)` | the atlas a pair draws from |
+| `ctx.actors()` | the sorted actors as `{ x, y, kind, over, ref }`, `(x, y)` being the foot point in world pixels |
+| `ctx.drawActor(actor, ox, oy)` | have the engine draw one actor with its cell's top-left at `(ox, oy)` of the current canvas, so OW sprites, palettes and walk phases are never reimplemented |
+| `ctx.drawFx(which)` | the engine's 2D field effects in view coordinates: `"ground"` (door animations, tall grass, weather below the actors) and `"weather"` (screen-space rain, snow, fog) |
+
+A cell is `{ mid, pair, slot, ts, void, coll, elev, behavior, behaviorName,
+class, hasUnder, hasOver }`. `ts` is the pair's atlas (`image`, `overImage`,
+`cols`); the metatile's art is the 16x16 rectangle at slot
+`(slot % cols, floor(slot / cols))`. **Re-read `ts.image` every frame**: the
+engine swaps animated atlases (water, flowers) under the same pair. `class` is
+`"ground"`, `"water"`, `"wall"`, `"ledge"` or `"void"` (past every connected
+map), so a mod does not need Gen 3's collision codes. `hasOver` says the over
+layer, which the flat game draws above the actors, has pixels in this cell.
+
+`mods/voxel_frlg` is the worked example: it meshes `ctx.cell` into columns,
+has the engine draw every actor into an atlas through `ctx.drawActor` and
+stands the slots up as cards, and lays `ctx.drawFx("ground")` on the map.
+
 ## Variable-size overworld sprites
 
 The `sprites` registry keeps the vanilla 16x16 grounded walker as its default,

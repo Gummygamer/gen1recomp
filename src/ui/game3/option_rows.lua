@@ -295,9 +295,36 @@ function Rows.build(ctx)
       local v = ((tonumber(c.options.tilt) or 0) + (dir < 0 and -1 or 1)) % n
       c.options.tilt = (v + n) % n
       Tilt.setLevel(c.options.tilt)
+      -- a world pipeline and tilt answer the same question: tilt on, pipeline off
+      if c.options.tilt > 0 then
+        local Pipelines = require("src.render.Pipelines")
+        for _, entry in ipairs(Pipelines.list()) do
+          if entry.def.drawWorld then Pipelines.setLevel(entry.id, 0) end
+        end
+        Pipelines.syncOptions(c.options)
+      end
       return true
     end,
   })
+  -- A mod's render pipelines (src/render/Pipelines.lua) sit beside TILT: one
+  -- row each, stepping the pipeline's own ladder.  A world pipeline switches
+  -- tilt off and the other way round, so the row writes both back.
+  do
+    local Pipelines = require("src.render.Pipelines")
+    for _, entry in ipairs(Pipelines.list()) do
+      local id = entry.id
+      add({
+        id = "pipeline:" .. id, label = Strings(entry.def.label or id:upper()),
+        value = function() return Strings(Pipelines.levelLabel(id)) end,
+        step = function(c, dir)
+          Pipelines.cycle(id, dir)
+          Pipelines.syncOptions(c.options)
+          require("src.render.Tilt").setLevel(c.options.tilt or 0)
+          return true
+        end,
+      })
+    end
+  end
   add({
     id = "zoom", label = Strings("ZOOM"),
     value = function(c)
@@ -433,8 +460,16 @@ function Rows.group(rows, openPage)
     for _, id in ipairs(g.members) do owner[id] = g end
     picked[g.id] = {}
   end
+  -- pipeline rows are registered by mods at runtime, so no static member list
+  -- can name them; they belong with the other display extras
+  local extras = picked["group.extras"] and "group.extras"
   for _, row in ipairs(rows) do
     local g = row.id and owner[row.id]
+    if not g and extras and row.id and row.id:find("^pipeline:") then
+      for _, cand in ipairs(Rows.GROUPS) do
+        if cand.id == extras then g = cand; owner[row.id] = cand end
+      end
+    end
     if g then picked[g.id][#picked[g.id] + 1] = row end
   end
   local made = {}

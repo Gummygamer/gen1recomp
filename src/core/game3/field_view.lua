@@ -18,6 +18,9 @@ FieldView._tilePalettes = nil -- [tileId+1] = BG slot 1..8
 FieldView._spriteCache = {} -- key → SpriteRenderer
 FieldView._logged = false
 FieldView._loggedPal = false
+-- bumped on every metatile write and full invalidate, so a render pipeline
+-- that caches geometry built from cells knows when to rebuild it
+FieldView._epoch = 0
 FieldView._nativeBatch = nil
 FieldView._nativeBatches = nil
 FieldView._nativeOverBatches = nil
@@ -951,6 +954,7 @@ end
 -- (metatile writes).  x, y are layout (current-map) cell coordinates.  Cells
 -- that are not visible need nothing: they are sampled when they scroll in.
 function FieldView.invalidateCell(x, y, layout)
+  FieldView._epoch = FieldView._epoch + 1
   if FieldView._nativeDirty or type(FieldView._nativeVisibleCells) ~= "table" then return end
   x, y = tonumber(x), tonumber(y)
   if not (x and y) or (layout ~= nil and layout ~= FieldView._nativeLayout) then
@@ -975,6 +979,7 @@ end
 -- layout maps 1:1 onto view cells; anything else (neighbour maps, a layout
 -- shared with a neighbour) falls back to a full rebuild.
 function FieldView.invalidateLayoutCell(layout, x, y)
+  FieldView._epoch = FieldView._epoch + 1
   if FieldView._nativeDirty then return end
   if layout == nil or layout ~= FieldView._nativeLayout then
     FieldView._nativeDirty = true
@@ -1797,8 +1802,94 @@ function FieldView.draw(game, canvasW, canvasH, opts)
   love.graphics.setColor(1, 1, 1, 1)
 end
 
+--- One field frame prepared for a render pipeline (src/core/game3/field_pipeline.lua):
+-- everything FieldView.draw settles BEFORE it draws -- the map, the camera,
+-- the session position sync, the neighbour refresh and the OAM-priority actor
+-- sort -- with none of the drawing.  The pipeline owns the world pass, so this
+-- must still run every frame or the session's position and the connected maps
+-- would stop following the player.  Returns nil where draw() itself would show
+-- its "no layout" placeholder, which the caller treats as "decline the frame".
+local pipeFrame = {}
+function FieldView.pipelineFrame(game, canvasW, canvasH)
+  local mapId = currentMapId(game)
+  local mapDef = resolveMapDef(game, mapId)
+  if FieldView._flashMapId ~= mapId then
+    FieldView.setDefaultFlashLevel(game, mapId)
+  end
+  if not mapDef or not mapDef.midLayout or not mapDef.width then return nil end
+
+  local px, py, facing, walkPhase, stepFlip, _, playerYOff, playerXOff = playerPixels(game)
+  playerXOff = playerXOff or 0
+  playerYOff = playerYOff or 0
+  local Runtime = package.loaded["src.core.game3.runtime"]
+  local session = Runtime and Runtime.getSession and Runtime.getSession()
+  if session then
+    session.x = math.floor((px or 0) / CELL)
+    session.y = math.floor((py or 0) / CELL)
+    session.facing = facing
+    if mapId then session.map = mapId end
+  end
+
+  local camX = math.floor(px + CELL / 2 - canvasW / 2) + (FieldView.cameraPanX or 0)
+  local camY = math.floor(py + CELL / 2 - canvasH / 2) + (FieldView.cameraPanY or 0)
+
+  FieldView._billboard = nil
+  FieldView._viewW, FieldView._viewH = canvasW, canvasH
+
+  local Map = package.loaded["src.core.game3.map"] or require("src.core.game3.map")
+  if Map.refreshWorld then
+    Map.refreshWorld(game, math.ceil(canvasW / CELL), math.ceil(canvasH / CELL), mapId)
+  end
+
+  local f = pipeFrame
+  f.game, f.mapId, f.mapDef = game, mapId, mapDef
+  f.px, f.py, f.facing = px, py, facing
+  f.camX, f.camY = camX, camY
+  f.viewW, f.viewH = canvasW, canvasH
+  f.under, f.over = nil, nil
+  if not (FieldView.hideActors) then
+    f.under, f.over = collectGame3Actors(
+      game, mapDef, camX, camY, px, py, facing, walkPhase, stepFlip, playerYOff, playerXOff)
+  end
+  return f
+end
+
+--- Draw one actor from a pipelineFrame so its cell's top-left lands at (ox, oy)
+-- in the current canvas.  A camera shifted by the difference does it, so every
+-- draw path an actor can take (OW sprite, renderer, custom :draw) is reused
+-- unchanged.
+function FieldView.drawPipelineActor(frame, a, ox, oy)
+  drawSingleActor(frame.game, frame.mapDef, a, a.x - ox, a.y - oy)
+end
+
+--- The 2D effects the flat draw lays over the map, for a pipeline to place
+-- itself.  Each draws in view coordinates (the view's top-left is the origin,
+-- one unit per game pixel) into the current canvas:
+--   "ground"   what lies ON the map: tall grass under the body and over the
+--              feet (it cannot be drawn over a card's feet, so it lies at them),
+--              the door-opening animation, weather that sits below the actors
+--   "weather"  rain, snow, fog and sandstorm, over everything
+function FieldView.drawPipelineFx(frame, which)
+  love.graphics.setColor(1, 1, 1, 1)
+  local camX, camY, w, h = frame.camX, frame.camY, frame.viewW, frame.viewH
+  if which == "ground" then
+    local FieldEffects = modFieldEffects()
+    if FieldEffects and FieldEffects.drawBehind then FieldEffects.drawBehind(camX, camY) end
+    local Doors = modDoors()
+    if Doors and Doors.draw then Doors.draw(camX, camY, w, h) end
+    local FieldWeather = modFieldWeather()
+    if FieldWeather and FieldWeather.drawBelow then FieldWeather.drawBelow(camX, camY, w, h) end
+    if FieldEffects and FieldEffects.drawFront then FieldEffects.drawFront(camX, camY, frame.py) end
+  elseif which == "weather" then
+    local FieldWeather = modFieldWeather()
+    if FieldWeather and FieldWeather.draw then FieldWeather.draw(camX, camY, w, h) end
+  end
+  love.graphics.setColor(1, 1, 1, 1)
+end
+
 --- Drop cached atlases/sprites (tileset hot-reload).
 function FieldView.invalidate()
+  FieldView._epoch = FieldView._epoch + 1
   local Plan = package.loaded["src.core.game3.field_plan"]
   if Plan then Plan.invalidate() end
   FieldView._atlas = nil

@@ -441,6 +441,61 @@ function Map.worldMidAt(cx, cy, primaryDef)
   return layout:midAt(cx, cy), primaryPair, true
 end
 
+--- worldMidAt plus where the cell came from: mid, pair, isVoid, layout, lx, ly.
+-- A render pipeline needs the owning layout to read collAt / elevAt for a cell
+-- on a connected map, which worldMidAt's (mid, pair) cannot say.  Same
+-- resolution order as worldMidAt; isVoid cells report the primary layout and
+-- the out-of-bounds coordinates (its border tiling answers for them).
+function Map.worldCellAt(cx, cy, primaryDef)
+  local layout = primaryDef and primaryDef.midLayout
+  if not layout then return nil end
+  local w, h = layout.width or 0, layout.height or 0
+  local primaryPair = layout.pair or primaryDef.pair
+
+  if cx >= 0 and cy >= 0 and cx < w and cy < h then
+    return layout:midAt(cx, cy), primaryPair, false, layout, cx, cy
+  end
+
+  local list = Map.neighborList or {}
+  local dir
+  if cy < 0 then dir = "north" elseif cy >= h then dir = "south" end
+  local dirs = { dir, (cx < 0 and "west") or (cx >= w and "east") or nil }
+  for _, d in ipairs(dirs) do
+    for i = #list, 1, -1 do
+      local n = list[i]
+      local L = n.dir == d and n.def and n.def.midLayout
+      if L then
+        local offset = tonumber(n.offset) or 0
+        local nx, ny
+        if d == "north" then
+          nx, ny = cx - offset, (L.height or 0) + cy
+        elseif d == "south" then
+          nx, ny = cx - offset, cy - h
+        elseif d == "west" then
+          nx, ny = (L.width or 0) + cx, cy - offset
+        else
+          nx, ny = cx - w, cy - offset
+        end
+        if nx >= 0 and ny >= 0 and nx < (L.width or 0) and ny < (L.height or 0) then
+          return L:midAt(nx, ny), L.pair or n.def.pair or primaryPair, false, L, nx, ny
+        end
+      end
+    end
+  end
+
+  for _, entry in ipairs(Map.world) do
+    local L = entry.def ~= primaryDef and entry.def and entry.def.midLayout
+    if L then
+      local nx, ny = cx - entry.ox, cy - entry.oy
+      if nx >= 0 and ny >= 0 and nx < (L.width or 0) and ny < (L.height or 0) then
+        return L:midAt(nx, ny), L.pair or entry.def.pair or primaryPair, false, L, nx, ny
+      end
+    end
+  end
+
+  return layout:midAt(cx, cy), primaryPair, true, layout, cx, cy
+end
+
 --- Ensure mapDef.midLayout is bound (lazy; Dataset.hydrate usually did this).
 function Map.ensureMidLayout(game, mapId, def)
   def = def or host_map_def(game, mapId)

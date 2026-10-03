@@ -1,0 +1,28 @@
+-- Sharing metadata (25-community-and-ecosystem.md 3.2).  Read by tooling
+-- and the manager detail pane; never by the loader's merge.
+return {
+  summary = "The FireRed / LeafGreen overworld as a 3D diorama with a tilting, depth-buffered camera.",
+  author = "Gen1Recomp community",
+  contact = "https://github.com/bryanthaboi/gen1recomp",
+  tags = { "graphics", "3d", "voxel", "render-pipeline", "presentation" },
+  differences = {
+    changed = {
+      "with VOXEL on, the overworld draws as 3D geometry instead of flat tiles",
+      "occlusion comes from a depth buffer rather than an OAM-priority sort",
+      "turning VOXEL on switches TILT off, and turning TILT on switches VOXEL off",
+    },
+    added = {
+      "VOXEL options row under EXTRAS and hotkey 6 (OFF / 15 / 35 / 50 / 65 degrees)",
+    },
+    known = {
+      "tall grass lies at the avatar's feet instead of over them",
+      "dark caves draw lit: the Flash mask is not projected",
+      "FireRed and LeafGreen only; Emerald is not claimed (untested there)",
+    },
+  },
+  credits = {
+    { who = "DramaticShape/DramaticShapeVoxelMod", for_ = "the render-pipeline approach and lib/Mat4.lua (MIT)" },
+    { who = "ZallaxDev/pokeemerald-3Ds-dualscreen", for_ = "the idea of a voxel overworld on a Gen 3 field" },
+  },
+  compat = { engine = ">=0.0.0-0 <2.0.0", modApi = 2 },
+}

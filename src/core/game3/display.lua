@@ -227,6 +227,7 @@ local function drawFieldPlane(game, vw, vh, Renderer)
   local Oam = require("src.core.game3.oam")
   local FieldView = require("src.core.game3.field_view")
   local Tilt = require("src.render.Tilt")
+  local Pipelines = require("src.render.Pipelines")
   local Transition = package.loaded["src.core.game3.battle_transition"]
   local transitioning = Transition and Transition.isActive and Transition.isActive()
   Oam.resetFrame()
@@ -234,7 +235,24 @@ local function drawFieldPlane(game, vw, vh, Renderer)
   local function exchange(current, replacement)
     return Renderer and Renderer:exchangeWorldCanvas(current, replacement)
   end
-  if Tilt.active() and not transitioning and Renderer and Renderer.beginUprightPass then
+  -- A mod's render pipeline (src/render/Pipelines.lua) may own the whole world
+  -- pass.  Like tilt it stands down for a battle-transition wipe, which reads the
+  -- flat world canvas, and it falls back to the flat draw whenever it declines
+  -- the frame, so a failing pipeline never shows a blank world.
+  local override
+  local pipelineId = Renderer and not transitioning and Pipelines.worldPipeline() or nil
+  if pipelineId then
+    local FieldPipeline = require("src.core.game3.field_pipeline")
+    local ctx = FieldPipeline.context(game, Renderer, pipelineId)
+    if ctx then
+      override = Pipelines.drawWorld(pipelineId, ctx)
+      if override then override = Pipelines.worldPresent(override, ctx) end
+    end
+    Renderer:setWorldOverride(override)
+  end
+  if override then
+    -- the pipeline drew the world, actors included
+  elseif Tilt.active() and not transitioning and Renderer and Renderer.beginUprightPass then
     FieldView.draw(game, vw, vh, { skipActors = true, exchangeCanvas = exchange })
     Renderer:beginUprightPass()
     FieldView.draw(game, vw, vh, { actorsOnly = true, billboard = true })
