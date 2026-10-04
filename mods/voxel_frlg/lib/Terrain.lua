@@ -177,6 +177,22 @@ local function groveAt(get, x, y)
   return false
 end
 
+-- How many cells wide the structure through (x, y) is, capped.  A fence line, a
+-- hedge or a pole is one or two across however far it runs; a building is wider.
+local function widthAt(get, x, y)
+  local width = 1
+  for d = 1, 3 do
+    if not structureCell(get, x - d, y) then break end
+    width = width + 1
+  end
+  for d = 1, 3 do
+    if not structureCell(get, x + d, y) then break end
+    width = width + 1
+  end
+  return width
+end
+Terrain.PROP_MAX_WIDTH = 2
+
 -- Does the cell at (x, y) stand as a card?  The border always does; a wall does
 -- when its structure is short or is a grove; an overhang is part of what it
 -- hangs on.
@@ -186,7 +202,8 @@ local function isProp(get, x, y, outdoor, depth)
   if not r then return false end
   if r.class == "void" then return Terrain.PROP_VOID end
   if r.class == "wall" then
-    return runAt(get, x, y) <= Terrain.PROP_MAX_RUN or groveAt(get, x, y)
+    return runAt(get, x, y) <= Terrain.PROP_MAX_RUN
+      or widthAt(get, x, y) <= Terrain.PROP_MAX_WIDTH or groveAt(get, x, y)
   end
   if (depth or 0) < RUN_REACH and attachedAt(get, x, y, 0) then
     return isProp(get, x, y + 1, outdoor, (depth or 0) + 1)
@@ -196,6 +213,53 @@ end
 
 local function runHeight(run)
   return Terrain.RUN_HEIGHT[math.min(run, #Terrain.RUN_HEIGHT)]
+end
+
+-- ------- the colour of a tile's sides
+--
+-- A box's east, west and north faces are seen edge-on and at an angle, where one
+-- tile stretched across them just repeats the same picture on every face and
+-- reads as a cube.  The art stays on the top and on the front (south) face,
+-- where it reads as a roof and a facade; the other sides take the tile's average
+-- colour, which the lighting then shades.
+local averages = setmetatable({}, { __mode = "k" })
+
+local function averageColour(ts, slot)
+  local byTs = averages[ts]
+  if not byTs then
+    byTs = {}
+    averages[ts] = byTs
+  end
+  local hit = byTs[slot]
+  if hit then return hit[1], hit[2], hit[3] end
+  local data = ts.imageData
+  local r, g, b, n = 0, 0, 0, 0
+  if data then
+    local sx, sy = (slot % ts.cols) * CELL, math.floor(slot / ts.cols) * CELL
+    for y = sy, sy + CELL - 1 do
+      for x = sx, sx + CELL - 1 do
+        local pr, pg, pb, pa = data:getPixel(x, y)
+        if pa > 0.5 then r, g, b, n = r + pr, g + pg, b + pb, n + 1 end
+      end
+    end
+  end
+  if n == 0 then r, g, b, n = 0.5, 0.5, 0.5, 1 end
+  byTs[slot] = { r / n, g / n, b / n }
+  return r / n, g / n, b / n
+end
+
+local whiteImage
+local function white()
+  if whiteImage then return whiteImage end
+  local ok, image = pcall(function()
+    local data = love.image.newImageData(1, 1)
+    data:setPixel(0, 0, 1, 1, 1, 1)
+    local img = love.graphics.newImage(data)
+    img:setFilter("nearest", "nearest")
+    return img
+  end)
+  whiteImage = ok and image or nil
+  return whiteImage
 end
 
 -- ------- keying a tileset's ground colour away
@@ -361,8 +425,14 @@ local function build(ctx, cx0, cy0)
     end
   end
   local outdoor = ctx.outdoor and ctx.mapType ~= 5
-  local function get(x, y) return info[idx(x, y)] or nil end
   local function cached(x, y) return cellRec(ctx, x, y) end
+  local function get(x, y)
+    local r = info[idx(x, y)]
+    if r ~= nil then return r or nil end
+    -- outside this build's skirt (the width of a long structure): the cache
+    if x >= x0 - 1 and x <= x0 + CHUNK and y >= top and y < top + rows then return nil end
+    return cellRec(ctx, x, y)
+  end
   -- classify every cell the build reads: its column height, and whether it
   -- stands as a card instead of a box
   for y = y0 - 1, y0 + CHUNK do
@@ -397,12 +467,16 @@ local function build(ctx, cx0, cy0)
     return b
   end
 
+  local function flat(ts, pair) return bucket(ts, pair, "f") end
+
   -- one quad: four corners { x, y, z, u, v }, which face it is
-  local function quad(b, c1, c2, c3, c4, face)
+  local function quad(b, c1, c2, c3, c4, face, colour)
     local v = b.verts
     local code = face / 16
+    local r, g, bl = 1, 1, 1
+    if colour then r, g, bl = colour[1], colour[2], colour[3] end
     for _, c in ipairs({ c1, c2, c3, c4 }) do
-      v[#v + 1] = { c[1], c[2], c[3], c[4], c[5], 1, 1, 1, code }
+      v[#v + 1] = { c[1], c[2], c[3], c[4], c[5], r, g, bl, code }
     end
     Gfx.pushQuad(b.map, b.quads)
     b.quads = b.quads + 1
@@ -480,9 +554,19 @@ local function build(ctx, cx0, cy0)
           if nh < h then
             -- corners are given as {x, z} pairs, top then bottom
             local function pt(p, y, u, v) return { p[1], y, p[2], u, v } end
-            quad(under,
-              pt(a, h, u0, v0), pt(b2, h, u1, v0),
-              pt(c3, nh, u1, v1), pt(d, nh, u0, v1), face + win)
+            if face == FACE.south then
+              quad(under,
+                pt(a, h, u0, v0), pt(b2, h, u1, v0),
+                pt(c3, nh, u1, v1), pt(d, nh, u0, v1), face + win)
+            else
+              -- the other sides: the tile's average colour, flat
+              local mid = ((u0 + u1) / 2)
+              local midv = ((v0 + v1) / 2)
+              quad(flat(c.ts, c.pair),
+                pt(a, h, mid, midv), pt(b2, h, mid, midv),
+                pt(c3, nh, mid, midv), pt(d, nh, mid, midv), face,
+                { averageColour(c.ts, c.slot) })
+            end
           end
         end
         -- south face: left to right as the camera sees it
@@ -589,12 +673,15 @@ end
 
 -- Draw the meshes of `list` with the atlas textures as they are RIGHT NOW.
 function Terrain.draw(list)
-  for _, layer in ipairs({ "u", "d", "o" }) do
+  for _, layer in ipairs({ "u", "f", "d", "o" }) do
     Gfx.depthBias(layer == "d" and DECAL_BIAS or 0)
     for _, c in ipairs(list) do
       for _, m in ipairs(c.meshes) do
         if m.layer == layer then
-          local img = (layer == "u") and m.ts.image or m.ts.overImage
+          local img
+          if layer == "u" then img = m.ts.image
+          elseif layer == "f" then img = white()
+          else img = m.ts.overImage end
           if img then
             m.mesh:setTexture(img)
             love.graphics.draw(m.mesh)

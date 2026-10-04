@@ -78,7 +78,7 @@ local SHADER = [[
     } else {
       light = ambient + sunColor * max(dot(faceNormal(code), sunDir), 0.0);
     }
-    vec3 rgb = p.rgb * light;
+    vec3 rgb = p.rgb * light * color.rgb;
 
     // Lit windows.  Nothing in a metatile says which pixels are glass, but
     // FireRed's panes are the one saturated light blue on a building, so a
@@ -201,6 +201,19 @@ function Gfx.soft(on)
   local sh = Gfx.shader()
   if sh then pcall(sh.send, sh, "soft", on and 1 or 0) end
   love.graphics.setDepthMode("lequal", not on)
+end
+
+-- Draw what is hidden: blend by alpha, and pass the depth test only where
+-- something is IN FRONT of the fragment, so a character behind a building or
+-- inside a column shows through as a translucent ghost.  Pass false to restore.
+function Gfx.ghost(on)
+  local sh = Gfx.shader()
+  if sh then pcall(sh.send, sh, "soft", on and 1 or 0) end
+  if on then
+    love.graphics.setDepthMode("greater", false)
+  else
+    love.graphics.setDepthMode("lequal", true)
+  end
 end
 
 -- Close the pass and hand back its colour canvas.

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2
+
+- **Fewer cubes.** Narrow tall structures (a fence line, a hedge, a pole: one or
+  two cells across however far they run) now stand as sprite cards, not boxes. A
+  box's east, west and north faces take the tile's average colour instead of
+  repeating the tile's picture on every face; the picture stays on the top (roof)
+  and the front (facade), where it reads correctly.
+- **Characters no longer vanish.** A character hidden behind a building, a tree
+  or a roof, or inside a column, is drawn again as a translucent ghost wherever
+  something stands in front of it. In the flat game nobody disappears behind a
+  house.
+
 ## 0.3.1
 
 - **Trees are trees.** Trees, bushes, boulders, signs and the whole border of

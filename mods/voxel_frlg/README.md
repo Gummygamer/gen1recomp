@@ -67,13 +67,19 @@ classified from the map and the art:
   column: one deep (a fence, a counter) is low, two medium, three or more (a
   house, a cliff) tall. A walkable cell whose over layer is the structure's
   overhang (a roof's top edge) joins it. Tune `Terrain.RUN_HEIGHT`.
-- **Props.** Outdoors, short solid things (three cells or fewer: boulders,
+- **Props.** Outdoors, narrow structures (one or two cells across: fence lines,
+  hedges, poles), short solid things (three cells or fewer: boulders,
   signs, bushes, small trees) and anything green or ground-coloured (trees,
   the gaps between trunks, however deep the grove) are not boxed: a box repeats
   one tile across every face and reads as a cube. They stand as sprite cards
   instead, like the characters, leaning toward the camera, with the tileset's
   ground colour keyed away so the tree is a tree and not a green square. The
   border of an outdoor map is treated the same way.
+- **Box sides.** A box keeps the tile's picture on its top and front face; its
+  other sides are the tile's average colour, shaded, so a building is not a cube
+  with one tile repeated on every face.
+- **Hidden characters.** Anyone standing behind a building or tree is drawn
+  again as a half-strength ghost where something is in front of them.
 - **Standing on things.** A character on a solid cell (a Poke Ball on a lab
   table, a scientist behind a counter) stands on top of its column rather than
   inside it.

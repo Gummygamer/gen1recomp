@@ -44,6 +44,7 @@ end
 local SHADOW_W, SHADOW_H = 16, 8
 local shadowImage
 local shadowMesh
+local ghostMesh
 
 local function shadowTexture()
   if shadowImage then return shadowImage end
@@ -99,6 +100,8 @@ function Actors.shadows(list, groundAt, strength)
 end
 
 function Actors.invalidate()
+  if ghostMesh and ghostMesh.release then pcall(ghostMesh.release, ghostMesh) end
+  ghostMesh = nil
   if shadowMesh and shadowMesh.release then pcall(shadowMesh.release, shadowMesh) end
   shadowMesh = nil
   if atlas and atlas.release then pcall(atlas.release, atlas) end
@@ -181,6 +184,49 @@ function Actors.draw(list, groundAt, lean)
   mesh:setDrawRange(1, n * 6)
   mesh:setTexture(atlas)
   love.graphics.draw(mesh)
+  Actors.ghosts(list, groundAt, lean)
+end
+
+-- The characters again, wherever something solid stands in front of them: behind
+-- a building, a tree or a roof, inside a column.  Drawn at half strength with the
+-- depth test turned round, so only the hidden parts show.  Without it a
+-- character who walks behind a house simply vanishes, which in the flat game
+-- never happens.
+local GHOST_ALPHA = 0.5
+function Actors.ghosts(list, groundAt, lean)
+  local verts, map, n = {}, {}, 0
+  local aw, ah = COLS * SLOT, ROWS * SLOT
+  local cosL, sinL = math.cos(lean), math.sin(lean)
+  for _, d in ipairs(list) do
+    if d.slot and (d.kind == "player" or d.kind == "npc") then
+      local i = d.slot - 1
+      local sx = (i % COLS) * SLOT
+      local sy = math.floor(i / COLS) * SLOT
+      local u0, v0 = (sx + 0.02) / aw, (sy + 0.02) / ah
+      local u1, v1 = (sx + SLOT - 0.02) / aw, (sy + SLOT - 0.02) / ah
+      local fx, fz = d.x, d.y - 2
+      local fy = groundAt(fx, fz) + 0.5
+      local function pt(px, py, u, v)
+        local up = (CELL_Y + CELL - py)
+        return { fx + px - SLOT / 2, fy + cosL * up, fz - sinL * up, u, v,
+          1, 1, 1, GHOST_ALPHA }
+      end
+      verts[#verts + 1] = pt(0, 0, u0, v0)
+      verts[#verts + 1] = pt(SLOT, 0, u1, v0)
+      verts[#verts + 1] = pt(SLOT, SLOT, u1, v1)
+      verts[#verts + 1] = pt(0, SLOT, u0, v1)
+      Gfx.pushQuad(map, n)
+      n = n + 1
+    end
+  end
+  if n == 0 then return end
+  if ghostMesh and ghostMesh.release then ghostMesh:release() end
+  ghostMesh = Gfx.mesh(verts, map, "stream")
+  if not ghostMesh then return end
+  ghostMesh:setTexture(atlas)
+  Gfx.ghost(true)
+  love.graphics.draw(ghostMesh)
+  Gfx.ghost(false)
 end
 
 return Actors
